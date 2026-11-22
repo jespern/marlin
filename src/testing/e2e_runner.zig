@@ -362,7 +362,7 @@ fn runScenario(
         const flow = if (guest_handover) sf.check.handover_flow else sf.check.pause_flow;
         const claude = std.mem.startsWith(u8, flow, "guest_claude");
         const auth = std.mem.indexOf(u8, flow, "_auth_") != null;
-        const fixture_name: []const u8 = if (guest_handover) "claude_handover.sh" else if (auth) (if (claude) "claude_auth.sh" else "codex_auth.sh") else (if (claude) "claude.sh" else "codex.sh");
+        const fixture_name: []const u8 = if (guest_handover) (if (claude) "claude_handover.sh" else "codex_handover.sh") else if (auth) (if (claude) "claude_auth.sh" else "codex_auth.sh") else (if (claude) "claude.sh" else "codex.sh");
         const fixture = try std.fs.path.join(arena, &.{ scenarios_dir, "..", "fixtures", "pause", fixture_name });
         const script = try Io.Dir.cwd().readFileAlloc(io, fixture, arena, .limited(64 * 1024));
         const path = try std.fs.path.joinZ(arena, &.{ state_dir, "guest-peer" });
@@ -1376,7 +1376,7 @@ fn shellRoundTrip(conn: *ProtocolConn, arena: std.mem.Allocator, shell_id: u64, 
 }
 
 fn checkHandoverFlow(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, cwd: []const u8, flow: []const u8) !void {
-    if (std.mem.eql(u8, flow, "guest_claude")) return checkGuestHandover(gpa, io, env, cwd);
+    if (std.mem.startsWith(u8, flow, "guest_")) return checkGuestHandover(gpa, io, env, cwd, std.mem.eql(u8, flow, "guest_claude"));
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1473,7 +1473,7 @@ fn checkHandoverFlow(gpa: std.mem.Allocator, io: Io, env: *const std.process.Env
 /// A Claude Code turn running across a graceful handover: its guest is not
 /// stopped or resumed but followed by the successor, which finishes the
 /// same turn with every block exactly once.
-fn checkGuestHandover(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, cwd: []const u8) !void {
+fn checkGuestHandover(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, cwd: []const u8, claude: bool) !void {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1485,13 +1485,16 @@ fn checkGuestHandover(gpa: std.mem.Allocator, io: Io, env: *const std.process.En
     const hello = try recvTagBounded(watcher, arena, "hello_ok");
     const old_pid: std.posix.pid_t = @intCast(uintField(hello, "daemon_pid") orelse return error.DaemonPidMissing);
     try watcher.send(.{ .handover_watch = struct {}{} });
-    try watcher.send(.{ .session_create = .{ .cwd = cwd, .model = "claudecode/default", .approvals = "auto" } });
+    try watcher.send(.{ .session_create = .{ .cwd = cwd, .model = if (claude) @as([]const u8, "claudecode/default") else "codex/default", .approvals = "auto" } });
     const sid = uintField(try recvTagBounded(watcher, arena, "session_created"), "sid") orelse return error.SessionIdMissing;
     try watcher.send(.{ .sub = .{ .sid = sid, .from_seq = 0 } });
     try watcher.send(.{ .input = .{ .sid = sid, .text = "guest handover task" } });
     try pauseWaitCall(watcher, arena, sid);
     const pid_path = try std.fs.path.join(arena, &.{ cwd, "guest-pid" });
     const guest_pid = try std.fmt.parseInt(std.posix.pid_t, try Io.Dir.cwd().readFileAlloc(io, pid_path, arena, .limited(128)), 10);
+    // A kept guest is in a session of its own, beyond the runner's group
+    // cleanup: whatever happens here, it does not outlive the scenario.
+    defer _ = std.c.kill(-guest_pid, .KILL);
 
     const requester = try connectProtocol(gpa, io, env);
     defer requester.deinit();
@@ -1561,7 +1564,8 @@ fn checkGuestHandover(gpa: std.mem.Allocator, io: Io, env: *const std.process.En
         }
         if (objectField(body, "system_note")) |n| try notes.print(arena, "{s}\n", .{stringField(n, "text") orelse ""});
     }
-    if (user_msgs != 1 or calls != 1 or results != 1 or answers != 1 or commentary != 1) {
+    // Claude's commentary arrives before its tool call; this Codex has none.
+    if (user_msgs != 1 or calls != 1 or results != 1 or answers != 1 or commentary != @intFromBool(claude)) {
         print(io, "blocks: user {d} call {d} result {d} answer {d} commentary {d}; notes:\n{s}", .{ user_msgs, calls, results, answers, commentary, notes.items });
         return error.GuestHandoverBlocksWrong;
     }

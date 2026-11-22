@@ -12,6 +12,7 @@ const block = @import("../../core/block.zig");
 const loop = @import("../loop.zig");
 const Store = @import("../store.zig").Store;
 const claude_code = @import("../provider/claude_code.zig");
+const kept_mod = @import("kept.zig");
 
 pub const default_runtime = std.math.maxInt(u64);
 
@@ -267,4 +268,38 @@ pub fn appendGuestResult(gpa: std.mem.Allocator, ap: *loop.Appender, result: @Fi
     var with_media = result;
     with_media.attachments = refs.items;
     _ = try ap.appendWithBlobs(.{ .tool_result = with_media }, blobs.items);
+}
+
+/// Start a guest under a keeper when the daemon keeps guests: null (start
+/// it directly) when it does not, or the keeper cannot start. `backend`
+/// names it in the turn's record.
+pub fn spawnKept(
+    gpa: Allocator,
+    io: Io,
+    opts: loop.RunOpts,
+    argv: []const []const u8,
+    environ_map: ?*const std.process.Environ.Map,
+    round: u32,
+    turn_id: u64,
+    backend: []const u8,
+) ?*kept_mod.Kept {
+    const root = opts.keeper_root orelse return null;
+    const exe = opts.marlin_exe orelse return null;
+    // /compact is short and answers nothing: not worth keeping.
+    if (opts.guest_compact != null) return null;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = std.fmt.bufPrint(&buf, "{s}/{x}", .{ root, @import("../../core/ids.zig").next(io) }) catch return null;
+    const k = kept_mod.Kept.spawn(gpa, io, exe, dir, argv, opts.cwd, environ_map) catch |err| {
+        std.log.warn("guest keeper unavailable ({t}): the guest runs as this daemon's child", .{err});
+        kept_mod.removeDir(io, dir);
+        return null;
+    };
+    kept_mod.writeJson(gpa, io, dir, kept_mod.turn_name, kept_mod.TurnFile{
+        .sid = opts.session_id,
+        .turn_id = turn_id,
+        .backend = backend,
+        .round = round,
+        .started_at_ms = nowMs(io),
+    }) catch |err| std.log.warn("guest keeper: could not record the turn: {t}", .{err});
+    return k;
 }

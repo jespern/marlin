@@ -584,7 +584,8 @@ pub fn runTurn(
         // and sent; only its journal remains to follow.
         if (opts.guest_attach != null) return switch (guest) {
             .claude_code => runClaudeCodeTurn(gpa, io, store, opts, &ap, "", false),
-            .codex, .muse => error.GuestAttachUnsupported,
+            .codex => runCodexTurn(gpa, io, store, opts, &ap, ""),
+            .muse => error.GuestAttachUnsupported,
         };
         const fresh = ap.seq == 0;
         const user_block_id = try ap.append(.{ .user_msg = .{

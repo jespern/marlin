@@ -4263,7 +4263,7 @@ pub const Daemon = struct {
             // A guest parked on a prompt detaches too: its bridge asks the
             // successor again (cc_approve.zig), which shows the prompt anew.
             if (session.state != .running and session.state != .awaiting_approval) continue;
-            if (session.kept_slot.detachIfRunning(self.io)) session.detaching = true;
+            if (session.kept_slot.detachIfRunning(self.io, session.state == .awaiting_approval)) session.detaching = true;
         }
     }
 

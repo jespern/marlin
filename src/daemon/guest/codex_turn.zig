@@ -41,6 +41,8 @@ const resolveGuestApproval = loop.resolveGuestApproval;
 const tryCloseSteering = loop.tryCloseSteering;
 
 const shared = @import("shared.zig");
+const kept_mod = @import("kept.zig");
+const Kept = kept_mod.Kept;
 const guest_activity = @import("activity.zig");
 const compactDiagnostic = @import("claude_code_turn.zig").compactDiagnostic;
 const compactionNote = @import("claude_code_turn.zig").compactionNote;
@@ -137,9 +139,11 @@ pub fn otelOverrides(guest: ?OtelGuest, codex_config_names_collector: bool) ?cod
 const CodexTeardown = struct {
     io: Io,
     watcher: *CcWatcher,
-    watcher_thread: std.Thread,
+    watcher_thread: ?std.Thread,
     drain_thread: ?std.Thread,
-    child: *std.process.Child,
+    child: ?*std.process.Child,
+    /// A kept app-server: its keeper reaps it (the turn removes its journal).
+    kept: ?*Kept = null,
     group: std.process.Child.Id,
     done: bool = false,
 
@@ -147,16 +151,22 @@ const CodexTeardown = struct {
         if (self.done) return;
         self.done = true;
         self.watcher.done.store(true, .release);
-        self.watcher_thread.join();
-        if (process_io.closeStdinAndReap(self.child, self.io, codex_shutdown_grace_ms)) {
+        if (self.watcher_thread) |t| t.join();
+        if (self.kept) |k| {
+            k.closeStdin();
+            if (!k.waitExit(codex_shutdown_grace_ms)) _ = k.terminate(0);
+            return;
+        }
+        const child = self.child.?;
+        if (process_io.closeStdinAndReap(child, self.io, codex_shutdown_grace_ms)) {
             if (self.drain_thread) |thread| thread.join();
-            process_io.releaseReapedChild(self.child, self.io);
+            process_io.releaseReapedChild(child, self.io);
         } else {
             // Still running (or not ours to wait on): owned descendants must
             // not outlive the turn, so reap the whole group now. `wait` also
             // releases the pipes, so the drain joins before it runs.
             process_io.terminateProcessGroup(self.io, self.group, 0);
-            _ = self.child.wait(self.io) catch {};
+            _ = child.wait(self.io) catch {};
             if (self.drain_thread) |thread| thread.join();
         }
     }
@@ -445,7 +455,7 @@ fn appendCodexItemStarted(
         .name = name,
         .args_json = persisted_args,
     } });
-    if (opts.on_tool) |callback| callback(opts.on_delta_ctx, name, .start);
+    if (!ap.replaying) if (opts.on_tool) |callback| callback(opts.on_delta_ctx, name, .start);
 }
 
 fn appendCodexToolCompleted(
@@ -470,7 +480,7 @@ fn appendCodexToolCompleted(
         .inline_body = body[0..@min(body.len, opts.cfg.inline_tool_cap_bytes)],
         .full_body_ref = null,
     }, images);
-    if (opts.on_tool) |callback| callback(opts.on_delta_ctx, name, .done);
+    if (!ap.replaying) if (opts.on_tool) |callback| callback(opts.on_delta_ctx, name, .done);
     return true;
 }
 
@@ -618,6 +628,15 @@ pub fn readTokenUsage(
         out.store(@intCast(window), .release);
 }
 
+/// The replay caught up: persist, announce and write from here on.
+fn codexGoLive(opts: RunOpts, ap: *Appender, activity: *guest_activity.Tracker, line_writer: *kept_mod.LineWriter) !void {
+    ap.replaying = false;
+    ap.seq = try ap.store.lastSeq(opts.session_id);
+    line_writer.replaying = false;
+    activity.unmute();
+    publishPhase(opts, .provider);
+}
+
 pub fn runCodexTurn(
     gpa: std.mem.Allocator,
     io: Io,
@@ -667,7 +686,30 @@ pub fn runCodexTurn(
         break :blk value;
     } else null;
     const trace = codex.traceFor(traceparent);
-    var child = std.process.spawn(io, .{
+    // A kept app-server (keeper.zig) runs on through a daemon restart; one a
+    // previous daemon started is followed by replaying its journal to where
+    // that daemon stopped reading, then live.
+    const attach = opts.guest_attach;
+    const replay_until: u64 = if (attach) |a| a.replay_until else 0;
+    const resume_kept: ?*Kept = if (attach) |a| Kept.attach(gpa, io, a.dir) catch |err| {
+        const note = try std.fmt.allocPrint(arena, "codex could not be followed after the restart: {t}", .{err});
+        setDelegateError(note);
+        _ = try ap.append(.{ .system_note = .{ .text = note } });
+        kept_mod.removeDir(io, a.dir);
+        return error.DelegateFailed;
+    } else null;
+    const kept: ?*Kept = resume_kept orelse shared.spawnKept(gpa, io, opts, argv, if (guest_environ) |*map| map else null, 1, ap.turn_id, "codex");
+    var kept_owned = kept != null;
+    // Runs after the teardown below: the keeper has reaped the app-server.
+    defer if (kept_owned) {
+        const k = kept.?;
+        if (opts.kept_slot) |slot| slot.set(io, null);
+        k.reap();
+        kept_mod.removeDir(io, k.dir);
+        k.deinit();
+    };
+    var child: ?std.process.Child = null;
+    if (kept == null) child = std.process.spawn(io, .{
         .argv = argv,
         .cwd = .{ .path = opts.cwd },
         .environ_map = if (guest_environ) |*map| map else null,
@@ -681,19 +723,26 @@ pub fn runCodexTurn(
         _ = try ap.append(.{ .system_note = .{ .text = note } });
         return error.DelegateSpawnFailed;
     };
+    // Its group; 0 when a followed app-server already ended (nothing to signal).
+    const guest_pid: std.posix.pid_t = if (kept) |k| k.pid else child.?.id.?;
+    if (kept) |k| if (opts.kept_slot) |slot| slot.set(io, k);
 
-    var watcher = CcWatcher.init(io, opts.cancel, child.id.?, opts.park_clock, opts.cfg.guest_max_runtime_ms);
+    var watcher = CcWatcher.init(io, opts.cancel, guest_pid, opts.park_clock, opts.cfg.guest_max_runtime_ms);
     watcher.max_runtime_live = opts.guest_max_runtime_live;
-    const watcher_thread = try std.Thread.spawn(.{}, CcWatcher.run, .{&watcher});
-    var drain = CcStderrDrain{ .io = io, .file = child.stderr.? };
-    const drain_thread = std.Thread.spawn(.{}, CcStderrDrain.run, .{&drain}) catch null;
+    const watcher_thread: ?std.Thread = if (guest_pid > 0) try std.Thread.spawn(.{}, CcWatcher.run, .{&watcher}) else null;
+    var drain: CcStderrDrain = .{ .io = io, .file = undefined };
+    const drain_thread: ?std.Thread = if (child) |c| blk: {
+        drain.file = c.stderr.?;
+        break :blk std.Thread.spawn(.{}, CcStderrDrain.run, .{&drain}) catch null;
+    } else null;
     var teardown = CodexTeardown{
         .io = io,
         .watcher = &watcher,
         .watcher_thread = watcher_thread,
         .drain_thread = drain_thread,
-        .child = &child,
-        .group = child.id.?,
+        .child = if (child != null) &child.? else null,
+        .kept = kept,
+        .group = guest_pid,
     };
     defer teardown.run();
     // A dead app-server used to fail as a bare CodexAppServerExited with the
@@ -707,16 +756,34 @@ pub fn runCodexTurn(
         !watcher.cancelled.load(.acquire) and !watcher.timed_out.load(.acquire))
     {
         teardown.run();
-        noteCodexServerExit(gpa, ap, drain.tail[0..drain.len]);
+        var tail_buf: [4096]u8 = undefined;
+        noteCodexServerExit(gpa, ap, if (kept) |k| k.stderrTail(&tail_buf) else drain.tail[0..drain.len]);
     };
 
     var writer_buffer: [64 * 1024]u8 = undefined;
-    var writer_file = child.stdin.?.writer(io, &writer_buffer);
-    const writer = &writer_file.interface;
-    const line_buffer = try gpa.alloc(u8, codex_line_bytes);
-    defer gpa.free(line_buffer);
-    var reader_file = child.stdout.?.reader(io, line_buffer);
-    const reader = &reader_file.interface;
+    var writer_file: Io.File.Writer = undefined;
+    var line_writer: kept_mod.LineWriter = undefined;
+    const writer: *Io.Writer = if (kept) |k| blk: {
+        // While replaying, what this turn writes was written already.
+        line_writer = .init(k, replay_until > 0, &writer_buffer);
+        break :blk &line_writer.writer;
+    } else blk: {
+        writer_file = child.?.stdin.?.writer(io, &writer_buffer);
+        break :blk &writer_file.interface;
+    };
+    defer if (kept != null) line_writer.deinit();
+    var line_buffer: []u8 = &.{};
+    defer if (line_buffer.len > 0) gpa.free(line_buffer);
+    var reader_file: Io.File.Reader = undefined;
+    const reader: *Io.Reader = if (kept) |k| &k.reader.interface else blk: {
+        line_buffer = try gpa.alloc(u8, codex_line_bytes);
+        reader_file = child.?.stdout.?.reader(io, line_buffer);
+        break :blk &reader_file.interface;
+    };
+    var replaying = replay_until > 0;
+    if (replaying) ap.replaying = true;
+    var detached = false;
+    var detach_offset: u64 = 0;
 
     try codexRequest(arena, writer, "initialize", 1, trace, .{ .clientInfo = .{
         .name = "marlin",
@@ -843,6 +910,7 @@ pub fn runCodexTurn(
     var recovery_attempts: u32 = 0;
     var activity = guest_activity.Tracker.init(gpa, opts.on_guest_activity, opts.on_delta_ctx);
     defer activity.deinit();
+    if (replaying) activity.mute();
 
     var line_arena_state = std.heap.ArenaAllocator.init(gpa);
     defer line_arena_state.deinit();
@@ -854,9 +922,20 @@ pub fn runCodexTurn(
                 _ = try ap.append(.{ .system_note = .{ .text = "codex: one event line exceeded 64 MiB and was dropped" } });
                 continue;
             },
-            error.ReadFailed => break,
+            error.ReadFailed => {
+                // Detached while waiting: a partial line stays unread.
+                if (kept) |k| if (k.detached) {
+                    detached = true;
+                    detach_offset = k.consumed() - line_acc.items.len;
+                };
+                break;
+            },
             error.OutOfMemory => return error.OutOfMemory,
         } orelse break;
+        if (replaying and kept.?.consumed() > replay_until) {
+            replaying = false;
+            try codexGoLive(opts, ap, &activity, &line_writer);
+        }
         _ = line_arena_state.reset(.retain_capacity);
         const line_arena = line_arena_state.allocator();
         const inbound = codex.decodeLine(line_arena, line) catch continue;
@@ -869,7 +948,8 @@ pub fn runCodexTurn(
                     }
                 }
             },
-            .request => |request| {
+            // The daemon that read it first answered it.
+            .request => |request| if (!replaying) {
                 const is_command = std.mem.eql(u8, request.method, "item/commandExecution/requestApproval");
                 const is_file = std.mem.eql(u8, request.method, "item/fileChange/requestApproval");
                 if (is_command or is_file) {
@@ -902,11 +982,11 @@ pub fn runCodexTurn(
                         try activity.appendOutput(thread, delta);
                         continue;
                     }
-                    if (codex.strField(params, "delta")) |delta|
+                    if (!replaying) if (codex.strField(params, "delta")) |delta|
                         if (opts.on_delta) |callback| callback(opts.on_delta_ctx, delta);
                 } else if (std.mem.eql(u8, notification.method, "item/reasoning/summaryTextDelta")) {
                     if (!primary_thread) continue;
-                    if (codex.strField(params, "delta")) |delta|
+                    if (!replaying) if (codex.strField(params, "delta")) |delta|
                         if (opts.on_reasoning_delta) |callback| callback(opts.on_delta_ctx, delta);
                 } else if (std.mem.eql(u8, notification.method, "item/commandExecution/outputDelta")) {
                     const item_id = codex.strField(params, "itemId") orelse continue;
@@ -1015,9 +1095,11 @@ pub fn runCodexTurn(
                         _ = try ap.append(.{ .system_note = .{ .text = note } });
                         // Keep the original runtime deadline and let interrupt
                         // cancel the pause as well as the next vendor turn.
-                        for (0..recovery_attempts * 10) |_| {
-                            if (cancelled(opts.cancel) or watcher.cancelled.load(.acquire) or watcher.timed_out.load(.acquire)) break :events;
-                            try io.sleep(.fromMilliseconds(100), .awake);
+                        if (!replaying) {
+                            for (0..recovery_attempts * 10) |_| {
+                                if (cancelled(opts.cancel) or watcher.cancelled.load(.acquire) or watcher.timed_out.load(.acquire)) break :events;
+                                try io.sleep(.fromMilliseconds(100), .awake);
+                            }
                         }
                         if (cancelled(opts.cancel) or watcher.cancelled.load(.acquire) or watcher.timed_out.load(.acquire)) break :events;
                         active_turn_id = markServerExit(&server_exited, codexSendTurnStart(arena, writer, reader, next_request_id, thread_id, opts, trace, recovery_prompt)) catch |err| {
@@ -1035,8 +1117,12 @@ pub fn runCodexTurn(
                         continue :events;
                     }
 
-                    var follow_up: ?block.Input = if (opts.poll_steer) |poll| poll(opts.on_delta_ctx, gpa) else null;
-                    if (follow_up == null and !tryCloseSteering(opts))
+                    // Replaying, the journal says whether the first daemon went
+                    // on with a steer: it did when more of it follows.
+                    var follow_up: ?block.Input = if (replaying)
+                        (if (kept.?.consumed() < replay_until) block.Input{ .text = try gpa.dupe(u8, "") } else null)
+                    else if (opts.poll_steer) |poll| poll(opts.on_delta_ctx, gpa) else null;
+                    if (!replaying and follow_up == null and !tryCloseSteering(opts))
                         follow_up = if (opts.poll_steer) |poll| poll(opts.on_delta_ctx, gpa) else null;
                     if (!interrupted and !failed and follow_up != null) {
                         const text = follow_up.?;
@@ -1055,8 +1141,34 @@ pub fn runCodexTurn(
                 }
             },
         }
-        if (!done)
+        if (!done and !replaying)
             _ = try sendCodexSteers(gpa, line_arena, writer, opts, ap, thread_id, active_turn_id, trace, &next_request_id);
+        if (replaying and kept.?.consumed() >= replay_until) {
+            replaying = false;
+            try codexGoLive(opts, ap, &activity, &line_writer);
+        }
+        // Handing over: stop between events; the next daemon replays to here.
+        if (!done) if (kept) |k| if (k.detachRequested()) {
+            detached = true;
+            detach_offset = k.consumed();
+            break :events;
+        };
+    }
+
+    if (detached) {
+        // The app-server runs on with its stdin open for the next daemon.
+        teardown.done = true;
+        watcher.done.store(true, .release);
+        if (watcher_thread) |t| t.join();
+        const k = kept.?;
+        kept_mod.writeJson(gpa, io, k.dir, kept_mod.detach_name, kept_mod.DetachFile{
+            .consumed = @max(detach_offset, replay_until),
+            .inputs_sent = 0,
+        }) catch |err| std.log.err("guest keeper: could not record the handover point: {t}", .{err});
+        if (opts.kept_slot) |slot| slot.set(io, null);
+        kept_owned = false;
+        k.deinit();
+        return error.GuestDetached;
     }
 
     // A killed/interrupted rollout can publish usage without reaching its

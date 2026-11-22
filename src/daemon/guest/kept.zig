@@ -47,11 +47,12 @@ pub const Slot = struct {
     }
 
     /// Detach the kept turn if one runs now; false (and nothing pending)
-    /// when none does.
-    pub fn detachIfRunning(self: *Slot, io: Io) bool {
+    /// when none does, or it is `parked` on a prompt it cannot leave.
+    pub fn detachIfRunning(self: *Slot, io: Io, parked: bool) bool {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const k = self.kept orelse return false;
+        if (parked and !k.parked_detachable) return false;
         self.detach_pending = true;
         k.detach();
         return true;
@@ -117,6 +118,9 @@ pub const Kept = struct {
     detached: bool = false,
     /// The keeper said the guest ended (or vanished).
     exited: bool = false,
+    /// The turn can be detached while parked on a user prompt (its guest
+    /// asks through a bridge that retries), not only while running.
+    parked_detachable: bool = false,
     reader: JournalReader = undefined,
 
     /// Start `argv` under a keeper writing its journals into `dir`, which is
@@ -454,3 +458,49 @@ fn nowMs(io: Io) i64 {
 pub fn removeDir(io: Io, dir: []const u8) void {
     Io.Dir.cwd().deleteTree(io, dir) catch {};
 }
+
+/// An Io.Writer onto a kept guest's stdin: each complete line goes to the
+/// keeper. While `replaying`, lines are dropped: the daemon that read the
+/// journal first already sent them.
+pub const LineWriter = struct {
+    gpa: std.mem.Allocator,
+    kept: *Kept,
+    replaying: bool,
+    pending: std.ArrayList(u8) = .empty,
+    writer: Io.Writer,
+
+    pub fn init(k: *Kept, replaying: bool, buffer: []u8) LineWriter {
+        return .{ .gpa = k.gpa, .kept = k, .replaying = replaying, .writer = .{
+            .vtable = &.{ .drain = drain },
+            .buffer = buffer,
+        } };
+    }
+
+    /// Safe after the Kept is gone (a detached turn frees it first).
+    pub fn deinit(self: *LineWriter) void {
+        self.pending.deinit(self.gpa);
+    }
+
+    fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const self: *LineWriter = @alignCast(@fieldParentPtr("writer", w));
+        const gpa = self.gpa;
+        self.pending.appendSlice(gpa, w.buffer[0..w.end]) catch return error.WriteFailed;
+        w.end = 0;
+        var written: usize = 0;
+        for (data[0 .. data.len - 1]) |bytes| {
+            self.pending.appendSlice(gpa, bytes) catch return error.WriteFailed;
+            written += bytes.len;
+        }
+        const pattern = data[data.len - 1];
+        for (0..splat) |_| self.pending.appendSlice(gpa, pattern) catch return error.WriteFailed;
+        written += pattern.len * splat;
+        while (std.mem.indexOfScalar(u8, self.pending.items, '\n')) |nl| {
+            if (!self.replaying)
+                self.kept.writeLine(keeper.tag_write, self.pending.items[0..nl]) catch return error.WriteFailed;
+            const rest = self.pending.items.len - (nl + 1);
+            std.mem.copyForwards(u8, self.pending.items[0..rest], self.pending.items[nl + 1 ..]);
+            self.pending.shrinkRetainingCapacity(rest);
+        }
+        return written;
+    }
+};

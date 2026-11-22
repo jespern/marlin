@@ -353,38 +353,6 @@ pub fn claudeErrorNote(
     return std.fmt.allocPrint(allocator, "claude code error: {s}", .{trimmed_detail});
 }
 
-/// Start Claude Code under a keeper when the daemon keeps guests: null
-/// (start it directly) when it does not, or the keeper cannot start.
-fn spawnKept(
-    gpa: std.mem.Allocator,
-    io: Io,
-    opts: RunOpts,
-    argv: []const []const u8,
-    environ_map: ?*const std.process.Environ.Map,
-    round: u32,
-    turn_id: u64,
-) ?*Kept {
-    const root = opts.keeper_root orelse return null;
-    const exe = opts.marlin_exe orelse return null;
-    // /compact is short and answers nothing: not worth keeping.
-    if (opts.guest_compact != null) return null;
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = std.fmt.bufPrint(&buf, "{s}/{x}", .{ root, ids.next(io) }) catch return null;
-    const k = Kept.spawn(gpa, io, exe, dir, argv, opts.cwd, environ_map) catch |err| {
-        std.log.warn("guest keeper unavailable ({t}): Claude Code runs as this daemon's child", .{err});
-        kept_mod.removeDir(io, dir);
-        return null;
-    };
-    kept_mod.writeJson(gpa, io, dir, kept_mod.turn_name, kept_mod.TurnFile{
-        .sid = opts.session_id,
-        .turn_id = turn_id,
-        .backend = "claude_code",
-        .round = round,
-        .started_at_ms = nowMs(io),
-    }) catch |err| std.log.warn("guest keeper: could not record the turn: {t}", .{err});
-    return k;
-}
-
 /// The replay caught up: persist and announce from here on, starting with
 /// where the turn stands.
 fn ccGoLive(
@@ -532,7 +500,7 @@ fn ccInvoke(
     // A kept guest (keeper.zig) runs on through a daemon restart; without a
     // keeper it is this daemon's child, as before.
     const guest_environ = if (child_environ) |*map| map else opts.tool_environ;
-    const kept: ?*Kept = resume_kept orelse spawnKept(gpa, io, opts, argv, guest_environ, round, ap.turn_id);
+    const kept: ?*Kept = resume_kept orelse shared.spawnKept(gpa, io, opts, argv, guest_environ, round, ap.turn_id, "claude_code");
     // False once the kept guest is handed over (detached) or finished.
     var kept_owned = kept != null;
     var child: ?std.process.Child = null;
@@ -553,7 +521,12 @@ fn ccInvoke(
     // The guest's pid is its process group; 0 when a kept guest already
     // ended before this daemon attached (nothing left to signal).
     const guest_pid: std.posix.pid_t = if (kept) |k| k.pid else child.?.id.?;
-    if (kept) |k| if (opts.kept_slot) |slot| slot.set(io, k);
+    if (kept) |k| {
+        // Parked on a prompt it waits on its bridge, which asks the next
+        // daemon again: detachable then too.
+        k.parked_detachable = true;
+        if (opts.kept_slot) |slot| slot.set(io, k);
+    }
     // A failing turn stops a kept guest too and drops its journal.
     errdefer if (kept_owned) {
         const k = kept.?;
