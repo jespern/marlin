@@ -210,6 +210,12 @@
   /* A message to another session, whole, above its delivery receipt. */
   .tool .sent { white-space: pre-wrap; overflow-wrap: anywhere; margin: 4px 0 6px 1.2em; }
   .tool.err summary { color: var(--red); }
+  /* Messages between sessions lead with their direction (render.zig
+     message_in / message_out): dark purple received, light purple sent. */
+  .arrow { font-weight: 700; }
+  .arrow.in { color: #8b5cf6; }
+  .arrow.out { color: #c4b5fd; }
+  .message-in summary .name { color: var(--code); }
   .note { color: var(--code); font-size: 13px; } /* render.zig: note = soft blue */
   /* markdown */
   .md p, .md ul, .md ol, .md blockquote, .md table, .md h1, .md h2, .md h3, .md h4 { margin: 0 0 8px; }
@@ -1276,14 +1282,14 @@ function marlinToolLine(name, argsJson, done) {
   // Codex records its whole MCP item, the call's own arguments nested.
   if (a.arguments && typeof a.arguments === 'object') a = a.arguments;
   else if (typeof a.arguments === 'string') try { a = JSON.parse(a.arguments) || {}; } catch {}
-  if (tool === 'show_image') return {verb, target: typeof a.path === 'string' ? a.path.split('/').pop() : '', note: '', text: ''};
+  if (tool === 'show_image') return {tool, verb, target: typeof a.path === 'string' ? a.path.split('/').pop() : '', note: '', text: ''};
   const query = tool !== 'list' && typeof a.handle === 'string' ? a.handle : '';
   const text = typeof a.text === 'string' ? a.text : '';
   const note = text.split('\n', 1)[0].trim();
-  if (!query) return {verb, target: '', note, text};
+  if (!query) return {tool, verb, target: '', note, text};
   const q = query.toLowerCase();
   const s = q.length >= 4 && sessionsCache.find(x => (x.handle || '').startsWith(q));
-  if (!s) return {verb, target: query, note, text};
+  if (!s) return {tool, verb, target: query, note, text};
   // Eight characters, longer only while another known session shares them.
   let len = 8;
   for (const o of sessionsCache) {
@@ -1292,12 +1298,25 @@ function marlinToolLine(name, argsJson, done) {
     while (common < o.handle.length && o.handle[common] === s.handle[common]) common++;
     if (common >= len) len = common + 1;
   }
-  return {verb, target: (s.title || '(untitled)') + ' · ' + s.handle.slice(0, len), note, text};
+  return {tool, verb, target: (s.title || '(untitled)') + ' · ' + s.handle.slice(0, len), note, text};
 }
 function marlinToolSummary(summary, line) {
-  summary.replaceChildren('⚙ ', el('span', 'name', line.verb));
+  summary.replaceChildren(line.tool === 'message' ? el('span', 'arrow out', '→') : '⚙', ' ', el('span', 'name', line.verb));
   if (line.target) summary.append(' ', el('span', 'prev', line.target));
   if (line.note) summary.append(el('span', 'said', ': ' + line.note.slice(0, 400)));
+}
+
+// Input another session sent (layout.zig appendAgentMessage): the sender
+// and how it starts, a tap away from the whole message.
+function agentMessage(v) {
+  const said = v.display_text || v.text || '';
+  const node = el('details', 'block tool message-in');
+  const summary = el('summary');
+  summary.append(el('span', 'arrow in', '←'), ' ', el('span', 'name', v.from),
+    el('span', 'said', ' · ' + said.split('\n', 1)[0].trim().slice(0, 400)));
+  node.appendChild(summary);
+  node.appendChild(el('div', 'sent', said));
+  return node;
 }
 
 const rehydrationPrefix = '[rehydrated after compaction]';
@@ -1346,7 +1365,9 @@ function addBlock(b, target = $('#transcript'), live = true) {
   const kind = Object.keys(b.body)[0];
   const v = b.body[kind];
   let node = null;
-  if (kind === 'user_msg') {
+  if ((kind === 'user_msg' || kind === 'steer') && v.from) {
+    node = agentMessage(v);
+  } else if (kind === 'user_msg') {
     const synthetic = v.synthetic || (v.text || '').startsWith(rehydrationPrefix);
     // The user spoke after a proposal: it is no longer the open offer.
     if (!synthetic && target === $('#transcript')) planProposalReady = false;
@@ -1374,8 +1395,8 @@ function addBlock(b, target = $('#transcript'), live = true) {
   } else if (kind === 'tool_call' && isAskUserTool(v.name)) {
     node = questionRecord(v);
   } else if (kind === 'tool_call' && marlinTool(v.name)) {
-    node = el('details', 'block tool');
     const line = marlinToolLine(v.name, v.args_json, false);
+    node = el('details', 'block tool' + (line.tool === 'message' ? ' message-out' : ''));
     const s = el('summary');
     marlinToolSummary(s, line);
     node.appendChild(s);
@@ -1467,7 +1488,9 @@ function addBlock(b, target = $('#transcript'), live = true) {
   if (node) {
     if (b.seq) node.dataset.seq = b.seq;
     // An asked question is a conversation turn, not machinery: never folded.
-    const foldable = (kind === 'tool_call' && !node.classList.contains('question-record')) ||
+    // Nor is a message to another session: it stays its own row.
+    const foldable = (kind === 'tool_call' && !node.classList.contains('question-record') &&
+                      !node.classList.contains('message-out')) ||
       kind === 'tool_result' || kind === 'system_note' || kind === 'approval';
     if (!foldable || !addToToolGroup(t, node, kind)) t.appendChild(node);
     if (live) scrollBottom();

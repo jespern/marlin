@@ -550,6 +550,26 @@ async function main() {
       return {replaced,cleared};
     });
     assert.deepEqual(live,{replaced:'Test the',cleared:true});
+    // Messages between sessions lead with their direction: ← received in
+    // dark purple, → sent in light purple, and a sent one is never folded
+    // into "Ran N commands" with the tools around it.
+    const messages=await page.evaluate(()=>{
+      const shown=n=>[n.querySelector('summary').textContent,getComputedStyle(n.querySelector('.arrow')).color];
+      addBlock({seq:0,ts:0,body:{user_msg:{text:'[message from steward]\nAre you releasing?\nSoon?',display_text:'Are you releasing?\nSoon?',from:'steward · 1a2b3c4d'}}});
+      const received=[...document.querySelectorAll('.message-in')].pop();
+      addBlock({seq:0,ts:0,body:{tool_call:{name:'Bash',call_id:'mb1',args_json:JSON.stringify({command:'git status'})}}});
+      addBlock({seq:0,ts:0,body:{tool_call:{name:'mcp__marlin__message_session',call_id:'mm1',args_json:JSON.stringify({handle:'1a2b3c4d',text:'Taking 072.'})}}});
+      const sent=document.querySelector('[data-call="mm1"]');
+      const out={received:shown(received),whole:received.querySelector('.sent').textContent,sent:shown(sent),folded:!!sent.closest('.tool-group')};
+      for(const n of [received,sent,document.querySelector('[data-call="mb1"]').closest('.tool-group')]) n.remove();
+      return out;
+    });
+    assert.deepEqual(messages,{
+      received:['← steward · 1a2b3c4d · Are you releasing?','rgb(139, 92, 246)'],
+      whole:'Are you releasing?\nSoon?',
+      sent:['→ Message to 1a2b3c4d: Taking 072.','rgb(196, 181, 253)'],
+      folded:false,
+    });
     assert.equal(sgr.body,'$ make\n<span style="color:#73d091">ok</span>');
     // A shell is the whole account: never for a browser that is not paired.
     assert.equal((await fetch(origin+'/shell?sid='+sid+'&cols=40&rows=20')).status,403);

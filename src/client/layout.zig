@@ -1037,7 +1037,7 @@ pub fn marlinTool(name: []const u8) ?MarlinTool {
 /// title and handle when this client knows the session, else the handle
 /// the agent typed. `name` is the shorter form a run of calls lists: the
 /// title alone, or the handle when there is no title.
-pub const MarlinToolLine = struct { verb: []const u8, target: []const u8 = "", note: []const u8 = "", name: []const u8 = "" };
+pub const MarlinToolLine = struct { tool: MarlinTool, verb: []const u8, target: []const u8 = "", note: []const u8 = "", name: []const u8 = "" };
 
 pub fn marlinToolLine(
     arena: std.mem.Allocator,
@@ -1068,12 +1068,12 @@ fn marlinToolLineFrom(
         .wait => if (done) "Waited on" else "Waiting on",
         .show_image => if (done) "Showed" else "Showing",
     };
-    if (tool == .list) return .{ .verb = verb };
+    if (tool == .list) return .{ .tool = tool, .verb = verb };
     if (tool == .show_image) {
         const file = std.fs.path.basename(args.path orelse "");
-        return .{ .verb = verb, .target = file, .name = file };
+        return .{ .tool = tool, .verb = verb, .target = file, .name = file };
     }
-    const query = args.handle orelse return .{ .verb = verb };
+    const query = args.handle orelse return .{ .tool = tool, .verb = verb };
     const note = if (args.text) |text|
         std.mem.trim(u8, text[0 .. std.mem.indexOfScalar(u8, text, '\n') orelse text.len], " \t\r")
     else
@@ -1085,13 +1085,14 @@ fn marlinToolLineFrom(
         var buf: session_handle.Full = undefined;
         const handle = try arena.dupe(u8, session_handle.display(&buf, s.sid, known));
         return .{
+            .tool = tool,
             .verb = verb,
             .target = try std.fmt.allocPrint(arena, "{s} · {s}", .{ if (s.title.len > 0) s.title else "(untitled)", handle }),
             .note = note,
             .name = if (s.title.len > 0) s.title else handle,
         };
     }
-    return .{ .verb = verb, .target = query, .note = note, .name = query };
+    return .{ .tool = tool, .verb = verb, .target = query, .note = note, .name = query };
 }
 
 /// A run of calls to one session tool in a folded trail, said in one row:
@@ -1145,6 +1146,7 @@ fn marlinToolRun(
     if (calls < 2) return null;
     const line = try marlinToolLineFrom(arena, tool, .{}, sessions, done);
     return .{ .line = .{
+        .tool = tool,
         .verb = line.verb,
         .target = try std.mem.join(arena, ", ", names.items),
         .note = note orelse "",
@@ -1221,7 +1223,10 @@ fn appendMarlinToolLine(
 ) !void {
     const output_start = lines.items.len;
     defer stampOutputLines(lines.items[output_start..], rb.timestamp_ms);
-    const head = try std.fmt.allocPrint(alloc, "  ⚙ {s}{s}", .{ line.verb, if (line.target.len > 0) " " else "" });
+    // A message sent leads with its direction, not the tool glyph, so the
+    // conversation between sessions reads apart from the machinery.
+    const glyph = if (line.tool == .message) message_out_glyph else "⚙";
+    const head = try std.fmt.allocPrint(alloc, "  {s} {s}{s}", .{ glyph, line.verb, if (line.target.len > 0) " " else "" });
     const target = line.target[0..hardCellBreak(line.target, 0, w -| (displayWidth(head) + 2))];
     var note: []const u8 = "";
     if (line.note.len > 0) {
@@ -1236,7 +1241,20 @@ fn appendMarlinToolLine(
         .style2 = Palette.tool_cmd,
         .text3 = note,
         .style3 = Palette.collapse_hint,
+        .syntax = if (line.tool == .message) try arrowSpan(alloc, Palette.message_out) else &.{},
     });
+}
+
+/// Which way a message between sessions went: ← received, → sent.
+pub const message_in_glyph = "←";
+pub const message_out_glyph = "→";
+
+/// The arrow at the head of a message row ("  ← …"), in its direction's
+/// colour; the rest of the row keeps its own styles.
+fn arrowSpan(alloc: std.mem.Allocator, style: vaxis.Style) ![]const SyntaxSpan {
+    const span = try alloc.alloc(SyntaxSpan, 1);
+    span[0] = .{ .start = 2, .end = 2 + message_in_glyph.len, .style = style };
+    return span;
 }
 
 /// A tool call's row: a session tool said as what it does, anything else
@@ -2585,14 +2603,16 @@ fn rangeSeamNeedsBlank(stable_lines: []const Line, tail_lines: []const Line) boo
 /// it starts; the transcript view (ctrl+t) shows it whole.
 fn appendAgentMessage(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), rb: RenderBlock, expanded: bool, w: usize) !void {
     if (expanded) {
-        const head = try std.fmt.allocPrint(alloc, "  ↔ from {s}", .{rb.label});
+        const head = try std.fmt.allocPrint(alloc, "  " ++ message_in_glyph ++ " from {s}", .{rb.label});
+        const start = lines.items.len;
         try wrapPrefixed(alloc, lines, "", head, Palette.note, w);
+        lines.items[start].syntax = try arrowSpan(alloc, Palette.message_in);
         try wrapPrefixed(alloc, lines, "    ", rb.text, Palette.collapse_hint, w);
         return;
     }
     // The first line of what was said, flattened and cut to the row.
     const first = std.mem.trim(u8, rb.text[0 .. std.mem.indexOfScalar(u8, rb.text, '\n') orelse rb.text.len], " \t\r");
-    const head = try std.fmt.allocPrint(alloc, "  ↔ {s} · ", .{rb.label});
+    const head = try std.fmt.allocPrint(alloc, "  " ++ message_in_glyph ++ " {s} · ", .{rb.label});
     const hint = " · ctrl+t";
     // clipText appends " …" past `room`.
     const room = w -| (displayWidth(head) + displayWidth(hint) + 3);
@@ -2605,6 +2625,7 @@ fn appendAgentMessage(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), rb:
         .style2 = Palette.collapse_hint,
         .text3 = hint,
         .style3 = Palette.collapse_hint,
+        .syntax = try arrowSpan(alloc, Palette.message_in),
     });
 }
 

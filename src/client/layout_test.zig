@@ -1876,7 +1876,7 @@ test "a message from another agent folds to one line; ctrl+t shows it whole" {
         .from_agent = true,
     };
     const folded = try questionTranscriptText(arena, &.{message}, true);
-    try std.testing.expect(std.mem.indexOf(u8, folded, "↔ phone/voice · 2e96c9d3 · 1. I'm not changing gate or actuator now. · ctrl+t") != null);
+    try std.testing.expect(std.mem.indexOf(u8, folded, "← phone/voice · 2e96c9d3 · 1. I'm not changing gate or actuator now. · ctrl+t") != null);
     try std.testing.expect(std.mem.indexOf(u8, folded, "in the ledger") == null);
 
     var expanded_lines: std.ArrayList(Line) = .empty;
@@ -1917,7 +1917,7 @@ test "a message from another agent folds to one line; ctrl+t shows it whole" {
         try text.appendSlice(arena, try lineText(arena, line));
         try text.append(arena, '\n');
     }
-    try std.testing.expect(std.mem.indexOf(u8, text.items, "↔ from phone/voice · 2e96c9d3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text.items, "← from phone/voice · 2e96c9d3") != null);
     try std.testing.expect(std.mem.indexOf(u8, text.items, "in the ledger") != null);
     // Never a prompt card: no filled rows.
     for (expanded_lines.items) |line| try std.testing.expect(line.fill_style == null);
@@ -1993,8 +1993,8 @@ test "Marlin's own tools say what they do and name the session or image, under e
     const text = all.items;
     const named = try std.fmt.allocPrint(arena, "jev · {s}", .{jev[0..8]});
     try std.testing.expect(std.mem.indexOf(u8, text, "⚙ Listed sessions") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, try std.fmt.allocPrint(arena, "⚙ Message to {s}: Are you releasing?\n", .{named})) != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, try std.fmt.allocPrint(arena, "⚙ Message to {s}: Taking 072.\n", .{named})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, try std.fmt.allocPrint(arena, "→ Message to {s}: Are you releasing?\n", .{named})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, try std.fmt.allocPrint(arena, "→ Message to {s}: Taking 072.\n", .{named})) != null);
     // A shown image's row says so; the result's own words would repeat it.
     try std.testing.expect(std.mem.indexOf(u8, text, "⚙ Showed robin-messages-preview.png\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "Shown to the user") == null);
@@ -2051,7 +2051,7 @@ fn sessionToolTranscriptText(
 
 test "a run of calls to one session tool says its sessions in one row" {
     // Case: Codex told five sessions about a release; the trail read
-    // "⚙ Message to" five times, one row each.
+    // "Message to" five times, one row each.
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -2104,13 +2104,92 @@ test "a run of calls to one session tool says its sessions in one row" {
         try Codex.call(arena, "w4", "wait_for_session", postgres[0..8], ""),
     };
     const text = try sessionToolTranscriptText(arena, gpa, &blocks, &.{}, &sessions);
-    try std.testing.expect(std.mem.indexOf(u8, text, "⚙ Message to steward, postgres, beef1234\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "→ Message to steward, postgres, beef1234\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "⚙ Bash git fetch origin") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "⚙ Message to steward, postgres: Done.\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "→ Message to steward, postgres: Done.\n") != null);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "Message to"));
     try std.testing.expect(std.mem.indexOf(u8, text, try std.fmt.allocPrint(arena, "⚙ Waited on steward · {s}\n", .{steward[0..8]})) != null);
     try std.testing.expect(std.mem.indexOf(u8, text, try std.fmt.allocPrint(arena, "⚙ Waited on postgres · {s}\n", .{postgres[0..8]})) != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "⚙ Waiting on steward, postgres\n") != null);
+}
+
+/// Each row that leads with a message arrow: its text and the arrow's style.
+const ArrowRow = struct { text: []const u8, style: vaxis.Style };
+
+fn messageArrowRows(arena: std.mem.Allocator, gpa: std.mem.Allocator, blocks: []const RenderBlock, sessions: []const layout.SessionRef, expanded: bool) ![]const ArrowRow {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var cache = LayoutCache{};
+    defer cache.reset(gpa);
+    var tail = TailLayoutCache{};
+    defer tail.reset(gpa);
+    var stream = StreamLayoutCache{};
+    defer stream.reset(gpa);
+    var transcript = Transcript{
+        .io = threaded.io(),
+        .blocks = blocks,
+        .show_tool_transcript = expanded,
+        .state = .idle,
+        .layout_epoch = 0,
+        .delta = "",
+        .reasoning_delta = "",
+        .spinner_frame = 0,
+        .turn_started_ms = 0,
+        .call_started_ms = 0,
+        .stream_bytes = 0,
+        .stream_quiet_ms = 0,
+        .stream_status_at_ms = 0,
+        .approval = null,
+        .guest = true,
+        .sessions = sessions,
+        .layout_cache = &cache,
+        .tail_layout_cache = &tail,
+        .stream_layout_cache = &stream,
+    };
+    const lines = try layoutLines(arena, gpa, &transcript, 120);
+    var rows: std.ArrayList(ArrowRow) = .empty;
+    for (lines.items) |line| {
+        const text = try lineText(arena, line);
+        const arrow = inline for ([_][]const u8{ layout.message_in_glyph, layout.message_out_glyph }) |glyph| {
+            if (std.mem.startsWith(u8, text, "  " ++ glyph)) break glyph;
+        } else continue;
+        // The span covers the arrow and nothing else.
+        try std.testing.expectEqual(@as(usize, 1), line.syntax.len);
+        try std.testing.expectEqualStrings(arrow, text[line.syntax[0].start..line.syntax[0].end]);
+        try rows.append(arena, .{ .text = text, .style = line.syntax[0].style });
+    }
+    return rows.items;
+}
+
+test "messages between sessions lead with an arrow in their direction's colour" {
+    // Case: with sessions messaging each other a lot, a message sent or
+    // received was lost among the tool rows around it.
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const session_handle = @import("../core/session_handle.zig");
+    const steward = session_handle.full(1);
+    const sessions = [_]layout.SessionRef{.{ .sid = 1, .title = "steward" }};
+    const call = try std.fmt.allocPrint(arena, "{{\"handle\":\"{s}\",\"text\":\"Taking 072.\"}}", .{steward[0..8]});
+    const blocks = [_]RenderBlock{
+        .{ .kind = .user_msg, .turn_id = 1, .text = @constCast("Are you releasing?"), .label = @constCast("steward · 00000001"), .from_agent = true },
+        .{ .kind = .tool_call, .turn_id = 1, .call_id = @constCast("m1"), .label = @constCast("mcp__marlin__message_session"), .text = call },
+        .{ .kind = .tool_result, .turn_id = 1, .call_id = @constCast("m1"), .text = @constCast("Delivered."), .label = @constCast("") },
+        .{ .kind = .tool_call, .turn_id = 1, .call_id = @constCast("w1"), .label = @constCast("mcp__marlin__wait_for_session"), .text = call },
+        .{ .kind = .tool_result, .turn_id = 1, .call_id = @constCast("w1"), .text = @constCast("idle"), .label = @constCast("") },
+    };
+    for ([_]bool{ false, true }) |expanded| {
+        const rows = try messageArrowRows(arena, gpa, &blocks, &sessions, expanded);
+        try std.testing.expectEqual(@as(usize, 2), rows.len);
+        try std.testing.expect(std.mem.startsWith(u8, rows[0].text, "  ← "));
+        try std.testing.expect(std.meta.eql(rows[0].style, Palette.message_in));
+        try std.testing.expect(std.mem.startsWith(u8, rows[1].text, "  → Message to steward"));
+        try std.testing.expect(std.meta.eql(rows[1].style, Palette.message_out));
+    }
+    // Other session tools keep the tool glyph.
+    const text = try sessionToolTranscriptText(arena, gpa, &blocks, &.{}, &sessions);
+    try std.testing.expect(std.mem.indexOf(u8, text, "⚙ Waited on steward") != null);
 }
 
 test "a guest's live session tool says what it does and which session, not its MCP name" {

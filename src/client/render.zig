@@ -78,6 +78,11 @@ pub const Palette = struct {
     /// File-tool targets remain a single emphasized value. Bash previews use
     /// the semantic shell roles below instead of rendering as one blue blob.
     pub const tool_cmd: vaxis.Style = .{ .fg = .{ .index = 4 }, .bold = true }; // blue
+    /// Messages between sessions: the arrow says which way one went, so
+    /// that conversation stands out from the tool rows around it. Dark
+    /// purple for a message received, light purple for one sent.
+    pub const message_in: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x8b, 0x5c, 0xf6 } }, .bold = true };
+    pub const message_out: vaxis.Style = .{ .fg = .{ .rgb = .{ 0xc4, 0xb5, 0xfd } }, .bold = true };
     pub const shell_command: vaxis.Style = .{ .fg = .{ .index = 7 } };
     pub const shell_executable: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x82, 0xaa, 0xff } }, .bold = true };
     pub const shell_flag: vaxis.Style = .{ .fg = .{ .rgb = .{ 0x89, 0xdd, 0xff } } };
