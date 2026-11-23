@@ -10,8 +10,8 @@
             .hash = "vaxis-0.6.0-BWNV_LoTDQCQSGhvBbu_-fOf3I2P3TIiGaUzCDniO12E",
         },
         .regex = .{
-            .url = "https://github.com/zig-utils/zig-regex/archive/refs/tags/v0.2.1.tar.gz",
-            .hash = "zig_regex-0.2.1-omky0ZgdGQA1p3_ZDMPQ2PxIxqVzXZH8NhVTeHal08R3",
+            .url = "https://github.com/zig-utils/zig-regex/archive/refs/tags/v0.5.0.tar.gz",
+            .hash = "zig_regex-0.5.0-omky0dw1JgBjwcWg0HZiuEa0TNxkaAjhPIwC5u7_rH25",
         },
         .translate_c = .{
             .url = "git+https://codeberg.org/ziglang/translate-c?ref=zig-0.17.x#cfac21f3199b2b02ce3fd7db652aa456421fe4ab",
