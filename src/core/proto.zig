@@ -143,6 +143,8 @@ pub const SetupStatus = struct {
     codex_authenticated: bool = false,
     claude_code_available: bool = false,
     claude_code_authenticated: bool = false,
+    /// agy reports no sign-in state: installed is as far as Marlin knows.
+    agy_available: bool = false,
     openrouter_ready: bool = false,
     vercel_ready: bool = false,
     anthropic_ready: bool = false,

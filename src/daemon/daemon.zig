@@ -7592,6 +7592,7 @@ pub const Daemon = struct {
             .codex_authenticated = probe_guests and self.codexAuthenticated(),
             .claude_code_available = self.claudeCodeAvailable(),
             .claude_code_authenticated = probe_guests and self.claudeCodeAuthenticated(),
+            .agy_available = self.agyAvailable(),
             .openrouter_ready = envReady(self.environ, "OPENROUTER_API_KEY"),
             .vercel_ready = envReady(self.environ, "AI_GATEWAY_API_KEY"),
             .anthropic_ready = envReady(self.environ, "ANTHROPIC_API_KEY"),

@@ -1320,7 +1320,11 @@ test "provider setup distinguishes installed guests and advances custom fields w
     app.setup.readiness.codex_authenticated = true;
     try std.testing.expectEqualStrings("  ✓ signed in", app.setupProviderNote(setup_provider_items[1]));
 
-    app.setupProviderChosen(setup_provider_items[7]);
+    app.setup.readiness.agy_available = true;
+    try std.testing.expectEqualStrings("Antigravity · guest · Gemini 4 Neon on a Google login", setup_provider_items[3]);
+    try std.testing.expectEqualStrings("  ✓ installed", app.setupProviderNote(setup_provider_items[3]));
+
+    app.setupProviderChosen(setup_provider_items[8]);
     try std.testing.expectEqual(SetupPrompt.provider_name, app.setup.prompt);
     app.submitSetupPrompt("acme");
     try std.testing.expectEqual(SetupPrompt.base_url, app.setup.prompt);
@@ -7366,7 +7370,13 @@ test "a model is ready when its backend is, and unknown prefixes are trusted" {
     try std.testing.expect(ready.modelReady("claudecode/fable"));
     try std.testing.expect(!ready.modelReady("openrouter/anthropic/claude-sonnet-4.5"));
     try std.testing.expect(!ready.modelReady("codex/default"));
+    try std.testing.expect(!ready.modelReady("agy/default"));
     try std.testing.expect(ready.modelReady("someday/model"));
+}
+
+test "a custom provider cannot take a guest's name" {
+    for ([_][]const u8{ "codex", "claudecode", "muse", "agy" }) |name| try std.testing.expect(!setup_mod.validSetupProviderName(name));
+    try std.testing.expect(setup_mod.validSetupProviderName("acme"));
 }
 
 test "a bracketed paste arrives as one paste, not as keystrokes" {

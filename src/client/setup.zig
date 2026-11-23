@@ -10,7 +10,7 @@ const tui = @import("tui.zig");
 const App = tui.App;
 const PickerKind = tui.PickerKind;
 
-pub const SetupProvider = enum { openrouter, codex, claude_code, vercel, anthropic, litellm, local, custom };
+pub const SetupProvider = enum { openrouter, codex, claude_code, agy, vercel, anthropic, litellm, local, custom };
 
 pub const SetupPrompt = enum { none, credential, base_url, model, provider_name };
 
@@ -18,6 +18,7 @@ pub const setup_provider_items = [_][]const u8{
     "OpenRouter · native · one key, many models",
     "Codex · guest · ChatGPT login",
     "Claude Code · guest · Claude login",
+    "Antigravity · guest · Gemini 4 Neon on a Google login",
     "Vercel AI Gateway · native",
     "Anthropic API · native",
     "LiteLLM · local gateway",
@@ -31,6 +32,7 @@ pub const SetupReadiness = struct {
     codex_authenticated: bool = false,
     claude_code_available: bool = false,
     claude_code_authenticated: bool = false,
+    agy_available: bool = false,
     openrouter_ready: bool = false,
     vercel_ready: bool = false,
     anthropic_ready: bool = false,
@@ -44,6 +46,7 @@ pub const SetupReadiness = struct {
             .codex_authenticated = status.codex_authenticated,
             .claude_code_available = status.claude_code_available,
             .claude_code_authenticated = status.claude_code_authenticated,
+            .agy_available = status.agy_available,
             .openrouter_ready = status.openrouter_ready,
             .vercel_ready = status.vercel_ready,
             .anthropic_ready = status.anthropic_ready,
@@ -55,7 +58,7 @@ pub const SetupReadiness = struct {
     /// Whether the backend behind `model` can run a turn. Prefixes Marlin
     /// does not know are trusted; the daemon reports their failures.
     pub fn modelReady(self: SetupReadiness, model: []const u8) bool {
-        const Backend = enum { openrouter, vercel, anthropic, litellm, local, codex, claudecode };
+        const Backend = enum { openrouter, vercel, anthropic, litellm, local, codex, claudecode, agy };
         const prefix = model[0 .. std.mem.indexOfScalar(u8, model, '/') orelse model.len];
         return switch (std.meta.stringToEnum(Backend, prefix) orelse return true) {
             .openrouter => self.openrouter_ready,
@@ -65,6 +68,7 @@ pub const SetupReadiness = struct {
             .local => self.local_ready,
             .codex => self.codex_available,
             .claudecode => self.claude_code_available,
+            .agy => self.agy_available,
         };
     }
 };
@@ -74,7 +78,15 @@ pub fn validSetupProviderName(name: []const u8) bool {
     for (name) |byte| {
         if (!(std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_')) return false;
     }
-    return !std.mem.eql(u8, name, "codex") and !std.mem.eql(u8, name, "claudecode");
+    return !guestProviderName(name);
+}
+
+/// Model prefixes the guests own, which no configured provider may take.
+pub fn guestProviderName(name: []const u8) bool {
+    for ([_][]const u8{ "codex", "claudecode", "muse", "agy" }) |guest| {
+        if (std.mem.eql(u8, name, guest)) return true;
+    }
+    return false;
 }
 
 pub fn clearSetupDraft(self: *App) void {
@@ -126,6 +138,7 @@ pub fn setupProviderReady(self: *const App, provider: SetupProvider) bool {
         .openrouter => self.setup.readiness.openrouter_ready,
         .codex => self.setup.readiness.codex_authenticated,
         .claude_code => self.setup.readiness.claude_code_authenticated,
+        .agy => self.setup.readiness.agy_available,
         .vercel => self.setup.readiness.vercel_ready,
         .anthropic => self.setup.readiness.anthropic_ready,
         .litellm => self.setup.readiness.litellm_ready,
@@ -138,12 +151,14 @@ pub fn setupProviderNote(self: *const App, item: []const u8) []const u8 {
     const provider = setupProviderFromItem(item) orelse return "";
     if (self.setupProviderReady(provider)) return switch (provider) {
         .codex, .claude_code => "  ✓ signed in",
+        .agy => "  ✓ installed",
         .local => "  ✓ configured",
         else => "  ✓ key found",
     };
     return switch (provider) {
         .codex => if (self.setup.readiness.codex_available) "  · login needed" else "  · not installed",
         .claude_code => if (self.setup.readiness.claude_code_available) "  · login needed" else "  · not installed",
+        .agy => "  · not installed",
         .custom => "",
         else => "  · setup needed",
     };
@@ -197,6 +212,14 @@ pub fn setupProviderChosen(self: *App, item: []const u8) void {
                 return;
             }
             self.finishSetup("claudecode/default");
+        },
+        .agy => {
+            if (!self.setup.readiness.agy_available) {
+                self.openPicker(.setup_provider);
+                self.setNotice("the Antigravity CLI (agy) is not installed on the daemon host · install it, sign in with `agy`, then /setup", .{});
+                return;
+            }
+            self.finishSetup("agy/default");
         },
         .openrouter => {
             if (!self.setSetupBuffer(&self.setup.provider_name, "openrouter")) return;
@@ -254,7 +277,7 @@ pub fn setupModelSuggestion(self: *const App) []const u8 {
         .litellm => "litellm/",
         .local => "local/",
         .custom => "",
-        .codex, .claude_code => "",
+        .codex, .claude_code, .agy => "",
     };
 }
 
@@ -263,6 +286,10 @@ pub fn submitSetupPrompt(self: *App, raw: []const u8) void {
     switch (self.setup.prompt) {
         .none => {},
         .provider_name => {
+            if (guestProviderName(value)) {
+                self.setNotice("{s}/ is a guest's prefix · choose another provider name", .{value});
+                return;
+            }
             if (!validSetupProviderName(value)) {
                 self.setNotice("provider name must use letters, digits, - or _", .{});
                 return;
