@@ -2,7 +2,7 @@
 const std = @import("std");
 const raster = @import("raster.zig");
 const ghostty_font = @import("ghostty_font");
-const zigimg = @import("vaxis").zigimg;
+const wuffs = @import("wuffs");
 
 const fg: raster.Rgb = .{ 200, 200, 200 };
 const bg: raster.Rgb = .{ 0, 0, 0 };
@@ -158,14 +158,14 @@ test "the PNG decodes to the picture, at the display's density" {
     // 144 dpi.
     try std.testing.expect(std.mem.indexOf(u8, png, "pHYs\x00\x00\x16\x25\x00\x00\x16\x25\x01") != null);
 
-    var image = try zigimg.Image.fromMemory(gpa, png);
-    defer image.deinit(gpa);
-    try std.testing.expectEqual(@as(usize, picture.width), image.width);
-    try std.testing.expectEqual(@as(usize, picture.height), image.height);
-    const decoded = image.pixels.rgb24;
+    const image = try wuffs.png.decode(gpa, png);
+    defer gpa.free(image.data);
+    try std.testing.expectEqual(@as(u32, picture.width), image.width);
+    try std.testing.expectEqual(@as(u32, picture.height), image.height);
     for (0..picture.height) |y| for (0..picture.width) |x| {
         const want = picture.pixel(@intCast(x), @intCast(y));
-        const got = decoded[y * picture.width + x];
-        try std.testing.expectEqual(want, raster.Rgb{ got.r, got.g, got.b });
+        const got = image.data[(y * picture.width + x) * 4 ..][0..4];
+        try std.testing.expectEqual(want, raster.Rgb{ got[0], got[1], got[2] });
+        try std.testing.expectEqual(@as(u8, 255), got[3]);
     };
 }

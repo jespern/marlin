@@ -6,8 +6,8 @@
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .vaxis = .{
-            .url = "git+https://github.com/rockorager/libvaxis#0620b34e091deaa6f64608922be3814147128dfb",
-            .hash = "vaxis-0.6.0-BWNV_LoTDQCQSGhvBbu_-fOf3I2P3TIiGaUzCDniO12E",
+            .url = "git+https://github.com/rockorager/libvaxis#25b4bd7371cc3c32049e103ab292a525a1ecb7a7",
+            .hash = "vaxis-0.6.0-BWNV_G8gDgCNWI48cFKWal2NROjTRQXumw3ssMDeD6jt",
         },
         .regex = .{
             .url = "https://github.com/zig-utils/zig-regex/archive/refs/tags/v0.5.0.tar.gz",

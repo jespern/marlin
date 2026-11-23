@@ -3,7 +3,7 @@
 //! own reference renderings pixel for pixel.
 const std = @import("std");
 const ghostty_font = @import("ghostty_font");
-const zigimg = @import("vaxis").zigimg;
+const wuffs = @import("wuffs");
 
 /// Ghostty's testDrawRanges for U+2500...U+25FF: every sprite in the range,
 /// padded canvas and all, in a 16x16 atlas, compared with the reference.
@@ -41,13 +41,14 @@ fn expectMatchesReference(comptime size: []const u8, width: u32, ascent: u32, de
         }
     }
 
-    var reference = try zigimg.Image.fromMemory(gpa, @embedFile("sprite_reference_" ++ size));
-    defer reference.deinit(gpa);
-    try std.testing.expectEqual(@as(usize, atlas_width), reference.width);
-    const expected = reference.pixels.grayscale8;
+    // The references are grayscale; wuffs decodes them to RGBA with R = G = B.
+    const reference = try wuffs.png.decode(gpa, @embedFile("sprite_reference_" ++ size));
+    defer gpa.free(reference.data);
+    try std.testing.expectEqual(atlas_width, reference.width);
+    try std.testing.expectEqual(atlas.len * 4, reference.data.len);
     var differing: usize = 0;
-    for (atlas, expected) |got, want| {
-        if (got != want.value) differing += 1;
+    for (atlas, 0..) |got, i| {
+        if (got != reference.data[i * 4]) differing += 1;
     }
     try std.testing.expectEqual(@as(usize, 0), differing);
 }

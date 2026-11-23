@@ -309,8 +309,8 @@ pub fn build(b: *std.Build) void {
             .root_source_file = ghostty.path(b.fmt("src/font/sprite/testdata/U+2500...U+25FF-{s}.png", .{size})),
         });
     }
-    // PNGs with alpha, a palette, and 16-bit channels, to hold the shell
-    // PNG decoder to the pixels zigimg produced.
+    // PNGs with alpha, a palette, and 16-bit channels for the shell PNG
+    // decoder.
     for ([_][2][]const u8{
         .{ "png_sample_rgba", "images/gnome/16.png" },
         .{ "png_sample_palette", "images/Ghostty.icon/Assets/gloss.png" },
