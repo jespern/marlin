@@ -138,6 +138,15 @@
   .images { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
   .images a { display: block; line-height: 0; }
   .images img { max-width: 100%; max-height: 60vh; border-radius: 4px; border: 1px solid var(--line); }
+  /* A tapped image, full size over everything. Installed on the home screen
+     the app has no back button, so a tap, Esc or the back gesture closes it. */
+  #image-view {
+    position: fixed; inset: 0; z-index: 60; background: rgba(0,0,0,.92);
+    display: flex; align-items: center; justify-content: center;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+  #image-view[hidden] { display: none; }
+  #image-view img { max-width: 100%; max-height: 100%; object-fit: contain; }
   .user {
     background: var(--prompt-bg); border-left: 3px solid var(--accent);
     padding: 8px 12px; border-radius: 4px; white-space: pre-wrap;
@@ -451,6 +460,7 @@
   </div>
 </div>
 <div id="backdrop"></div>
+<div id="image-view" hidden><img alt=""></div>
 <div id="main">
   <div id="topbar">
     <button id="menu-btn" title="sessions">☰</button>
@@ -718,7 +728,7 @@ function imageStrip(attachments) {
     const src = '/blob?hash=' + encodeURIComponent(a.hash);
     const link = el('a');
     link.href = src;
-    link.target = '_blank';
+    link.onclick = e => { e.preventDefault(); openImageView(src, a.name || 'image'); };
     const img = el('img');
     img.src = src;
     img.alt = a.name || 'image';
@@ -730,6 +740,30 @@ function imageStrip(attachments) {
   }
   return strip;
 }
+
+function openImageView(src, alt) {
+  const view = $('#image-view');
+  const img = view.querySelector('img');
+  img.src = src;
+  img.alt = alt;
+  view.hidden = false;
+  history.pushState({ imageView: true }, '');
+}
+
+// fromHistory: the back gesture already left the viewer's history entry.
+function closeImageView(fromHistory) {
+  const view = $('#image-view');
+  if (view.hidden) return;
+  view.hidden = true;
+  view.querySelector('img').removeAttribute('src');
+  if (!fromHistory && history.state && history.state.imageView) history.back();
+}
+
+$('#image-view').addEventListener('click', () => closeImageView(false));
+window.addEventListener('popstate', () => closeImageView(true));
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && !$('#image-view').hidden) { e.preventDefault(); e.stopImmediatePropagation(); closeImageView(false); }
+}, true);
 
 function settleOptimisticInput(kind, text, attachments) {
   const i = pendingInputs.findIndex(p => p.sid === sid && p.text === text);

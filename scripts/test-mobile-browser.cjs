@@ -646,6 +646,21 @@ async function main() {
       const img=n.querySelector('.images img');
       return n.textContent==='look at this' && img && img.complete && img.naturalWidth===1500 && img.getAttribute('src').startsWith('/blob?hash=');
     }));
+    // A tap opens it full size in the page, not a new view: a Home Screen
+    // app has no back button to leave one. A tap, or the back gesture, closes it.
+    const appUrl=page.url();
+    await page.locator('.block.user .images img').first().tap();
+    await page.locator('#image-view').waitFor({state:'visible'});
+    assert.equal(page.url(),appUrl);
+    assert.match(await page.locator('#image-view img').getAttribute('src'),/^\/blob\?hash=/);
+    await page.locator('#image-view').tap();
+    await page.locator('#image-view').waitFor({state:'hidden'});
+    await page.locator('.block.user .images img').first().tap();
+    await page.locator('#image-view').waitFor({state:'visible'});
+    await page.goBack();
+    await page.locator('#image-view').waitFor({state:'hidden'});
+    assert.equal(page.url(),appUrl);
+    assert.equal(await page.locator('#connection-state').textContent(),'Connected');
     assert.deepEqual(errors,[]);
     // A Home Screen app fills its web view and never extends past it: iOS
     // can report a screen taller than the view, and content laid out to the
