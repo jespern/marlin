@@ -331,6 +331,10 @@ pub const ClientMsg = union(enum) {
     /// Set a session's display title. The daemon normalizes it like
     /// auto-generated titles (first line, trimmed, length-capped).
     session_rename: struct { sid: u64, title: []const u8 },
+    /// Move root tab `sid` just before root `before_sid` in the tab strip,
+    /// or last when null. Answered with ok; every open root's new
+    /// tab_order goes out as session_upsert.
+    session_move: struct { sid: u64, before_sid: ?u64 = null },
     /// Change the working directory used by subsequent turns. Relative paths
     /// resolve against the session's current working directory.
     session_set_cwd: struct { sid: u64, cwd: []const u8 },
@@ -893,6 +897,10 @@ pub const SessionInfo = struct {
     state: SessionState = .idle,
     pause: PauseState = .none,
     created_at: i64,
+    /// Place in the tab strip, set by session_move: roots sort by it,
+    /// and 0 (never moved, or an older daemon) sorts after every placed
+    /// root, by created_at.
+    tab_order: i64 = 0,
     running: bool,
     /// Effective shell-sandbox state: the session's toggle AND a verified
     /// backend. Defaults false when decoding older daemons.

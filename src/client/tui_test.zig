@@ -7130,6 +7130,81 @@ fn recapBlocks(app: *const App) usize {
     return count;
 }
 
+test "/move places the tab before the one at pos, after it with l, or last with -1" {
+    // Jesper's spec: on B in A B C D E, /move 4 gives A C B D E (D shifts
+    // right), /move 4 l gives A C D B E (D stays left of B).
+    const order = [_]u64{ 'A', 'B', 'C', 'D', 'E' };
+    try std.testing.expectEqual(@as(?u64, 'D'), try tui.tabMoveBefore(&order, 'B', 4, .right));
+    try std.testing.expectEqual(@as(usize, 3), tui.tabPositionAfterMove(&order, 'B', 'D'));
+    try std.testing.expectEqual(@as(?u64, 'E'), try tui.tabMoveBefore(&order, 'B', 4, .left));
+    try std.testing.expectEqual(@as(usize, 4), tui.tabPositionAfterMove(&order, 'B', 'E'));
+    try std.testing.expectEqual(@as(?u64, null), try tui.tabMoveBefore(&order, 'B', 5, .left));
+    try std.testing.expectEqual(@as(?u64, null), try tui.tabMoveBefore(&order, 'B', -1, .right));
+    try std.testing.expectEqual(@as(?u64, null), try tui.tabMoveBefore(&order, 'B', -1, .left));
+    try std.testing.expectEqual(@as(usize, 5), tui.tabPositionAfterMove(&order, 'B', null));
+    // Leftwards: on D, /move 2 → A D B C E.
+    try std.testing.expectEqual(@as(?u64, 'B'), try tui.tabMoveBefore(&order, 'D', 2, .right));
+    try std.testing.expectEqual(@as(usize, 2), tui.tabPositionAfterMove(&order, 'D', 'B'));
+    // Onto itself: stays put.
+    try std.testing.expectEqual(@as(?u64, 'C'), try tui.tabMoveBefore(&order, 'B', 2, .right));
+    try std.testing.expectEqual(@as(?u64, null), try tui.tabMoveBefore(&order, 'E', 5, .right));
+    try std.testing.expectEqual(@as(usize, 2), tui.tabPositionAfterMove(&order, 'B', 'C'));
+    try std.testing.expectError(error.NoTab, tui.tabMoveBefore(&order, 'B', 0, .right));
+    try std.testing.expectError(error.NoTab, tui.tabMoveBefore(&order, 'B', 6, .right));
+    try std.testing.expectError(error.NoTab, tui.tabMoveBefore(&order, 'B', -2, .right));
+}
+
+test "the tab strip, Alt+N and /move follow tab_order, with unmoved tabs last by age" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    app.replaceSessionSummaries(&.{
+        .{ .sid = 1, .title = "one", .model = "m", .status = "idle", .created_at = 10, .tab_order = 2, .running = false },
+        .{ .sid = 2, .title = "two", .model = "m", .status = "idle", .created_at = 20, .tab_order = 1, .running = false },
+        .{ .sid = 3, .title = "three", .model = "m", .status = "idle", .created_at = 5, .running = false },
+        .{ .sid = 4, .title = "four", .model = "m", .status = "idle", .created_at = 1, .running = false },
+    });
+    const order = try tui.rootTabOrder(gpa, app.sessions.items);
+    defer gpa.free(order);
+    try std.testing.expectEqualSlices(u64, &.{ 2, 1, 4, 3 }, order);
+    try std.testing.expectEqual(@as(?u64, 4), tui.rootTabSidAtIndex(app.sessions.items, 3));
+    try std.testing.expectEqual(@as(?u64, 4), tui.nextRootTabSid(app.sessions.items, 1, 1));
+
+    var frame = std.heap.ArenaAllocator.init(gpa);
+    defer frame.deinit();
+    const bar = try layoutTabBar(frame.allocator(), &app, 200);
+    try std.testing.expectEqual(@as(u64, 2), bar.items[0].sid);
+    try std.testing.expectEqual(@as(u64, 3), bar.items[3].sid);
+
+    app.runCommand("/move 4");
+    var requests = std.mem.splitScalar(u8, output.written(), '\n');
+    var moved = false;
+    while (requests.next()) |line| {
+        if (line.len == 0) continue;
+        const request = try proto.decode(proto.ClientMsg, frame.allocator(), line);
+        if (request != .session_move) continue;
+        try std.testing.expectEqual(@as(u64, 1), request.session_move.sid);
+        try std.testing.expectEqual(@as(?u64, 3), request.session_move.before_sid);
+        moved = true;
+    }
+    try std.testing.expect(moved);
+    try std.testing.expectEqualStrings("moved to tab 3", app.notice.items);
+
+    output.clearRetainingCapacity();
+    app.runCommand("/move 9");
+    try std.testing.expectEqualStrings("no tab 9", app.notice.items);
+    app.runCommand("/move 2 x");
+    try std.testing.expectEqualStrings("usage: /move <pos|-1> [r|l]", app.notice.items);
+    try std.testing.expectEqual(@as(usize, 0), output.written().len);
+}
+
 test "returning to an idle cached tab keeps its layout and appends only what it missed" {
     // Case: Jesper flipped between tabs and saw the recap, and possibly the
     // whole window, drawn again each time: parking dropped the layout and

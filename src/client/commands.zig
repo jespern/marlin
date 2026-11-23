@@ -57,6 +57,7 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "/cwd", .usage = " <path>", .description = "change this session's working directory", .accepts_args = true },
     .{ .name = "/cd", .usage = " <path>", .description = "change working directory (alias for /cwd)", .accepts_args = true },
     .{ .name = "/rename", .usage = " <title>", .description = "rename this session", .accepts_args = true },
+    .{ .name = "/move", .usage = " <pos|-1> [r|l]", .description = "move this tab to position pos (-1 = last); the tab there shifts right, or left with l", .accepts_args = true },
     .{ .name = "/archive", .usage = " [children]", .description = "archive this session, or its finished children", .accepts_args = true },
     .{ .name = "/attach", .usage = " <image-path>", .description = "attach a PNG, JPEG, GIF, or WebP image", .accepts_args = true },
     .{ .name = "/compact", .usage = " [focus]", .description = "compact the current context (guests compact their own; focus steers Claude Code's summary)", .accepts_args = true },
@@ -879,6 +880,8 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
             return;
         };
         self.setNotice("renamed to {s}", .{title});
+    } else if (std.mem.eql(u8, head, "/move")) {
+        self.moveTab(it.next(), it.next(), it.next() != null);
     } else if (std.mem.eql(u8, head, "/archive")) {
         const arg = it.rest();
         if (arg.len == 0) {

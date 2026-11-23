@@ -597,16 +597,20 @@ test "gc removes orphans and explicitly demotes old idle blob bodies" {
     try std.testing.expectEqualStrings("referenced old output", fresh);
 }
 
-test "schema is v21 with performance telemetry and scaling indexes" {
+test "schema is v22 with performance telemetry and scaling indexes" {
     const gpa = std.testing.allocator;
     var store = try Store.open(gpa, null);
     defer store.close();
 
-    try std.testing.expectEqual(@as(i64, 21), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 22), try store.kvGetInt("schema_version"));
     // migrate() must be a no-op on a current DB (idempotent open).
     try store.migrate();
-    try std.testing.expectEqual(@as(i64, 21), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 22), try store.kvGetInt("schema_version"));
     try store.createSession(42, 1, "/tmp", "m", .auto);
+    // v22: a tab never moved has no place yet.
+    const listing = try store.getSessionListing(42);
+    defer listing.deinit(gpa);
+    try std.testing.expectEqual(@as(i64, 0), listing.tab_order);
     // v20: a guest's autocompact threshold, null (configured default) until set.
     try std.testing.expectEqual(@as(?u64, null), try store.getSessionGuestAutocompact(42));
     try store.setSessionGuestAutocompact(42, 200_000);
@@ -1006,6 +1010,60 @@ test "renaming a session locks its title; auto titles stay unlocked" {
     try std.testing.expectEqualStrings("my title", renamed.title);
 }
 
+fn expectTabOrder(store: *Store, expected: []const u64) !void {
+    const rows = try store.listSessions(false);
+    defer {
+        for (rows) |row| row.deinit(std.testing.allocator);
+        std.testing.allocator.free(rows);
+    }
+    for (expected, 1..) |sid, rank| {
+        for (rows) |row| {
+            if (row.id == sid) try std.testing.expectEqual(@as(i64, @intCast(rank)), row.tab_order);
+        }
+    }
+}
+
+test "moving a tab renumbers the open roots and a new tab opens after them" {
+    const gpa = std.testing.allocator;
+    var store = try Store.open(gpa, null);
+    defer store.close();
+    for (1..6) |sid| try store.createSession(sid, @intCast(sid * 10), "/", "m", .auto);
+    try store.appendBlock(.{
+        .id = 77,
+        .session_id = 2,
+        .turn_id = 1,
+        .seq = 1,
+        .ts = 21,
+        .body = .{ .tool_call = .{ .call_id = "task-1", .name = "task", .args_json = "{}" } },
+    });
+    try store.createChildSession(9, 25, 2, 77, "child", "/", "m", .auto, 0);
+    try store.setSessionTreeArchived(5, 99);
+
+    // Tabs 1 2 3 4; 2 goes before 4.
+    const first = try store.moveRootTab(2, 4);
+    defer gpa.free(first);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 3, 2, 4 }, first);
+    try expectTabOrder(&store, first);
+
+    // Last, then onto itself: no change.
+    const last = try store.moveRootTab(1, null);
+    defer gpa.free(last);
+    try std.testing.expectEqualSlices(u64, &.{ 3, 2, 4, 1 }, last);
+    const same = try store.moveRootTab(4, 4);
+    defer gpa.free(same);
+    try std.testing.expectEqualSlices(u64, &.{ 3, 2, 4, 1 }, same);
+
+    // A tab opened later has tab_order 0 and sorts after the placed ones.
+    try store.createSession(6, 1, "/", "m", .auto);
+    const with_new = try store.moveRootTab(6, 3);
+    defer gpa.free(with_new);
+    try std.testing.expectEqualSlices(u64, &.{ 6, 3, 2, 4, 1 }, with_new);
+
+    try std.testing.expectError(error.NotFound, store.moveRootTab(9, null));
+    try std.testing.expectError(error.NotFound, store.moveRootTab(5, null));
+    try std.testing.expectError(error.NotFound, store.moveRootTab(1, 9));
+}
+
 test "v13 session runtime migration preserves defaults and independent overrides" {
     var store = try Store.open(std.testing.allocator, null);
     defer store.close();
@@ -1021,6 +1079,7 @@ test "v13 session runtime migration preserves defaults and independent overrides
         "ALTER TABLE sessions DROP COLUMN draft",
         "ALTER TABLE sessions DROP COLUMN guest_autocompact_tokens",
         "ALTER TABLE sessions DROP COLUMN agy_session_id",
+        "ALTER TABLE sessions DROP COLUMN tab_order",
         "UPDATE kv SET value='13' WHERE key='schema_version'",
     }) |sql| {
         const stmt = try store.prepare(sql);
@@ -1056,6 +1115,7 @@ test "v14 migration preserves paused grants and later revocation overrides old c
         "ALTER TABLE sessions DROP COLUMN draft",
         "ALTER TABLE sessions DROP COLUMN guest_autocompact_tokens",
         "ALTER TABLE sessions DROP COLUMN agy_session_id",
+        "ALTER TABLE sessions DROP COLUMN tab_order",
         "UPDATE kv SET value='14' WHERE key='schema_version'",
     }) |sql| {
         const stmt = try store.prepare(sql);

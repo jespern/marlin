@@ -70,7 +70,7 @@ fn tabLabel(app: *const App, summary: ?*const SessionSummary) []const u8 {
     return identity[0..hardCellBreak(identity, 0, tab_label_max_cells)];
 }
 
-/// Build a chronological, root-only tab window. When the full strip does not
+/// Build the root-only tab window in tab order (tui.tabPrecedes). When the full strip does not
 /// fit, retain a contiguous neighborhood around the active root and reserve
 /// two cells at either edge for overflow markers.
 pub fn layoutTabBar(arena: std.mem.Allocator, app: *const App, width: usize) !TabLayout {
@@ -87,6 +87,7 @@ pub fn layoutTabBar(arena: std.mem.Allocator, app: *const App, width: usize) !Ta
             .active = session.sid == active_root,
             .shell = session.shell_id != 0,
             .created_at = session.created_at,
+            .tab_order = session.tab_order,
         });
     }
     if (candidates.items.len == 0) {
@@ -101,7 +102,7 @@ pub fn layoutTabBar(arena: std.mem.Allocator, app: *const App, width: usize) !Ta
     }
     std.sort.insertion(TabCandidate, candidates.items, {}, struct {
         fn lessThan(_: void, a: TabCandidate, b: TabCandidate) bool {
-            return a.created_at < b.created_at or (a.created_at == b.created_at and a.sid < b.sid);
+            return tui.tabPrecedes(a, b);
         }
     }.lessThan);
     for (candidates.items, 1..) |*candidate, index| candidate.index = index;

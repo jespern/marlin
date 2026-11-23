@@ -2679,6 +2679,23 @@ pub const Daemon = struct {
                 self.sendTo(client, .{ .ok = .{} });
                 self.broadcastSessionUpsert(sr.sid);
             },
+            .session_move => |sm| {
+                const order = self.store.moveRootTab(sm.sid, sm.before_sid) catch |err| {
+                    self.sendTo(client, if (err == error.NotFound)
+                        .{ .err = .{ .code = "no_session", .msg = "only open root sessions have tabs" } }
+                    else
+                        .{ .err = .{ .code = "store", .msg = "could not move tab" } });
+                    return;
+                };
+                defer self.gpa.free(order);
+                self.sendTo(client, .{ .ok = .{} });
+                for (order) |sid| {
+                    const row = self.store.getSessionListing(sid) catch continue;
+                    defer row.deinit(self.gpa);
+                    self.fanOutSessionUpsertRow(row);
+                }
+                self.broadcastLegacySessionList();
+            },
             .session_set_cwd => |sc| {
                 const session = (try self.getOrLoadSession(sc.sid)) orelse {
                     self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
@@ -6647,6 +6664,7 @@ pub const Daemon = struct {
                 .state = state,
                 .pause = if (live) |session| sessionPauseState(session) else if (stored_pause != null) .paused else .none,
                 .created_at = row.created_at,
+                .tab_order = row.tab_order,
                 .running = state == .running,
                 .sandboxed = self.sandbox_backend != .unavailable and
                     (if (live) |session| session.sandbox_enabled else self.cfg.permissions_enabled),

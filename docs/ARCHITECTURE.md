@@ -660,7 +660,7 @@ Key decisions:
 ```
 sessions(id, title, created_at, cwd, model, effort, provider, status,
          pinned_context, config_json, parent_sid, kind, parent_block_id,
-         max_rounds)
+         max_rounds, tab_order)
 blocks(id, session_id, turn_id, seq, kind, ts, body_json, covers_to_seq)
 blobs(hash, bytes, created_at, tombstone)  -- full tool outputs, content-addressed
 blob_refs(hash, block_id)                  -- refcounting for GC

@@ -1202,3 +1202,93 @@ test "a changed MCP server is re-listed only once no turn is running" {
     try std.testing.expect(runtime.find("mcp__grow__added") != null);
     try std.testing.expectEqual(@as(usize, 0), r.daemon.mcp_stale.items.len);
 }
+
+test "session_move stores the tab order and broadcasts every open root" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var server = try (try std.Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    var peer = try server.socket.address.connect(io, .{ .mode = .stream });
+    defer peer.close(io);
+    var stream = try server.accept(io);
+    defer stream.close(io);
+
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    // One literal, so unnamed fields take their defaults (see ShellRig).
+    var daemon: daemon_mod.Daemon = .{
+        .gpa = gpa,
+        .io = io,
+        .environ = &environ,
+        .events = .init(gpa),
+        .clients = .empty,
+        .clients_mutex = .init,
+        .phone_push = null,
+        .mcp_stale = .empty,
+        .sessions = .empty,
+        .shells = .empty,
+        .agent_waits = .empty,
+        .next_shell_id = 1,
+        .store = try store.Store.open(gpa, null),
+        .cfg = .{},
+        .network = .{ .gpa = gpa },
+        .advertiser = null,
+        .sandbox_backend = .unavailable,
+        .presence = .{},
+        .pending_reboot = null,
+        .outgoing = null,
+        .predecessor_fd = -1,
+        .predecessor_reader = null,
+        .handed_over = false,
+        .web_deferred = false,
+        // Not reached by this test.
+        .extensions = undefined,
+        .http_pool = undefined,
+    };
+    defer daemon.store.close();
+    defer daemon.clients.deinit(gpa);
+    defer daemon.sessions.deinit(gpa);
+    defer daemon.events.deinit();
+    for (1..4) |sid| try daemon.store.createSession(sid, @intCast(sid), "/", "m", .auto);
+    var mover = daemon_mod.Client{ .id = 1, .stream = stream, .outbox = .init(gpa), .said_hello = true };
+    var watcher = daemon_mod.Client{
+        .id = 2,
+        .stream = stream,
+        .outbox = .init(gpa),
+        .said_hello = true,
+        .watches_sessions = true,
+        .watches_session_deltas = true,
+    };
+    defer for ([_]*daemon_mod.Client{ &mover, &watcher }) |client| {
+        while (client.outbox.tryPop(io)) |line| gpa.free(line.bytes);
+        client.outbox.deinit();
+    };
+    try daemon.clients.put(gpa, mover.id, &mover);
+    try daemon.clients.put(gpa, watcher.id, &watcher);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const move = try proto.encode(gpa, proto.ClientMsg{ .session_move = .{ .sid = 3, .before_sid = 1 } });
+    try daemon.handleEvent(.{ .client_msg = .{ .client_id = mover.id, .msg_line = move } });
+
+    const reply = mover.outbox.tryPop(io).?;
+    defer gpa.free(reply.bytes);
+    try std.testing.expect(try proto.decode(proto.DaemonMsg, arena, try arena.dupe(u8, reply.bytes)) == .ok);
+    var ranks: [4]i64 = @splat(0);
+    while (watcher.outbox.tryPop(io)) |line| {
+        defer gpa.free(line.bytes);
+        const msg = try proto.decode(proto.DaemonMsg, arena, try arena.dupe(u8, line.bytes));
+        if (msg == .session_upsert) ranks[msg.session_upsert.session.sid] = msg.session_upsert.session.tab_order;
+    }
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3, 1 }, ranks[1..]);
+
+    const child = try proto.encode(gpa, proto.ClientMsg{ .session_move = .{ .sid = 99 } });
+    try daemon.handleEvent(.{ .client_msg = .{ .client_id = mover.id, .msg_line = child } });
+    const refused = mover.outbox.tryPop(io).?;
+    defer gpa.free(refused.bytes);
+    const err = try proto.decode(proto.DaemonMsg, arena, try arena.dupe(u8, refused.bytes));
+    try std.testing.expectEqualStrings("no_session", err.err.code);
+}

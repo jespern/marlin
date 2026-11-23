@@ -65,7 +65,8 @@ const schema_sql =
     \\  guest_context_limit INTEGER,
     \\  draft TEXT NOT NULL DEFAULT '',
     \\  guest_autocompact_tokens INTEGER,
-    \\  agy_session_id TEXT
+    \\  agy_session_id TEXT,
+    \\  tab_order INTEGER NOT NULL DEFAULT 0
     \\);
     \\CREATE TABLE IF NOT EXISTS live_shells(
     \\  session_id INTEGER PRIMARY KEY,
@@ -206,7 +207,7 @@ const schema_sql =
     \\  kind TEXT NOT NULL,
     \\  detail TEXT NOT NULL DEFAULT '{}'
     \\);
-    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','21');
+    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','22');
 ;
 
 pub const SessionRow = struct {
@@ -550,6 +551,14 @@ pub const Store = struct {
             try self.execAll(
                 \\ALTER TABLE sessions ADD COLUMN agy_session_id TEXT;
                 \\UPDATE kv SET value='21' WHERE key='schema_version';
+            );
+        }
+        if (ver < 22) {
+            // v21 → v22: a root's place in the tab strip once moved (/move).
+            // 0 = never moved: such tabs follow the placed ones by age.
+            try self.execAll(
+                \\ALTER TABLE sessions ADD COLUMN tab_order INTEGER NOT NULL DEFAULT 0;
+                \\UPDATE kv SET value='22' WHERE key='schema_version';
             );
         }
     }
@@ -1801,6 +1810,8 @@ pub const Store = struct {
         archived: bool,
         plan_mode: bool,
         approval_mode: ApprovalMode = .default,
+        /// Place in the tab strip; 0 = never moved (see moveRootTab).
+        tab_order: i64 = 0,
 
         pub fn deinit(self: SessionListing, gpa: std.mem.Allocator) void {
             gpa.free(self.title);
@@ -1834,6 +1845,7 @@ pub const Store = struct {
             .archived = c.sqlite3_column_int64(stmt, 11) != 0,
             .plan_mode = c.sqlite3_column_int64(stmt, 12) != 0,
             .approval_mode = ApprovalMode.parse(columnText(stmt, 13)),
+            .tab_order = c.sqlite3_column_int64(stmt, 14),
         };
     }
 
@@ -1843,7 +1855,7 @@ pub const Store = struct {
         const stmt = try self.prepare(
             \\SELECT s.id, s.parent_sid, s.kind, s.parent_block_id, COALESCE(s.max_rounds, 0),
             \\       s.title, s.cwd, s.model, s.effort, s.status, s.created_at,
-            \\       s.archived_at IS NOT NULL, s.plan_mode, s.approval_mode
+            \\       s.archived_at IS NOT NULL, s.plan_mode, s.approval_mode, s.tab_order
             \\FROM sessions s
             \\WHERE (? OR s.archived_at IS NULL)
             \\ORDER BY COALESCE((SELECT p.created_at FROM sessions p WHERE p.id=s.parent_sid), s.created_at) DESC,
@@ -1869,13 +1881,64 @@ pub const Store = struct {
         return out.toOwnedSlice(self.gpa);
     }
 
+    /// Put root `id` just before root `before` in the tab strip, or last
+    /// when `before` is null. Every open root is renumbered 1..N in the new
+    /// order, so tabs never moved (tab_order 0), such as ones opened later,
+    /// follow by age. Returns the open roots in their new order; the caller
+    /// frees it.
+    pub fn moveRootTab(self: Store, id: u64, before: ?u64) Error![]u64 {
+        const db_mutex = c.sqlite3_db_mutex(self.db);
+        c.sqlite3_mutex_enter(db_mutex);
+        defer c.sqlite3_mutex_leave(db_mutex);
+        try self.execAll("BEGIN IMMEDIATE;");
+        var committed = false;
+        defer if (!committed) self.execAll("ROLLBACK;") catch {};
+
+        var order: std.ArrayList(u64) = .empty;
+        errdefer order.deinit(self.gpa);
+        var found: ?usize = null;
+        {
+            const stmt = try self.prepare(
+                \\SELECT id FROM sessions
+                \\WHERE parent_sid IS NULL AND kind='root' AND archived_at IS NULL
+                \\ORDER BY tab_order=0, tab_order, created_at, id
+            );
+            defer finalize(stmt);
+            while (true) {
+                const rc = c.sqlite3_step(stmt);
+                if (rc == c.SQLITE_DONE) break;
+                if (rc != c.SQLITE_ROW) return error.SqliteStep;
+                const row_id: u64 = @bitCast(c.sqlite3_column_int64(stmt, 0));
+                if (row_id == id) found = order.items.len else try order.append(self.gpa, row_id);
+            }
+        }
+        const was_at = found orelse return error.NotFound;
+        var at = order.items.len;
+        if (before) |target| {
+            at = if (target == id) was_at else std.mem.indexOfScalar(u64, order.items, target) orelse return error.NotFound;
+        }
+        try order.insert(self.gpa, at, id);
+
+        const update = try self.prepare("UPDATE sessions SET tab_order=? WHERE id=?");
+        defer finalize(update);
+        for (order.items, 1..) |row_id, rank| {
+            resetStatement(update);
+            bindInt(update, 1, @intCast(rank));
+            bindInt(update, 2, @bitCast(row_id));
+            try stepDone(update);
+        }
+        try self.execAll("COMMIT;");
+        committed = true;
+        return order.toOwnedSlice(self.gpa);
+    }
+
     /// Fetch one catalog row without scanning the durable session table.
     /// The caller owns the returned strings via SessionListing.deinit().
     pub fn getSessionListing(self: Store, id: u64) Error!SessionListing {
         const stmt = try self.prepare(
             \\SELECT s.id, s.parent_sid, s.kind, s.parent_block_id, COALESCE(s.max_rounds, 0),
             \\       s.title, s.cwd, s.model, s.effort, s.status, s.created_at,
-            \\       s.archived_at IS NOT NULL, s.plan_mode, s.approval_mode
+            \\       s.archived_at IS NOT NULL, s.plan_mode, s.approval_mode, s.tab_order
             \\FROM sessions s WHERE s.id=?
         );
         defer finalize(stmt);
@@ -1897,7 +1960,7 @@ pub const Store = struct {
             \\)
             \\SELECT s.id, s.parent_sid, s.kind, s.parent_block_id, COALESCE(s.max_rounds, 0),
             \\       s.title, s.cwd, s.model, s.effort, s.status, s.created_at,
-            \\       s.archived_at IS NOT NULL, s.plan_mode, s.approval_mode
+            \\       s.archived_at IS NOT NULL, s.plan_mode, s.approval_mode, s.tab_order
             \\FROM sessions s JOIN session_tree t ON t.id=s.id
             \\ORDER BY CASE WHEN s.parent_sid IS NULL THEN 0 ELSE 1 END,
             \\         s.created_at ASC, s.id ASC

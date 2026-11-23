@@ -64,6 +64,7 @@ policy that failed open. Both default false when decoding an older daemon.
 | session_complete_cwd | sid, typed, request_id | session_cwd_completions{sid, cwd, typed, request_id, matches}; directory arguments resolved on the daemon host, including its HOME; replies are requested only |
 | session_set_cwd | sid, cwd | ok, or err{busy} mid-turn / err{bad_cwd}; relative paths resolve against the current session cwd, and the canonical existing directory is persisted and broadcast as session_upsert |
 | session_rename | sid, title | ok; title normalized like auto-titles (first line, trimmed, capped) and broadcast as session_upsert |
+| session_move | sid, before_sid? | ok; puts root tab `sid` just before root `before_sid` (last when null), renumbers every open root's `tab_order` 1..N and broadcasts each as session_upsert; err{no_session} unless both are open roots |
 | session_set_approvals | sid, approvals ("default" \| "auto") | persists per session before ok and publishes refreshed session metadata; applies to the RUNNING turn too — granting full access resolves a parked prompt immediately |
 | session_draft | sid, text | no reply; keeps the session's unsent composer text in the store ("" clears it) so it outlives the client. The TUI sends it when a tab is parked, before it exits (detach, quit, reboot, `!`), and as "" on submit |
 | voice_status / voice_setup {engine,mode} / voice_setup_cancel / voice_set {enabled?,mode?} / voice_transcribe {request_id,audio_base64} | dictation for a `--remote` client (gated on hello_ok.voice): the daemon's machine holds the engine, model, and [voice]; the client only records. voice_status and voice_set reply voice_status_result; voice_setup streams voice_setup_progress then voice_setup_result; voice_transcribe replies voice_transcript (one clip at a time; a second gets err) |
@@ -238,7 +239,9 @@ currently `running`, and the effective `sandboxed` and `network_filtering`
 states. M6 hierarchy fields are `parent_sid` (null for roots), `kind` (`root`,
 `task_child`, or reserved `review_child`), `parent_block_id`, and `max_rounds`.
 `guest_pid` is the guest server process serving the session right now (Muse
-Code's `muse serve`), 0 when none runs.
+Code's `muse serve`), 0 when none runs. `tab_order` is a root's place in the
+tab strip once moved (session_move); 0 means never moved, and such roots
+follow the placed ones by `created_at`.
 `archived` is true only in inclusive list results. Older clients may ignore
 these fields; older entries decode as active roots.
 

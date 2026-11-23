@@ -392,6 +392,8 @@ pub const SessionSummary = struct {
     state: proto.SessionState,
     pause: proto.PauseState = .none,
     created_at: i64,
+    /// Place in the tab strip; 0 = never moved (see tabPrecedes).
+    tab_order: i64 = 0,
     label: []u8,
     /// Effective shell-sandbox state (session toggle AND verified backend).
     sandboxed: bool,
@@ -1517,7 +1519,7 @@ pub const App = struct {
         self.switchSession(sid, false) catch self.setNotice("could not switch session", .{});
     }
 
-    /// Move in the same chronological root-session order shown by the tab
+    /// Move in the same root-session order shown by the tab
     /// strip. This is deliberately separate from gt/gT, whose useful Vim-like
     /// contract is MRU navigation across every session (including children).
     pub fn cycleTab(self: *App, direction: i8) void {
@@ -1528,7 +1530,7 @@ pub const App = struct {
     }
 
     /// Option/Alt+N: jump straight to the Nth tab in the strip's
-    /// chronological order (1-based), from any mode. From a focused child
+    /// order (1-based), from any mode. From a focused child
     /// this also jumps to its own root (the highlighted tab).
     pub fn jumpToTab(self: *App, index: usize) void {
         const sid = rootTabSidAtIndex(self.sessions.items, index) orelse {
@@ -1702,6 +1704,7 @@ pub const App = struct {
             .state = info.state,
             .pause = info.pause,
             .created_at = info.created_at,
+            .tab_order = info.tab_order,
             .label = label,
             .sandboxed = info.sandboxed,
             .network_filtering = info.network_filtering,
@@ -5004,6 +5007,33 @@ pub const App = struct {
         return false;
     }
 
+    /// /move pos [r|l]: move the focused session's tab (its root's, from
+    /// a child). The daemon stores the order and every client re-sorts
+    /// on the session_upserts that follow.
+    pub fn moveTab(self: *App, pos_arg: ?[]const u8, side_arg: ?[]const u8, extra: bool) void {
+        const usage = "usage: /move <pos|-1> [r|l]";
+        const pos_text = pos_arg orelse return self.setNotice(usage, .{});
+        if (extra) return self.setNotice(usage, .{});
+        const pos = std.fmt.parseInt(i64, pos_text, 10) catch return self.setNotice(usage, .{});
+        const side: TabMoveSide = if (side_arg) |text|
+            if (std.mem.eql(u8, text, "r") or std.mem.eql(u8, text, "right"))
+                .right
+            else if (std.mem.eql(u8, text, "l") or std.mem.eql(u8, text, "left"))
+                .left
+            else
+                return self.setNotice(usage, .{})
+        else
+            .right;
+        const order = rootTabOrder(self.gpa, self.sessions.items) catch return self.setNotice("could not move tab", .{});
+        defer self.gpa.free(order);
+        const sid = self.rootSessionId(self.view.sid);
+        if (std.mem.indexOfScalar(u64, order, sid) == null) return self.setNotice("this session has no tab", .{});
+        const before = tabMoveBefore(order, sid, pos, side) catch return self.setNotice("no tab {d}", .{pos});
+        self.conn.send(.{ .session_move = .{ .sid = sid, .before_sid = before } }) catch
+            return self.setNotice("could not move tab", .{});
+        self.setNotice("moved to tab {d}", .{tabPositionAfterMove(order, sid, before)});
+    }
+
     pub fn archiveCurrentSession(self: *App) void {
         if (self.view.state == .running or self.view.state == .awaiting_approval) {
             self.setNotice("cannot archive a running session — interrupt it first", .{});
@@ -5612,6 +5642,7 @@ pub const TabCandidate = struct {
     active: bool,
     shell: bool = false,
     created_at: i64,
+    tab_order: i64 = 0,
 
     pub fn width(self: TabCandidate) usize {
         // leading space + kind glyph + separator + index + separator + label
@@ -5628,10 +5659,18 @@ fn decimalDigits(value: usize) usize {
 }
 
 fn rootTabPrecedes(a: *const SessionSummary, b: *const SessionSummary) bool {
+    return tabPrecedes(a.*, b.*);
+}
+
+/// Tab strip order: tabs placed with /move by their tab_order, then the
+/// never-moved ones (0) by age, so a new tab opens at the end.
+pub fn tabPrecedes(a: anytype, b: anytype) bool {
+    if ((a.tab_order != 0) != (b.tab_order != 0)) return a.tab_order != 0;
+    if (a.tab_order != b.tab_order) return a.tab_order < b.tab_order;
     return a.created_at < b.created_at or (a.created_at == b.created_at and a.sid < b.sid);
 }
 
-/// Return the adjacent root in the tab strip's chronological order, wrapping
+/// Return the adjacent root in the tab strip's order, wrapping
 /// at either edge. Child sessions never become standalone keyboard targets.
 pub fn nextRootTabSid(sessions: []const SessionSummary, active_sid: u64, direction: i8) ?u64 {
     var first: ?*const SessionSummary = null;
@@ -5658,6 +5697,54 @@ pub fn nextRootTabSid(sessions: []const SessionSummary, active_sid: u64, directi
         }
     }
     return if (adjacent) |session| session.sid else if (direction < 0) last.?.sid else first.?.sid;
+}
+
+/// Root tabs in strip order. Caller frees.
+pub fn rootTabOrder(gpa: std.mem.Allocator, sessions: []const SessionSummary) ![]u64 {
+    var roots: std.ArrayList(*const SessionSummary) = .empty;
+    defer roots.deinit(gpa);
+    for (sessions) |*session| {
+        if (session.parent_sid != null or session.kind != .root) continue;
+        try roots.append(gpa, session);
+    }
+    std.sort.insertion(*const SessionSummary, roots.items, {}, struct {
+        fn lessThan(_: void, a: *const SessionSummary, b: *const SessionSummary) bool {
+            return rootTabPrecedes(a, b);
+        }
+    }.lessThan);
+    const order = try gpa.alloc(u64, roots.items.len);
+    for (roots.items, order) |session, *sid| sid.* = session.sid;
+    return order;
+}
+
+pub const TabMoveSide = enum { right, left };
+
+/// Where `/move pos dir` puts tab `sid`, as the tab to land just before
+/// (null = last). The tab now at `pos` (1-based) shifts right of it by
+/// default, or stays left of it with `.left`; pos -1 is the end. Moving
+/// onto itself keeps the tab where it is.
+pub fn tabMoveBefore(order: []const u64, sid: u64, pos: i64, side: TabMoveSide) error{NoTab}!?u64 {
+    if (pos == -1) return null;
+    if (pos < 1 or pos > order.len) return error.NoTab;
+    const at: usize = @intCast(pos - 1);
+    const before = switch (side) {
+        .right => order[at],
+        .left => if (at + 1 < order.len) order[at + 1] else return null,
+    };
+    if (before != sid) return before;
+    const self_at = std.mem.indexOfScalar(u64, order, sid) orelse return error.NoTab;
+    return if (self_at + 1 < order.len) order[self_at + 1] else null;
+}
+
+/// 1-based place of `sid` once it is moved before `before` (null = last).
+pub fn tabPositionAfterMove(order: []const u64, sid: u64, before: ?u64) usize {
+    var position: usize = 1;
+    for (order) |other| {
+        if (other == sid) continue;
+        if (before) |target| if (other == target) break;
+        position += 1;
+    }
+    return position;
 }
 
 /// The Nth root tab (1-based) in the same order the strip renders:
