@@ -42,8 +42,10 @@ Agents can talk to each other across sessions, whatever model each runs:
 ask one to "check with the Codex session in ~/Work/api" and it can list the
 other sessions, read one's recent transcript, message it, and wait for its
 answer. Messages show in both transcripts, marked with who sent them. A chain
-of agent-to-agent messages stops after five hops, and anything you type starts
-it over.
+of agent-to-agent messages stops after 20 hops, and anything you type starts
+it over. A turn's chain is whatever started it; a reply that arrives while it
+runs counts only toward answering that sender, so two agents can't ping-pong
+forever, but one busy session's long chain doesn't stop the others.
 
 ## Git status line
 

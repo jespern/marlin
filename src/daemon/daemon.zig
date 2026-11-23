@@ -497,9 +497,14 @@ pub const Session = struct {
     /// configured default, 0 leaves it to the guest. Read per invocation.
     guest_autocompact_live: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
     /// Agent-to-agent hops behind the current turn: 0 when a human started
-    /// or steered it, else the hop count of the message that did. A message
-    /// this session's agent sends is one hop more (sessions.max_hops).
+    /// or steered it, else the hop count of the message that started it. A
+    /// message this session's agent sends is one hop more (sessions.max_hops),
+    /// or one more than agent_hops_from when it goes back to a sender.
     agent_hops: u8 = 0,
+    /// Dispatcher-only. Per session that messaged this one during the
+    /// current turn, the highest hop it sent: a message back to it goes on
+    /// that chain, while messages to anyone else stay on this turn's own.
+    agent_hops_from: std.AutoHashMapUnmanaged(u64, u8) = .empty,
     /// What has streamed of the text and the thinking being written now,
     /// sent whole to a client that subscribes mid-stream (dispatcher-only).
     live_text: std.ArrayList(u8) = .empty,
@@ -585,6 +590,13 @@ pub const Session = struct {
         const used = self.context_used.load(.acquire);
         const limit = self.guest_context_limit.load(.acquire);
         return .{ .used = if (used > 0) used else null, .guest_limit = if (limit > 0) limit else null };
+    }
+
+    /// A human or a message starts the turn's chain at `hops`; what earlier
+    /// senders were owed belonged to the chain before.
+    pub fn startAgentChain(self: *Session, hops: u8) void {
+        self.agent_hops = hops;
+        self.agent_hops_from.clearRetainingCapacity();
     }
 };
 
@@ -3291,12 +3303,12 @@ pub const Daemon = struct {
                     };
                     session.steer_mutex.unlock(self.io);
                     // A human spoke: any agent message chain starts over.
-                    session.agent_hops = 0;
+                    session.startAgentChain(0);
                     self.sendTo(client, .{ .ok = .{ .request_id = inp.request_id } });
                     self.publishQueue(session);
                     return;
                 }
-                session.agent_hops = 0;
+                session.startAgentChain(0);
                 const attachments = self.prepareAttachments(inp.attachments) catch |err| {
                     self.sendInputError(client, inp.request_id, "attachment", attachmentErrorMessage(err));
                     return;
@@ -4693,6 +4705,7 @@ pub const Daemon = struct {
         session.guest_activity_mutex.unlock(self.io);
         session.live_text.deinit(self.gpa);
         session.live_reasoning.deinit(self.gpa);
+        session.agent_hops_from.deinit(self.gpa);
         self.gpa.free(session.model);
         self.gpa.free(session.cwd);
         if (session.pending_guest_model) |guest| self.gpa.free(guest);
@@ -6390,7 +6403,7 @@ pub const Daemon = struct {
             // An outside caller has no turn to count against and starts a
             // chain rather than continuing one.
             const caller: ?*Session = if (from_outside) null else (try self.getOrLoadSession(caller_sid)) orelse return error.NoSession;
-            const hops: u8 = if (caller) |c| c.agent_hops +| 1 else 1;
+            const hops: u8 = if (caller) |c| @max(c.agent_hops, c.agent_hops_from.get(target_sid) orelse 0) +| 1 else 1;
             if (hops > sessions_tool.max_hops) return .{ .text = try std.fmt.allocPrint(arena, "not sent: this would be hop {d} of a chain of agent messages, past the limit of {d}. Tell the user what you need instead.", .{ hops, sessions_tool.max_hops }), .status = .denied };
             const session = (try self.getOrLoadSession(target_sid)) orelse return error.NoSession;
             if (session.pause_requested.load(.acquire) or self.pending_reboot != null)
@@ -6419,11 +6432,16 @@ pub const Daemon = struct {
                     return err;
                 };
                 session.steer_mutex.unlock(self.io);
-                session.agent_hops = @max(session.agent_hops, hops);
+                // It lands in a turn that has its own chain: only a message
+                // back to this sender continues this one.
+                if (caller != null) {
+                    const got = try session.agent_hops_from.getOrPut(self.gpa, caller_sid);
+                    got.value_ptr.* = if (got.found_existing) @max(got.value_ptr.*, hops) else hops;
+                }
                 self.publishQueue(session);
                 return .{ .text = try std.fmt.allocPrint(arena, "Delivered to {s} \"{s}\". It is busy and reads it between its steps. Call wait_for_session to get its answer.", .{ target.handle, target.title }) };
             }
-            session.agent_hops = hops;
+            session.startAgentChain(hops);
             self.startTurnJob(session, message, &.{}, false, text, false, sender) catch |err| {
                 if (err == error.SessionBusy) return .{ .text = "not sent: that session just started a turn; try again", .status = .err };
                 return err;

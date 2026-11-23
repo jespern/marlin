@@ -453,6 +453,7 @@ const ShellRig = struct {
         r.daemon.mcp_stale.deinit(gpa);
         r.session.live_text.deinit(gpa);
         r.session.live_reasoning.deinit(gpa);
+        r.session.agent_hops_from.deinit(gpa);
         gpa.free(r.session.model);
         gpa.free(r.session.cwd);
         r.daemon.store.close();
@@ -883,6 +884,7 @@ test "agents reach other sessions: list, read, message (hop and turn limits), wa
         r.session.steer_queue.deinit(gpa);
         other.live_text.deinit(gpa);
         other.live_reasoning.deinit(gpa);
+        other.agent_hops_from.deinit(gpa);
         gpa.free(other.model);
         gpa.free(other.cwd);
     }
@@ -936,10 +938,12 @@ test "agents reach other sessions: list, read, message (hop and turn limits), wa
     // The receiver's transcript folds it under the sender, showing their words.
     try std.testing.expectEqualStrings("Is the lexer done?", other.steer_queue.items[0].input.display_text.?);
     try std.testing.expect(std.mem.indexOf(u8, other.steer_queue.items[0].input.from.?, caller_handle) != null);
-    try std.testing.expectEqual(@as(u8, 1), other.agent_hops);
+    // Its turn keeps its own chain; a message back to us would go on ours.
+    try std.testing.expectEqual(@as(u8, 0), other.agent_hops);
+    try std.testing.expectEqual(@as(?u8, 1), other.agent_hops_from.get(7));
 
     // A chain at the hop limit stops.
-    r.session.agent_hops = 5;
+    r.session.agent_hops = @import("tools/sessions.zig").max_hops;
     try Call.send(r, 7, 5, "message_session", .{ .handle = handle, .text = "again" });
     try std.testing.expectEqual(block_mod.ToolStatus.denied, (try Call.result(r, 5)).?.status);
     try std.testing.expectEqual(@as(usize, 1), other.steer_queue.items.len);
@@ -984,6 +988,68 @@ test "agents reach other sessions: list, read, message (hop and turn limits), wa
     r.session.steer_accepting = true;
     try r.send(2, "{{\"input\":{{\"sid\":7,\"text\":\"carry on\",\"request_id\":30}}}}", .{});
     try std.testing.expectEqual(@as(u8, 0), r.session.agent_hops);
+}
+
+// Case (2026-11-23): Jesper's steward, in a turn he started, read replies
+// from workers deep in their own chains, and was then refused messages to
+// everyone. A reply mid-turn counts only toward messages back to its sender.
+test "a reply that arrives mid-turn counts only toward its sender" {
+    const session_handle = @import("../core/session_handle.zig");
+    const sessions_tool = @import("tools/sessions.zig");
+    const r = try ShellRig.create();
+    defer r.destroy();
+    const gpa = r.gpa;
+    var others: [2]daemon_mod.Session = undefined;
+    for (&others, [_]u64{ 8, 9 }) |*other, sid| {
+        try r.daemon.store.createSession(sid, 0, "/other", "codex/gpt", .auto);
+        other.* = .{ .id = sid, .model = try gpa.dupe(u8, "codex/gpt"), .cwd = try gpa.dupe(u8, "/other"), .state = .running, .steer_accepting = true };
+        try r.daemon.sessions.put(gpa, sid, other);
+    }
+    defer for (&others) |*other| {
+        for (other.steer_queue.items) |queued| queued.input.deinit(gpa);
+        other.steer_queue.deinit(gpa);
+        other.agent_hops_from.deinit(gpa);
+        other.live_text.deinit(gpa);
+        other.live_reasoning.deinit(gpa);
+        gpa.free(other.model);
+        gpa.free(other.cwd);
+    };
+    defer {
+        for (r.session.steer_queue.items) |queued| queued.input.deinit(gpa);
+        r.session.steer_queue.deinit(gpa);
+    }
+    var buf: session_handle.Full = undefined;
+    const all = [_]u64{ 7, 8, 9 };
+    const handles = [_][]const u8{
+        try r.arena.allocator().dupe(u8, session_handle.display(&buf, 7, &all)),
+        try r.arena.allocator().dupe(u8, session_handle.display(&buf, 8, &all)),
+        try r.arena.allocator().dupe(u8, session_handle.display(&buf, 9, &all)),
+    };
+    const Call = struct {
+        fn status(rig: *ShellRig, caller: u64, request_id: u64, to: []const u8) !block_mod.ToolStatus {
+            const args_json = try std.json.Stringify.valueAlloc(rig.gpa, .{ .handle = to, .text = "update" }, .{});
+            defer rig.gpa.free(args_json);
+            const msg = try std.json.Stringify.valueAlloc(rig.gpa, .{ .agent_tool = .{ .request_id = request_id, .sid = caller, .name = "message_session", .args_json = args_json } }, .{});
+            defer rig.gpa.free(msg);
+            try rig.send(1, "{s}", .{msg});
+            for (try rig.drain(1)) |got| if (got == .agent_tool_result and got.agent_tool_result.request_id == request_id) return got.agent_tool_result.status;
+            return error.NoResult;
+        }
+    };
+
+    // Jesper's turn (7) hears from 8, whose chain is at the limit.
+    r.session.state = .running;
+    r.session.steer_accepting = true;
+    others[0].agent_hops = sessions_tool.max_hops - 1;
+    try std.testing.expectEqual(block_mod.ToolStatus.ok, try Call.status(r, 8, 1, handles[0]));
+    // 9 has nothing to do with that chain.
+    try std.testing.expectEqual(block_mod.ToolStatus.ok, try Call.status(r, 7, 2, handles[2]));
+    try std.testing.expectEqual(@as(u8, 0), r.session.agent_hops);
+    // Answering 8 would go on its chain: two agents still can't ping-pong.
+    try std.testing.expectEqual(block_mod.ToolStatus.denied, try Call.status(r, 7, 3, handles[1]));
+    // Jesper speaking starts every chain over.
+    try r.send(2, "{{\"input\":{{\"sid\":7,\"text\":\"answer it\",\"request_id\":30}}}}", .{});
+    try std.testing.expectEqual(block_mod.ToolStatus.ok, try Call.status(r, 7, 4, handles[1]));
 }
 
 // Case: Robin, Jesper's assistant outside Marlin, routes what needs him and
@@ -1085,7 +1151,9 @@ test "an assistant outside Marlin reads the attention log and answers what waits
     const delivered = r.session.steer_queue.items[0].input.text;
     try std.testing.expect(std.mem.startsWith(u8, delivered, "[Message from robin, the user's assistant outside Marlin."));
     try std.testing.expect(std.mem.endsWith(u8, delivered, "Status?"));
-    try std.testing.expectEqual(@as(u8, 1), r.session.agent_hops);
+    // Robin is no session to answer, so the running turn's chain is untouched.
+    try std.testing.expectEqual(@as(u8, 0), r.session.agent_hops);
+    try std.testing.expectEqual(@as(u32, 0), r.session.agent_hops_from.count());
 
     // `last` reads the newest moments.
     try Call.send(r, 0, "robin", 12, "attention", .{ .last = 1 });

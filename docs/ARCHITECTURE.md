@@ -142,10 +142,14 @@ between steps, marked with the sender's handle and title), and
 returns its last reply. Native turns reach them through `RunOpts.on_agent_tool`;
 guests through the same `cc_approve` bridge (`agent_tool` /
 `agent_tool_result`). They are never behind the approval gate. A chain of agent
-messages stops after five hops (a human message starts it over), a turn sends
-at most ten, two sessions may not wait on each other, and an interrupt
-releases a waiting caller. Plan mode and read-only children may read but not
-message.
+messages stops after 20 hops (a human message starts it over), two sessions
+may not wait on each other, and an interrupt releases a waiting caller. A
+turn's hop count is that of what started it (`Session.agent_hops`); a message
+steered into a running turn is remembered per sender
+(`Session.agent_hops_from`), so only a message back to that sender continues
+its chain. Two running sessions answering each other are still bounded; a
+cycle of three running sessions is not. Plan mode and read-only children may
+read but not message.
 
 The same tools serve assistants outside Marlin through its MCP server
 (`client/mcp_server.zig`, `POST /mcp` on the web companion, bearer tokens with
