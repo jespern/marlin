@@ -394,31 +394,40 @@ const ShellRig = struct {
         try r.environ.put("SHELL", "/bin/sh");
         try r.environ.put("HOME", "/");
         try r.environ.put("PATH", "/usr/bin:/bin");
+        // One literal, so every field the rig does not name takes its
+        // declared default: assigned one by one, the rest held whatever the
+        // allocation did (a stale voice_setup_thread refused /voice setup
+        // on the Linux CI runner only).
+        r.daemon = .{
+            .gpa = gpa,
+            .io = io,
+            .environ = &r.environ,
+            .events = .init(gpa),
+            .clients = .empty,
+            .clients_mutex = .init,
+            .phone_push = null,
+            .mcp_stale = .empty,
+            .sessions = .empty,
+            .shells = .empty,
+            .agent_waits = .empty,
+            .next_shell_id = 1,
+            .store = try store.Store.open(gpa, null),
+            .cfg = .{},
+            .network = .{ .gpa = gpa },
+            .advertiser = null,
+            .sandbox_backend = .unavailable,
+            .presence = .{},
+            .pending_reboot = null,
+            .outgoing = null,
+            .predecessor_fd = -1,
+            .predecessor_reader = null,
+            .handed_over = false,
+            .web_deferred = false,
+            // Not reached by these tests.
+            .extensions = undefined,
+            .http_pool = undefined,
+        };
         const d = &r.daemon;
-        d.gpa = gpa;
-        d.io = io;
-        d.environ = &r.environ;
-        d.events = .init(gpa);
-        d.clients = .empty;
-        d.clients_mutex = .init;
-        d.phone_push = null;
-        d.mcp_stale = .empty;
-        d.sessions = .empty;
-        d.shells = .empty;
-        d.agent_waits = .empty;
-        d.next_shell_id = 1;
-        d.store = try store.Store.open(gpa, null);
-        d.cfg = .{};
-        d.network = .{ .gpa = gpa };
-        d.advertiser = null;
-        d.sandbox_backend = .unavailable;
-        d.presence = .{};
-        d.pending_reboot = null;
-        d.outgoing = null;
-        d.predecessor_fd = -1;
-        d.predecessor_reader = null;
-        d.handed_over = false;
-        d.web_deferred = false;
         try d.store.createSession(7, 0, "/", "m", .auto);
         r.session = .{ .id = 7, .model = try gpa.dupe(u8, "m"), .cwd = try gpa.dupe(u8, "/") };
         try d.sessions.put(gpa, r.session.id, &r.session);
