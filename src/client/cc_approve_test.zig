@@ -178,6 +178,34 @@ test "bridge: the tools for other sessions are listed and forwarded, failures fl
     try std.testing.expect(std.mem.indexOf(u8, failed, "\"isError\":true") != null);
 }
 
+test "a bridge without approve neither lists it nor runs it" {
+    const gpa = std.testing.allocator;
+    const Probe = struct {
+        var decided = false;
+        fn decide(_: ?*anyopaque, _: []const u8, _: []const u8) cc_approve.Decision {
+            decided = true;
+            return cc_approve.Decision.init(.granted, null);
+        }
+        fn agent(_: ?*anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8) ?cc_approve.AgentToolResult {
+            return .{ .text = alloc.dupe(u8, "ok") catch return null, .ok = true };
+        }
+    };
+    const decider = Decider{ .decide = Probe.decide, .agent_tool = Probe.agent, .approve = false };
+    const listed = handleLine(gpa,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+    , decider).?;
+    defer gpa.free(listed);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"approve\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"ask_user\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"wait_for_session\"") != null);
+    const called = handleLine(gpa,
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"approve","arguments":{"tool_name":"Bash","input":{}}}}
+    , decider).?;
+    defer gpa.free(called);
+    try std.testing.expect(std.mem.indexOf(u8, called, "unknown tool") != null);
+    try std.testing.expect(!Probe.decided);
+}
+
 const ImageDecider = struct {
     fn load(_: ?*anyopaque, gpa: std.mem.Allocator, path: []const u8) anyerror!@import("../daemon/tools/show_image.zig").Loaded {
         if (!std.mem.eql(u8, path, "chart.png")) return error.FileNotFound;

@@ -77,6 +77,9 @@ pub const Decider = struct {
     agent_tool: ?*const fn (ctx: ?*anyopaque, gpa: std.mem.Allocator, name: []const u8, args_json: []const u8) ?AgentToolResult = null,
     /// show_image: read an image from the session's working directory.
     load_image: ?*const fn (ctx: ?*anyopaque, gpa: std.mem.Allocator, path: []const u8) anyerror!show_image.Loaded = null,
+    /// Offer `approve`, Claude Code's permission prompt tool. Guests that ask
+    /// for permission over their own protocol (`--no-approve`) never call it.
+    approve: bool = true,
 };
 
 pub const AgentToolResult = struct { text: []u8, ok: bool };
@@ -89,15 +92,18 @@ pub fn run(
     args: []const [:0]const u8,
 ) !u8 {
     var sid: ?u64 = null;
+    var approve = true;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--sid") and i + 1 < args.len) {
+        if (std.mem.eql(u8, args[i], "--no-approve")) {
+            approve = false;
+        } else if (std.mem.eql(u8, args[i], "--sid") and i + 1 < args.len) {
             i += 1;
             sid = std.fmt.parseInt(u64, args[i], 10) catch null;
         }
     }
     const session_id = sid orelse {
-        std.log.err("usage: marlin cc_approve --sid <sid> (internal)", .{});
+        std.log.err("usage: marlin cc_approve --sid <sid> [--no-approve] (internal)", .{});
         return 2;
     };
 
@@ -114,6 +120,7 @@ pub fn run(
         .ask_question = DaemonDecider.askQuestion,
         .agent_tool = DaemonDecider.agentTool,
         .load_image = DaemonDecider.loadImage,
+        .approve = approve,
     };
 
     var in_buf: [64 * 1024]u8 = undefined;
@@ -281,7 +288,7 @@ pub fn handleLine(gpa: std.mem.Allocator, line: []const u8, decider: Decider) ?[
     }
     if (std.mem.eql(u8, rpc.method, "ping")) return rpcResult(gpa, id, "{}");
     if (std.mem.eql(u8, rpc.method, "tools/list")) {
-        if (decider.agent_tool != null) return toolsWithSessions(gpa, id);
+        if (decider.agent_tool != null) return toolsWithSessions(gpa, id, decider.approve);
         return rpcResult(gpa, id, base_tools_json);
     }
     if (std.mem.eql(u8, rpc.method, "tools/call")) {
@@ -307,7 +314,7 @@ fn handleToolCall(gpa: std.mem.Allocator, id: std.json.Value, params: ?std.json.
         return handleShowImage(gpa, id, p, decider);
     if (sessions_tool.isTool(name.string))
         return handleAgentTool(gpa, id, name.string, p, decider);
-    if (!std.mem.eql(u8, name.string, "approve"))
+    if (!std.mem.eql(u8, name.string, "approve") or !decider.approve)
         return rpcError(gpa, id, -32602, "unknown tool");
 
     // Anything malformed decides as a deny, not a protocol error: Claude
@@ -393,14 +400,17 @@ fn handleAskUser(gpa: std.mem.Allocator, id: std.json.Value, p: std.json.Value, 
 
 /// tools/list with the tools for other sessions after approve and ask_user,
 /// from the same specs the native agent gets.
-fn toolsWithSessions(gpa: std.mem.Allocator, id: std.json.Value) ?[]u8 {
+fn toolsWithSessions(gpa: std.mem.Allocator, id: std.json.Value, approve: bool) ?[]u8 {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const Tool = struct { name: []const u8, description: []const u8, inputSchema: std.json.Value };
     const base = std.json.parseFromSliceLeaky(struct { tools: []Tool }, arena, base_tools_json, .{}) catch return null;
     var tools: std.ArrayList(Tool) = .empty;
-    tools.appendSlice(arena, base.tools) catch return null;
+    for (base.tools) |tool| {
+        if (!approve and std.mem.eql(u8, tool.name, "approve")) continue;
+        tools.append(arena, tool) catch return null;
+    }
     for (sessions_tool.specs) |spec| tools.append(arena, .{
         .name = spec.name,
         .description = spec.description,
