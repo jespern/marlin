@@ -1340,12 +1340,11 @@ pub const App = struct {
         const saved = try self.gpa.create(SessionView);
         errdefer self.gpa.destroy(saved);
         self.saved_view_clock +%= 1;
-        // A half-buffered older page and baked layout are cheap to redo and
-        // would otherwise keep every cached transcript's layout alive.
+        // A half-buffered page is stale once parked. The baked layout stays:
+        // reopening the tab shows it as it was instead of laying the whole
+        // window out again. The window trim bounds what each cached tab holds.
         self.clearHistoryBackfill();
         self.trimHistoryWindow(!self.view.history_has_newer);
-        self.view.layout_cache.reset(self.gpa);
-        self.view.tail_layout_cache.reset(self.gpa);
         // A background tab hears no live text, and none is replayed: what
         // streamed so far would come back stale, shown below the block it
         // became, or with new text glued on after a gap.
@@ -1391,12 +1390,12 @@ pub const App = struct {
         self.copy_cursor = null;
         self.view.deinit(self.gpa);
         self.view = saved.*;
-        self.view.layout_epoch +%= 1;
         // Any page that was in flight when the view was parked is stale.
         self.view.history_loading = false;
         self.view.history_before_seq = 0;
         self.view.history_after_seq = 0;
         self.view.history_tail_reload = false;
+        self.view.history_catch_up = false;
         self.view.history_page_failed = false;
         self.view.sel_clear_after_copy = false;
         self.view.last_used = 0;
@@ -1484,20 +1483,24 @@ pub const App = struct {
             } }) catch {
                 self.view.history_loading = false;
             };
-        } else {
+        } else if (!self.view.history_has_newer) {
+            // The cached window is the live edge: append what was missed
+            // so its layout and recap stay as they were. A gap of more than
+            // one page falls back to a tail reload at replay_done.
             self.view.history_loading = true;
-            self.view.history_tail_reload = true;
-            self.view.history_before_seq = 0;
-            self.view.history_after_seq = 0;
+            self.view.history_catch_up = true;
             self.conn.send(.{ .sub = .{
                 .skill_catalog = true,
                 .prompt_history_limit = Editor.max_history_entries,
                 .sid = sid,
-                .tail_limit = initial_replay_blocks,
+                .from_seq = self.view.last_seq +| 1,
+                .replay_limit = initial_replay_blocks,
             } }) catch {
                 self.view.history_loading = false;
-                self.view.history_tail_reload = false;
+                self.view.history_catch_up = false;
             };
+        } else {
+            self.requestTailReload();
         }
         self.rememberSession(sid);
     }
@@ -1927,7 +1930,10 @@ pub const App = struct {
             if (!std.mem.eql(u8, awaited, hash)) continue;
             _ = self.blob_requests.orderedRemove(i);
             if (self.images.deliver(self.gpa, hash, bytes)) {
+                // Parked tabs keep their layout, so they re-lay out too.
                 self.view.layout_epoch +%= 1;
+                var it = self.saved_views.valueIterator();
+                while (it.next()) |saved| saved.*.layout_epoch +%= 1;
                 self.refresh_requested = true;
             }
             return;
@@ -2351,6 +2357,13 @@ pub const App = struct {
                         .replay_limit = initial_replay_blocks,
                     } }) catch self.setNotice("could not continue session replay", .{});
                     return;
+                }
+                if (view.history_catch_up and replay.forward) {
+                    view.history_catch_up = false;
+                    if (replay.has_newer) {
+                        self.requestTailReload();
+                        return;
+                    }
                 }
                 if (replay.forward) {
                     if (!view.history_has_newer) self.trimHistoryWindow(true);
@@ -2790,6 +2803,7 @@ pub const App = struct {
                     self.view.history_before_seq = 0;
                     self.view.history_after_seq = 0;
                     self.view.history_tail_reload = false;
+                    self.view.history_catch_up = false;
                     self.view.history_page_failed = false;
                 }
                 self.setNotice("daemon error {s}: {s}", .{ e.code, e.msg });
@@ -5191,6 +5205,11 @@ pub const App = struct {
 
     pub fn requestLiveTail(self: *App) void {
         if (!self.view.history_has_newer or self.view.history_loading) return;
+        self.requestTailReload();
+    }
+
+    /// Replace the focused window with the newest page and resubscribe live.
+    pub fn requestTailReload(self: *App) void {
         self.clearHistoryBackfill();
         self.view.history_loading = true;
         self.view.history_before_seq = 0;

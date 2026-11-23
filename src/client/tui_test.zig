@@ -7099,6 +7099,127 @@ test "pending input does not freeze active tool layout and survives history trim
     try std.testing.expectEqual(@as(usize, 1), pending);
 }
 
+fn lastSubRequest(arena: std.mem.Allocator, written: []const u8) !?@FieldType(proto.ClientMsg, "sub") {
+    var found: ?@FieldType(proto.ClientMsg, "sub") = null;
+    var requests = std.mem.splitScalar(u8, written, '\n');
+    while (requests.next()) |line| {
+        if (line.len == 0) continue;
+        const request = try proto.decode(proto.ClientMsg, arena, line);
+        if (request == .sub) found = request.sub;
+    }
+    return found;
+}
+
+fn cachedTabApp(gpa: std.mem.Allocator, io: Io, conn: *attach.Conn) !App {
+    var app = App{ .gpa = gpa, .io = io, .conn = conn, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
+    app.replaceSessionSummaries(&.{
+        .{ .sid = 1, .title = "first", .model = "m", .status = "idle", .created_at = 1, .running = false },
+        .{ .sid = 2, .title = "second", .model = "m", .status = "idle", .created_at = 2, .running = false },
+    });
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .blk = .{ .sid = 1, .b = .{ .id = 1, .session_id = 1, .seq = 1, .turn_id = 1, .ts = 1, .body = .{ .user_msg = .{ .text = "fix the parser" } } } } }));
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .blk = .{ .sid = 1, .b = .{ .id = 2, .session_id = 1, .seq = 2, .turn_id = 1, .ts = 2, .body = .{ .assistant_msg = .{ .text = "Fixed." } } } } }));
+    try app.view.appendRecap(gpa, 2, "You fixed the parser.", true);
+    return app;
+}
+
+fn recapBlocks(app: *const App) usize {
+    var count: usize = 0;
+    for (app.view.blocks.items) |rb| {
+        if (rb.kind == .system_note and std.mem.eql(u8, rb.label, "Recap")) count += 1;
+    }
+    return count;
+}
+
+test "returning to an idle cached tab keeps its layout and appends only what it missed" {
+    // Case: Jesper flipped between tabs and saw the recap, and possibly the
+    // whole window, drawn again each time: parking dropped the layout and
+    // the return reloaded the newest window over identical blocks.
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = try cachedTabApp(gpa, threaded.io(), &conn);
+    defer app.deinit();
+    var frame = std.heap.ArenaAllocator.init(gpa);
+    defer frame.deinit();
+    _ = try layoutLines(frame.allocator(), &app, 80);
+    const covered = app.view.layout_cache.covered;
+    const epoch = app.view.layout_epoch;
+    try std.testing.expect(covered > 0);
+
+    try app.switchSession(2, false);
+    const before = output.written().len;
+    try app.switchSession(1, false);
+    try std.testing.expectEqual(covered, app.view.layout_cache.covered);
+    try std.testing.expectEqual(epoch, app.view.layout_epoch);
+    const sub = (try lastSubRequest(frame.allocator(), output.written()[before..])).?;
+    try std.testing.expectEqual(@as(u64, 3), sub.from_seq);
+    try std.testing.expectEqual(@as(u32, 0), sub.tail_limit);
+    try std.testing.expectEqual(tui.initial_replay_blocks, sub.replay_limit);
+
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .blk = .{ .sid = 1, .b = .{ .id = 3, .session_id = 1, .seq = 3, .turn_id = 2, .ts = 3, .body = .{ .user_msg = .{ .text = "now the lexer" } } } } }));
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .replay_done = .{ .sid = 1, .oldest_seq = 3, .newest_seq = 3, .has_older = false, .has_newer = false, .forward = true } }));
+    try std.testing.expect(!app.view.history_loading);
+    try std.testing.expect(!app.view.history_catch_up);
+    try std.testing.expectEqual(epoch, app.view.layout_epoch);
+    try std.testing.expectEqual(@as(u64, 3), app.view.last_seq);
+    try std.testing.expectEqual(@as(usize, 1), recapBlocks(&app));
+    try std.testing.expectEqualStrings("now the lexer", app.view.blocks.items[app.view.blocks.items.len - 1].text);
+    _ = try layoutLines(frame.allocator(), &app, 80);
+    try std.testing.expect(app.view.layout_cache.covered >= covered);
+}
+
+test "a cached tab that missed more than a page reloads the newest window" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = try cachedTabApp(gpa, threaded.io(), &conn);
+    defer app.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    try app.switchSession(2, false);
+    try app.switchSession(1, false);
+    const before = output.written().len;
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .replay_done = .{ .sid = 1, .oldest_seq = 3, .newest_seq = 98, .has_older = false, .has_newer = true, .forward = true } }));
+    try std.testing.expect(app.view.history_tail_reload);
+    try std.testing.expect(app.view.history_loading);
+    try std.testing.expect(!app.view.history_catch_up);
+    const sub = (try lastSubRequest(arena.allocator(), output.written()[before..])).?;
+    try std.testing.expectEqual(tui.initial_replay_blocks, sub.tail_limit);
+    try std.testing.expectEqual(@as(u32, 0), sub.replay_limit);
+}
+
+test "an image delivered while a tab is parked re-lays out that tab" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = try cachedTabApp(gpa, threaded.io(), &conn);
+    defer app.deinit();
+    app.kitty_graphics = true;
+    const pasted = [_]block.MediaRef{.{ .hash = "img1", .mime = "image/png", .name = "clipboard.png", .byte_len = 100 }};
+    app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .blk = .{ .sid = 1, .b = .{ .id = 3, .session_id = 1, .seq = 3, .turn_id = 2, .ts = 3, .body = .{ .user_msg = .{ .text = "look", .attachments = &pasted } } } } }));
+    try std.testing.expectEqual(@as(usize, 1), app.blob_requests.items.len);
+    try app.switchSession(2, false);
+    const parked = app.saved_views.get(1).?.layout_epoch;
+    app.blobArrived("img1", @embedFile("png_sample_rgba"));
+    try std.testing.expect(app.saved_views.get(1).?.layout_epoch != parked);
+}
+
 test "returning to a tab with pending input replays missed deliveries and retains its cache" {
     const gpa = std.testing.allocator;
     var threaded: Io.Threaded = .init(gpa, .{});

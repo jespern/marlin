@@ -141,6 +141,10 @@ pub const SessionView = struct {
     history_after_seq: u64 = 0,
     /// A tail reload replaces an old scrollback window atomically.
     history_tail_reload: bool = false,
+    /// A reopened cached view is reading what it missed in the background
+    /// from last_seq on. If that is more than one page, the newest window
+    /// is reloaded instead of paging through the gap.
+    history_catch_up: bool = false,
     /// The loaded window has durable blocks below it.
     history_has_newer: bool = false,
     /// Reposition this durable block after a sliding-window page swap.
