@@ -89,7 +89,8 @@ pub const Recorder = struct {
     }
 
     fn halt(self: *Recorder) void {
-        if (self.queue == null) return;
+        // `native` first, at compile time: AudioToolbox exists only on macOS.
+        if (!native or self.queue == null) return;
         self.running.store(false, .release);
         // Synchronous: no callback runs after these return.
         _ = AudioQueueStop(self.queue, 1);
