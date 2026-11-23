@@ -1,11 +1,12 @@
 //! What guest agents cost, read from their own request logs (Claude Code's
-//! ~/.claude/projects, Codex's ~/.codex/sessions): per backend, client and
+//! ~/.claude/projects, Codex's ~/.codex/sessions, Antigravity's
+//! ~/.gemini/antigravity-cli/conversations): per backend, client and
 //! model, and per Marlin session. Shared by the daemon (daemon/cost_report.zig
 //! scans) and the client (`marlin diagnostics --cost` prints).
 const std = @import("std");
 
 pub const Group = struct {
-    /// "claude_code" or "codex".
+    /// "claude_code", "codex" or "agy".
     backend: []const u8,
     /// "marlin" (a Marlin session's guest), "interactive" (the vendor's own
     /// terminal UI), or "other" (any other headless use).
@@ -18,7 +19,7 @@ pub const Group = struct {
     cache_write_5m: u64 = 0,
     cache_write_1h: u64 = 0,
     output: u64 = 0,
-    /// Requests that wrote (Claude) or sent uncached (Codex) most of a
+    /// Requests that wrote (Claude) or sent uncached (Codex, agy) most of a
     /// context over 100K tokens: the cache had expired or the prefix changed.
     rewrites: u64 = 0,
     rewrite_tokens: u64 = 0,

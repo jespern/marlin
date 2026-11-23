@@ -111,14 +111,14 @@ pub fn formatCostReport(arena: std.mem.Allocator, report: cost.Report, days: u32
     var b1: [16]u8 = undefined;
     var b2: [16]u8 = undefined;
     var b3: [16]u8 = undefined;
-    for ([_][]const u8{ "claude_code", "codex" }) |backend| {
+    for ([_][]const u8{ "claude_code", "codex", "agy" }) |backend| {
         const claude = std.mem.eql(u8, backend, "claude_code");
         var any = false;
         for (report.groups) |g| {
             if (!std.mem.eql(u8, g.backend, backend) or g.requests < 5) continue;
             if (!any) {
                 try out.print(arena, "\n{s:<36} {s:>8} {s:>8} {s:>7} {s:>17} {s:>12}\n", .{
-                    if (claude) "Claude Code" else "Codex", "requests", "context", "cached", "rewrites", if (claude) "cost/req" else "uncached/req",
+                    if (claude) "Claude Code" else if (std.mem.eql(u8, backend, "codex")) "Codex" else "Antigravity", "requests", "context", "cached", "rewrites", if (claude) "cost/req" else "uncached/req",
                 });
                 any = true;
             }

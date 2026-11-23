@@ -4349,6 +4349,10 @@ pub const Daemon = struct {
                 defer self.gpa.free(thread);
                 try job.marlin.codex.put(a, try a.dupe(u8, thread), row.id);
             }
+            if (try self.store.getAgySessionId(row.id)) |conversation| {
+                defer self.gpa.free(conversation);
+                try job.marlin.agy.put(a, try a.dupe(u8, conversation), row.id);
+            }
             var handle_buf: session_handle.Full = undefined;
             try job.marlin.names.put(a, row.id, .{
                 .handle = try a.dupe(u8, session_handle.display(&handle_buf, row.id, known)),

@@ -42,16 +42,22 @@ marlin diagnostics --cost              # last 7 days
 marlin diagnostics --cost --since 30d  # or --json
 ```
 
-compares Claude Code and Codex run by Marlin with the same tools run on their
-own, per model: requests, context sent per request, how much of it came from
+compares Claude Code, Codex and Antigravity run by Marlin with the same tools
+run on their own, per model: requests, context sent per request, how much of it came from
 the prompt cache, full-context rewrites (a request that wrote most of a
 context over 100K to the cache again, because the cache had expired), and an
 approximate cost per request in fresh-input tokens. It then names the
 costliest Marlin sessions on Claude Code. The daemon reads the guests' own
-request logs on its host (`~/.claude/projects`, `~/.codex/sessions`); a
+request logs on its host (`~/.claude/projects`, `~/.codex/sessions`, and
+Antigravity's conversation databases in `~/.gemini/antigravity-cli`); a
 response logged once per content block counts once. Marlin's Claude Code
 sessions are recognised by the session ids Marlin gives them, its Codex ones
-by `originator`; other headless use shows as `other`.
+by `originator`, its Antigravity ones by their stored conversation ids, and
+agy's own terminal sessions by its prompt history; other headless use shows
+as `other`. Antigravity keeps usage only in an undocumented protobuf, decoded
+from fields matched against what agy 1.5.14 reports over ACP for the same
+requests; a newer agy that renumbers them needs the scanner updated. Its
+databases are opened read-only, never written.
 
 ## Transport failures and recovery
 
