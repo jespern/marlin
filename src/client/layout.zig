@@ -1027,8 +1027,9 @@ pub fn marlinTool(name: []const u8) ?MarlinTool {
 /// A Marlin tool call said as what it does: "Waiting on" "jev · 1a2b3c4d",
 /// with a message's first line as the note. The target is the session's
 /// title and handle when this client knows the session, else the handle
-/// the agent typed.
-pub const MarlinToolLine = struct { verb: []const u8, target: []const u8 = "", note: []const u8 = "" };
+/// the agent typed. `name` is the shorter form a run of calls lists: the
+/// title alone, or the handle when there is no title.
+pub const MarlinToolLine = struct { verb: []const u8, target: []const u8 = "", note: []const u8 = "", name: []const u8 = "" };
 
 pub fn marlinToolLine(
     arena: std.mem.Allocator,
@@ -1038,6 +1039,20 @@ pub fn marlinToolLine(
     done: bool,
 ) !?MarlinToolLine {
     const tool = marlinTool(name) orelse return null;
+    const args = marlinToolArgs(arena, args_json) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => MarlinToolArgs{},
+    };
+    return try marlinToolLineFrom(arena, tool, args, sessions, done);
+}
+
+fn marlinToolLineFrom(
+    arena: std.mem.Allocator,
+    tool: MarlinTool,
+    args: MarlinToolArgs,
+    sessions: []const SessionRef,
+    done: bool,
+) !MarlinToolLine {
     const verb: []const u8 = switch (tool) {
         .list => if (done) "Listed sessions" else "Listing sessions",
         .read => if (done) "Read session" else "Reading session",
@@ -1046,11 +1061,10 @@ pub fn marlinToolLine(
         .show_image => if (done) "Showed" else "Showing",
     };
     if (tool == .list) return .{ .verb = verb };
-    const args = marlinToolArgs(arena, args_json) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => return .{ .verb = verb },
-    };
-    if (tool == .show_image) return .{ .verb = verb, .target = std.fs.path.basename(args.path orelse "") };
+    if (tool == .show_image) {
+        const file = std.fs.path.basename(args.path orelse "");
+        return .{ .verb = verb, .target = file, .name = file };
+    }
     const query = args.handle orelse return .{ .verb = verb };
     const note = if (args.text) |text|
         std.mem.trim(u8, text[0 .. std.mem.indexOfScalar(u8, text, '\n') orelse text.len], " \t\r")
@@ -1061,14 +1075,106 @@ pub fn marlinToolLine(
         const known = try arena.alloc(u64, sessions.len);
         for (sessions, known) |other, *sid| sid.* = other.sid;
         var buf: session_handle.Full = undefined;
-        const handle = session_handle.display(&buf, s.sid, known);
+        const handle = try arena.dupe(u8, session_handle.display(&buf, s.sid, known));
         return .{
             .verb = verb,
             .target = try std.fmt.allocPrint(arena, "{s} · {s}", .{ if (s.title.len > 0) s.title else "(untitled)", handle }),
             .note = note,
+            .name = if (s.title.len > 0) s.title else handle,
         };
     }
-    return .{ .verb = verb, .target = query, .note = note };
+    return .{ .verb = verb, .target = query, .note = note, .name = query };
+}
+
+/// A run of calls to one session tool in a folded trail, said in one row:
+/// "Message to steward, postgres, voyage". A call whose result failed
+/// ends the run, so its error stays under its own row. The run's message
+/// note shows only when every call sent the same first line.
+const MarlinToolRun = struct { line: MarlinToolLine, last: usize };
+
+fn marlinToolRun(
+    arena: std.mem.Allocator,
+    blocks: []const RenderBlock,
+    start: usize,
+    end: usize,
+    sessions: []const SessionRef,
+) !?MarlinToolRun {
+    const first = blocks[start];
+    const tool = marlinTool(first.label) orelse return null;
+    if (tool == .show_image) return null;
+    var names: std.ArrayList([]const u8) = .empty;
+    var note: ?[]const u8 = null;
+    var calls: usize = 0;
+    var done = true;
+    var last = start;
+    var i = start;
+    scan: while (i < end) : (i += 1) {
+        const b = blocks[i];
+        if (b.turn_id != first.turn_id) break;
+        switch (b.kind) {
+            .tool_call => {
+                if (marlinTool(b.label) != tool) break;
+                const result = pairedToolResult(blocks, i);
+                if (result) |r| if (r.status != .ok) break;
+                if (result == null) done = false;
+                const line = (try marlinToolLine(arena, b.label, b.text, sessions, false)).?;
+                calls += 1;
+                note = if (note) |seen| (if (std.mem.eql(u8, seen, line.note)) seen else "") else line.note;
+                for (names.items) |seen| if (std.mem.eql(u8, seen, line.name)) {
+                    last = i;
+                    continue :scan;
+                };
+                if (line.name.len > 0) try names.append(arena, line.name);
+            },
+            .tool_result => {
+                const call = pairedToolCallIndex(blocks, i) orelse break;
+                if (call < start) break;
+            },
+            else => break,
+        }
+        last = i;
+    }
+    if (calls < 2) return null;
+    const line = try marlinToolLineFrom(arena, tool, .{}, sessions, done);
+    return .{ .line = .{
+        .verb = line.verb,
+        .target = try std.mem.join(arena, ", ", names.items),
+        .note = note orelse "",
+    }, .last = last };
+}
+
+/// A live activity row for one of Marlin's own tools, said as what it does
+/// ("Waiting on chat · cbf5d5c5"), else null. The call's block carries its
+/// arguments; without one (marlin top, a subagent's call) the activity's
+/// detail does: Codex's arguments as JSON, Claude Code's bare handle.
+pub fn marlinActivityLabel(
+    arena: std.mem.Allocator,
+    item: proto.GuestActivity,
+    blocks: []const RenderBlock,
+    sessions: []const SessionRef,
+) !?[]const u8 {
+    const tool = marlinTool(item.name) orelse return null;
+    if (item.id.len > 0 and blocks.len > 0) {
+        const turn_id = blocks[blocks.len - 1].turn_id;
+        var i = blocks.len;
+        while (i > 0 and blocks[i - 1].turn_id == turn_id) {
+            i -= 1;
+            const rb = blocks[i];
+            if (rb.kind == .tool_call and std.mem.eql(u8, rb.call_id, item.id))
+                return try marlinToolStatus(arena, rb, sessions);
+        }
+    }
+    const args = marlinToolArgs(arena, item.detail) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => MarlinToolArgs{ .handle = if (looksLikeHandle(item.detail)) item.detail else null },
+    };
+    return try marlinStatusText(arena, try marlinToolLineFrom(arena, tool, args, sessions, false));
+}
+
+fn looksLikeHandle(text: []const u8) bool {
+    if (text.len < session_handle.min_prefix_len or text.len > session_handle.full_len) return false;
+    for (text) |c| if (!std.ascii.isHex(c)) return false;
+    return true;
 }
 
 const MarlinToolArgs = struct { handle: ?[]const u8 = null, text: ?[]const u8 = null, path: ?[]const u8 = null };
@@ -1146,6 +1252,10 @@ fn appendCallLine(
 /// ("Waiting on jev · 1a2b3c4d"), else null.
 fn marlinToolStatus(arena: std.mem.Allocator, rb: RenderBlock, sessions: []const SessionRef) !?[]const u8 {
     const line = (try marlinToolLine(arena, rb.label, rb.text, sessions, false)) orelse return null;
+    return try marlinStatusText(arena, line);
+}
+
+fn marlinStatusText(arena: std.mem.Allocator, line: MarlinToolLine) ![]const u8 {
     if (line.target.len == 0) return line.verb;
     return try std.fmt.allocPrint(arena, "{s} {s}", .{ line.verb, line.target });
 }
@@ -1963,6 +2073,8 @@ fn appendGuestActivityChildren(
     arena: std.mem.Allocator,
     lines: *std.ArrayList(Line),
     items: []const proto.GuestActivity,
+    blocks: []const RenderBlock,
+    sessions: []const SessionRef,
     parent_id: []const u8,
     depth: usize,
     now_ms: i64,
@@ -1980,11 +2092,14 @@ fn appendGuestActivityChildren(
         else
             "├─";
         const elapsed_s: i64 = if (item.started_at_ms > 0) @max(0, @divTrunc(now_ms - item.started_at_ms, 1000)) else 0;
-        const item_detail = if (std.ascii.eqlIgnoreCase(item.name, "bash"))
+        const said = try marlinActivityLabel(arena, item, blocks, sessions);
+        const item_detail = if (said != null)
+            ""
+        else if (std.ascii.eqlIgnoreCase(item.name, "bash"))
             shellDisplayCommand(item.detail)
         else
             item.detail;
-        const activity_head = try std.fmt.allocPrint(arena, "{s}{s} {s}", .{ indent, icon, item.name });
+        const activity_head = try std.fmt.allocPrint(arena, "{s}{s} {s}", .{ indent, icon, said orelse item.name });
         const detail = if (item_detail.len > 0) try std.fmt.allocPrint(arena, " · {s}", .{item_detail}) else "";
         const activity_text = try std.fmt.allocPrint(arena, "{s}{s}", .{ activity_head, detail });
         try lines.append(arena, .{
@@ -2003,7 +2118,7 @@ fn appendGuestActivityChildren(
             else
                 &.{},
         });
-        try appendGuestActivityChildren(arena, lines, items, item.id, depth + 1, now_ms, fallback_timestamp);
+        try appendGuestActivityChildren(arena, lines, items, blocks, sessions, item.id, depth + 1, now_ms, fallback_timestamp);
     }
 }
 
@@ -2245,6 +2360,13 @@ pub fn layoutBlockRange(
                     continue;
                 }
                 if (!last_dense) try blankLine(alloc, lines);
+                if (!transcript.show_tool_transcript) {
+                    if (try marlinToolRun(alloc, transcript.blocks, block_idx, end, transcript.sessions)) |run| {
+                        try appendMarlinToolLine(alloc, lines, rb, run.line, w);
+                        block_idx = run.last;
+                        continue;
+                    }
+                }
                 const note = if (result != null and result.?.status == .ok and isFileEditTool(rb.label))
                     try diffSummaryNote(alloc, result.?.text)
                 else
@@ -2582,7 +2704,7 @@ pub fn layoutLines(
     {
         try blankLine(arena, &lines);
         if (transcript.guest_activity.len > 0) {
-            try appendGuestActivityChildren(arena, &lines, transcript.guest_activity, "", 0, nowWallMs(transcript.io), live_timestamp);
+            try appendGuestActivityChildren(arena, &lines, transcript.guest_activity, transcript.blocks, transcript.sessions, "", 0, nowWallMs(transcript.io), live_timestamp);
         }
         if (transcript.reasoning_delta.len == 0) {
             try blankLine(arena, &lines);

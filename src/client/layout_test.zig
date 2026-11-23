@@ -2005,3 +2005,145 @@ test "Marlin's own tools say what they do and name the session or image, under e
     try std.testing.expect(std.mem.indexOf(u8, text, "mcp__marlin__") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "MCP marlin/") == null);
 }
+
+fn sessionToolTranscriptText(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    blocks: []const RenderBlock,
+    activity: []const proto.GuestActivity,
+    sessions: []const layout.SessionRef,
+) ![]const u8 {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var cache = LayoutCache{};
+    defer cache.reset(gpa);
+    var tail = TailLayoutCache{};
+    defer tail.reset(gpa);
+    var stream = StreamLayoutCache{};
+    defer stream.reset(gpa);
+    var transcript = Transcript{
+        .io = threaded.io(),
+        .blocks = blocks,
+        .show_tool_transcript = false,
+        .state = .running,
+        .layout_epoch = 0,
+        .delta = "",
+        .reasoning_delta = "",
+        .spinner_frame = 0,
+        .turn_started_ms = 0,
+        .call_started_ms = 0,
+        .stream_bytes = 0,
+        .stream_quiet_ms = 0,
+        .stream_status_at_ms = 0,
+        .approval = null,
+        .guest = true,
+        .guest_activity = activity,
+        .sessions = sessions,
+        .layout_cache = &cache,
+        .tail_layout_cache = &tail,
+        .stream_layout_cache = &stream,
+    };
+    const lines = try layoutLines(arena, gpa, &transcript, 160);
+    var all: std.ArrayList(u8) = .empty;
+    for (lines.items) |line| try all.print(arena, "{s}\n", .{try lineText(arena, line)});
+    return all.items;
+}
+
+test "a run of calls to one session tool says its sessions in one row" {
+    // Case: Codex told five sessions about a release; the trail read
+    // "⚙ Message to" five times, one row each.
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const session_handle = @import("../core/session_handle.zig");
+    const steward = session_handle.full(1);
+    const postgres = session_handle.full(2);
+    const sessions = [_]layout.SessionRef{ .{ .sid = 1, .title = "steward" }, .{ .sid = 2, .title = "postgres" } };
+    const Codex = struct {
+        fn call(a: std.mem.Allocator, id: []const u8, tool: []const u8, handle: []const u8, text: []const u8) !RenderBlock {
+            return .{
+                .kind = .tool_call,
+                .turn_id = 1,
+                .call_id = @constCast(id),
+                .label = try std.fmt.allocPrint(a, "MCP marlin/{s}", .{tool}),
+                .text = try std.fmt.allocPrint(a, "{{\"type\":\"mcpToolCall\",\"tool\":\"{s}\",\"arguments\":{{\"handle\":\"{s}\",\"text\":\"{s}\"}}}}", .{ tool, handle, text }),
+            };
+        }
+        fn result(id: []const u8, status: block.ToolStatus) RenderBlock {
+            return .{ .kind = .tool_result, .turn_id = 1, .call_id = @constCast(id), .text = @constCast("Delivered."), .label = @constCast(""), .status = status };
+        }
+    };
+    const blocks = [_]RenderBlock{
+        .{ .kind = .user_msg, .turn_id = 1, .text = @constCast("ship it"), .label = @constCast("") },
+        // Four messages: one session twice, one this client does not know,
+        // not all the same words.
+        try Codex.call(arena, "m1", "message_session", steward[0..8], "Released."),
+        Codex.result("m1", .ok),
+        try Codex.call(arena, "m2", "message_session", postgres[0..8], "Released."),
+        Codex.result("m2", .ok),
+        try Codex.call(arena, "m3", "message_session", steward[0..8], "Released.\\nDetails."),
+        Codex.result("m3", .ok),
+        try Codex.call(arena, "m4", "message_session", "beef1234", "Your turn."),
+        Codex.result("m4", .ok),
+        .{ .kind = .tool_call, .turn_id = 1, .call_id = @constCast("b1"), .text = @constCast("{\"command\":\"git fetch origin\"}"), .label = @constCast("Bash") },
+        .{ .kind = .tool_result, .turn_id = 1, .call_id = @constCast("b1"), .text = @constCast(""), .label = @constCast("") },
+        // The same words to each: the run keeps them.
+        try Codex.call(arena, "m5", "message_session", steward[0..8], "Done."),
+        Codex.result("m5", .ok),
+        try Codex.call(arena, "m6", "message_session", postgres[0..8], "Done."),
+        Codex.result("m6", .ok),
+        // A failed wait ends the run: its error stays under its own row.
+        try Codex.call(arena, "w1", "wait_for_session", steward[0..8], ""),
+        Codex.result("w1", .ok),
+        try Codex.call(arena, "w2", "wait_for_session", postgres[0..8], ""),
+        Codex.result("w2", .err),
+        // Still running: present tense.
+        try Codex.call(arena, "w3", "wait_for_session", steward[0..8], ""),
+        Codex.result("w3", .ok),
+        try Codex.call(arena, "w4", "wait_for_session", postgres[0..8], ""),
+    };
+    const text = try sessionToolTranscriptText(arena, gpa, &blocks, &.{}, &sessions);
+    try std.testing.expect(std.mem.indexOf(u8, text, "⚙ Message to steward, postgres, beef1234\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "⚙ Bash git fetch origin") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "⚙ Message to steward, postgres: Done.\n") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "Message to"));
+    try std.testing.expect(std.mem.indexOf(u8, text, try std.fmt.allocPrint(arena, "⚙ Waited on steward · {s}\n", .{steward[0..8]})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, try std.fmt.allocPrint(arena, "⚙ Waited on postgres · {s}\n", .{postgres[0..8]})) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "⚙ Waiting on steward, postgres\n") != null);
+}
+
+test "a guest's live session tool says what it does and which session, not its MCP name" {
+    // Case: "• mcp__marlin__wait_for_session · 1m" while Claude Code waited
+    // on another session.
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const session_handle = @import("../core/session_handle.zig");
+    const chat = session_handle.full(5);
+    const sessions = [_]layout.SessionRef{.{ .sid = 5, .title = "chat" }};
+    const args = try std.fmt.allocPrint(arena, "{{\"handle\":\"{s}\"}}", .{chat[0..8]});
+    const blocks = [_]RenderBlock{
+        .{ .kind = .user_msg, .turn_id = 1, .text = @constCast("ask chat"), .label = @constCast("") },
+        .{ .kind = .tool_call, .turn_id = 1, .call_id = @constCast("toolu_1"), .text = args, .label = @constCast("mcp__marlin__wait_for_session") },
+    };
+    const activity = [_]proto.GuestActivity{.{ .id = "toolu_1", .kind = .tool, .name = "mcp__marlin__wait_for_session" }};
+    const text = try sessionToolTranscriptText(arena, gpa, &blocks, &activity, &sessions);
+    const said = try std.fmt.allocPrint(arena, "• Waiting on chat · {s} · ", .{chat[0..8]});
+    try std.testing.expect(std.mem.indexOf(u8, text, said) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "mcp__marlin__") == null);
+
+    // Without the call's block (marlin top, a subagent's call), the
+    // activity's own detail names the session: Codex's arguments as JSON,
+    // Claude Code's bare handle. Any other detail is not a handle.
+    const named = try std.fmt.allocPrint(arena, "Waiting on chat · {s}", .{chat[0..8]});
+    const codex_detail = try std.fmt.allocPrint(arena, "{{\"handle\":\"{s}\"}}", .{chat[0..8]});
+    for ([_]proto.GuestActivity{
+        .{ .id = "x", .kind = .tool, .name = "MCP marlin/wait_for_session", .detail = codex_detail },
+        .{ .id = "x", .kind = .tool, .name = "mcp__marlin__wait_for_session", .detail = chat[0..8] },
+    }) |item|
+        try std.testing.expectEqualStrings(named, (try layout.marlinActivityLabel(arena, item, &.{}, &sessions)).?);
+    try std.testing.expectEqualStrings("Waiting on", (try layout.marlinActivityLabel(arena, .{ .id = "x", .kind = .tool, .name = "mcp__marlin__wait_for_session", .detail = "wait for it" }, &.{}, &sessions)).?);
+    try std.testing.expect(try layout.marlinActivityLabel(arena, .{ .id = "x", .kind = .tool, .name = "Bash", .detail = "ls" }, &.{}, &sessions) == null);
+}

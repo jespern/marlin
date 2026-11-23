@@ -8,6 +8,7 @@ const proto = @import("../core/proto.zig");
 const session_handle = @import("../core/session_handle.zig");
 const attach = @import("attach.zig");
 const render = @import("render.zig");
+const layout = @import("layout.zig");
 
 const Palette = render.Palette;
 
@@ -522,14 +523,22 @@ fn activitySegments(
     columns: Columns,
     now_ms: i64,
     selected: bool,
+    sessions: []const layout.SessionRef,
 ) ![]const vaxis.Segment {
     const base = rowStyle(selected, false);
     var age_buf: [32]u8 = undefined;
     const age = formatAge(&age_buf, row.item.started_at_ms, now_ms);
-    const display_detail = if (row.item.kind == .process) render.shellDisplayCommand(row.item.detail) else row.item.detail;
+    // Marlin's own tools say what they do, the session included.
+    const said = try layout.marlinActivityLabel(arena, row.item, &.{}, sessions);
+    const display_detail = if (said != null)
+        ""
+    else if (row.item.kind == .process)
+        render.shellDisplayCommand(row.item.detail)
+    else
+        row.item.detail;
     const indent = try render.spaces(arena, row.depth * 2);
     const detail = if (display_detail.len > 0) try std.fmt.allocPrint(arena, " · {s}", .{display_detail}) else "";
-    const title = try std.fmt.allocPrint(arena, "{s}{s} {s}{s}", .{ indent, activityIcon(row.item.kind), row.item.name, detail });
+    const title = try std.fmt.allocPrint(arena, "{s}{s} {s}{s}", .{ indent, activityIcon(row.item.kind), said orelse row.item.name, detail });
 
     var out = try arena.alloc(vaxis.Segment, 11);
     var n: usize = 0;
@@ -623,10 +632,12 @@ pub fn drawActivityOutput(
     arena: std.mem.Allocator,
     row: ActivityRow,
     output_scroll: *usize,
+    sessions: []const layout.SessionRef,
 ) !void {
     win.clear();
     if (win.width < 20 or win.height < 4) return;
-    const title = try std.fmt.allocPrint(arena, " output — {s} {s}", .{ activityIcon(row.item.kind), row.item.name });
+    const said = try layout.marlinActivityLabel(arena, row.item, &.{}, sessions);
+    const title = try std.fmt.allocPrint(arena, " output — {s} {s}", .{ activityIcon(row.item.kind), said orelse row.item.name });
     _ = win.printSegment(.{ .text = truncateRight(title, win.width -| 1), .style = .{ .fg = Palette.soft_blue, .bold = true } }, .{ .wrap = .none });
     if (row.item.detail.len > 0) {
         const detail = if (row.item.kind == .process) render.shellDisplayCommand(row.item.detail) else row.item.detail;
@@ -1155,6 +1166,8 @@ pub fn drawCatalog(
     win.clear();
     if (win.width < 20 or win.height < 4) return;
     const work = try workRows(arena, rows, activity_groups);
+    const sessions = try arena.alloc(layout.SessionRef, rows.len);
+    for (rows, sessions) |row, *ref| ref.* = .{ .sid = row.sid, .title = row.title };
 
     var running: usize = 0;
     var approvals: usize = 0;
@@ -1174,7 +1187,7 @@ pub fn drawCatalog(
     }
 
     if (inspecting_activity and work.len > 0) switch (work[selected_index]) {
-        .activity => |activity| return drawActivityOutput(win, arena, activity, output_scroll),
+        .activity => |activity| return drawActivityOutput(win, arena, activity, output_scroll, sessions),
         .session => {},
     };
 
@@ -1210,7 +1223,7 @@ pub fn drawCatalog(
                 },
                 .activity => |activity| {
                     row_win.fill(.{ .style = rowStyle(selected, false) });
-                    const segments = try activitySegments(arena, activity, columns, now_ms, selected);
+                    const segments = try activitySegments(arena, activity, columns, now_ms, selected, sessions);
                     _ = row_win.print(segments, .{ .col_offset = 1, .wrap = .none });
                 },
             }

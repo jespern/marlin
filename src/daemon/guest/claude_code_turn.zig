@@ -75,7 +75,8 @@ pub fn guestToolPhase(open_tools: usize) proto.TurnPhase {
 fn activityDetail(arena: std.mem.Allocator, input_json: []const u8) []const u8 {
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, input_json, .{}) catch return "";
     if (parsed != .object) return "";
-    inline for (.{ "description", "command", "prompt", "file_path", "pattern", "query" }) |key| {
+    // "handle": the session Marlin's own session tools act on.
+    inline for (.{ "description", "command", "prompt", "file_path", "pattern", "query", "handle" }) |key| {
         if (parsed.object.get(key)) |value| if (value == .string) return value.string;
     }
     return "";
