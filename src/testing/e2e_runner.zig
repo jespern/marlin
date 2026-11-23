@@ -360,15 +360,15 @@ fn runScenario(
     const guest_handover = std.mem.startsWith(u8, sf.check.handover_flow, "guest_");
     if (std.mem.startsWith(u8, sf.check.pause_flow, "guest_") or guest_handover) {
         const flow = if (guest_handover) sf.check.handover_flow else sf.check.pause_flow;
-        const claude = std.mem.startsWith(u8, flow, "guest_claude");
+        const guest = Guest.of(flow);
         const auth = std.mem.indexOf(u8, flow, "_auth_") != null;
-        const fixture_name: []const u8 = if (guest_handover) (if (claude) "claude_handover.sh" else "codex_handover.sh") else if (auth) (if (claude) "claude_auth.sh" else "codex_auth.sh") else (if (claude) "claude.sh" else "codex.sh");
+        const fixture_name = try std.fmt.allocPrint(arena, "{s}{s}.sh", .{ @tagName(guest), if (guest_handover) "_handover" else if (auth) "_auth" else "" });
         const fixture = try std.fs.path.join(arena, &.{ scenarios_dir, "..", "fixtures", "pause", fixture_name });
         const script = try Io.Dir.cwd().readFileAlloc(io, fixture, arena, .limited(64 * 1024));
         const path = try std.fs.path.joinZ(arena, &.{ state_dir, "guest-peer" });
         try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = script });
         if (std.c.chmod(path, 0o755) != 0) return error.GuestFixtureChmodFailed;
-        try env.put(if (claude) "MARLIN_CLAUDE_CODE_BIN" else "MARLIN_CODEX_BIN", path);
+        try env.put(guest.binEnv(), path);
         try env.put("MARLIN_AUTH_TEST_CASE", sf.check.pause_flow);
     }
     if (sf.check.codex_question_flow) {
@@ -1376,7 +1376,7 @@ fn shellRoundTrip(conn: *ProtocolConn, arena: std.mem.Allocator, shell_id: u64, 
 }
 
 fn checkHandoverFlow(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, cwd: []const u8, flow: []const u8) !void {
-    if (std.mem.startsWith(u8, flow, "guest_")) return checkGuestHandover(gpa, io, env, cwd, std.mem.eql(u8, flow, "guest_claude"));
+    if (std.mem.startsWith(u8, flow, "guest_")) return checkGuestHandover(gpa, io, env, cwd, Guest.of(flow));
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1470,10 +1470,49 @@ fn checkHandoverFlow(gpa: std.mem.Allocator, io: Io, env: *const std.process.Env
     if (exited.get("code")) |code| if (code != .null) return error.HandoverShellStatusInvented;
 }
 
-/// A Claude Code turn running across a graceful handover: its guest is not
+/// The guest agent a `guest_*` flow drives, through its fake binary.
+const Guest = enum {
+    claude,
+    codex,
+    agy,
+
+    fn of(flow: []const u8) Guest {
+        inline for (.{ Guest.claude, Guest.agy }) |guest| {
+            if (std.mem.startsWith(u8, flow, "guest_" ++ @tagName(guest))) return guest;
+        }
+        return .codex;
+    }
+
+    fn model(guest: Guest) []const u8 {
+        return switch (guest) {
+            .claude => "claudecode/default",
+            .codex => "codex/default",
+            .agy => "agy/default",
+        };
+    }
+
+    fn binEnv(guest: Guest) []const u8 {
+        return switch (guest) {
+            .claude => "MARLIN_CLAUDE_CODE_BIN",
+            .codex => "MARLIN_CODEX_BIN",
+            .agy => "MARLIN_AGY_BIN",
+        };
+    }
+
+    /// What a login-required error tells the user to run.
+    fn loginCommand(guest: Guest) []const u8 {
+        return switch (guest) {
+            .claude => "claude auth login",
+            .codex => "codex login",
+            .agy => "`agy`",
+        };
+    }
+};
+
+/// A guest turn running across a graceful handover: its guest is not
 /// stopped or resumed but followed by the successor, which finishes the
 /// same turn with every block exactly once.
-fn checkGuestHandover(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, cwd: []const u8, claude: bool) !void {
+fn checkGuestHandover(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, cwd: []const u8, guest: Guest) !void {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1485,7 +1524,7 @@ fn checkGuestHandover(gpa: std.mem.Allocator, io: Io, env: *const std.process.En
     const hello = try recvTagBounded(watcher, arena, "hello_ok");
     const old_pid: std.posix.pid_t = @intCast(uintField(hello, "daemon_pid") orelse return error.DaemonPidMissing);
     try watcher.send(.{ .handover_watch = struct {}{} });
-    try watcher.send(.{ .session_create = .{ .cwd = cwd, .model = if (claude) @as([]const u8, "claudecode/default") else "codex/default", .approvals = "auto" } });
+    try watcher.send(.{ .session_create = .{ .cwd = cwd, .model = guest.model(), .approvals = "auto" } });
     const sid = uintField(try recvTagBounded(watcher, arena, "session_created"), "sid") orelse return error.SessionIdMissing;
     try watcher.send(.{ .sub = .{ .sid = sid, .from_seq = 0 } });
     try watcher.send(.{ .input = .{ .sid = sid, .text = "guest handover task" } });
@@ -1564,8 +1603,9 @@ fn checkGuestHandover(gpa: std.mem.Allocator, io: Io, env: *const std.process.En
         }
         if (objectField(body, "system_note")) |n| try notes.print(arena, "{s}\n", .{stringField(n, "text") orelse ""});
     }
-    // Claude's commentary arrives before its tool call; this Codex has none.
-    if (user_msgs != 1 or calls != 1 or results != 1 or answers != 1 or commentary != @intFromBool(claude)) {
+    // Claude's commentary arrives before its tool call; this Codex and agy
+    // have none.
+    if (user_msgs != 1 or calls != 1 or results != 1 or answers != 1 or commentary != @intFromBool(guest == .claude)) {
         print(io, "blocks: user {d} call {d} result {d} answer {d} commentary {d}; notes:\n{s}", .{ user_msgs, calls, results, answers, commentary, notes.items });
         return error.GuestHandoverBlocksWrong;
     }
@@ -1624,7 +1664,8 @@ fn checkPauseFlow(gpa: std.mem.Allocator, io: Io, env: *const std.process.Enviro
     var conn = try connectProtocol(gpa, io, env);
     defer conn.deinit();
     if (std.mem.startsWith(u8, flow, "guest_")) {
-        try conn.send(.{ .session_create = .{ .cwd = cwd, .model = if (std.mem.startsWith(u8, flow, "guest_claude")) @as([]const u8, "claudecode/default") else "codex/default", .approvals = "auto" } });
+        const guest = Guest.of(flow);
+        try conn.send(.{ .session_create = .{ .cwd = cwd, .model = guest.model(), .approvals = "auto" } });
         const created = try recvTagBounded(conn, arena, "session_created");
         const sid = uintField(created, "sid").?;
         try conn.send(.{ .sub = .{ .sid = sid, .from_seq = 0 } });
@@ -1635,7 +1676,7 @@ fn checkPauseFlow(gpa: std.mem.Allocator, io: Io, env: *const std.process.Enviro
                 if (uintField(status, "sid") != sid) continue;
                 if (!std.mem.eql(u8, stringField(status, "state") orelse "", "err")) continue;
                 const message = stringField(status, "err_text") orelse return error.AuthErrorMissing;
-                const command: []const u8 = if (std.mem.startsWith(u8, flow, "guest_claude")) "claude auth login" else "codex login";
+                const command = guest.loginCommand();
                 if (std.mem.indexOf(u8, message, command) == null or std.mem.indexOf(u8, message, "daemon host") == null) return error.AuthLoginInstructionMissing;
                 break;
             }
