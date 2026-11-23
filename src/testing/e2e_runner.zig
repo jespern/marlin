@@ -1576,6 +1576,11 @@ fn checkGuestHandover(gpa: std.mem.Allocator, io: Io, env: *const std.process.En
     var answers: usize = 0;
     var commentary: usize = 0;
     var notes: std.ArrayList(u8) = .empty;
+    // A block stored while this subscription read its history also arrives
+    // live; clients drop it by seq (tui.zig, webui.html), and so does this.
+    // A block stored twice has two seqs and still counts twice.
+    var last_seq: u64 = 0;
+    var repeats: usize = 0;
     while (true) {
         const msg = try recvBounded(moved, arena);
         if (tagObject(msg, "status")) |status| {
@@ -1590,7 +1595,14 @@ fn checkGuestHandover(gpa: std.mem.Allocator, io: Io, env: *const std.process.En
         }
         const blk = tagObject(msg, "blk") orelse continue;
         if (uintField(blk, "sid") != sid) continue;
-        const body = (objectField(objectField(blk, "b") orelse continue, "body")) orelse continue;
+        const b = objectField(blk, "b") orelse continue;
+        const seq = uintField(b, "seq") orelse 0;
+        if (seq <= last_seq) {
+            repeats += 1;
+            continue;
+        }
+        last_seq = seq;
+        const body = objectField(b, "body") orelse continue;
         if (objectField(body, "user_msg") != null) user_msgs += 1;
         if (objectField(body, "tool_call") != null) calls += 1;
         if (objectField(body, "tool_result") != null) results += 1;
@@ -1606,7 +1618,7 @@ fn checkGuestHandover(gpa: std.mem.Allocator, io: Io, env: *const std.process.En
     // Claude's commentary arrives before its tool call; this Codex and agy
     // have none.
     if (user_msgs != 1 or calls != 1 or results != 1 or answers != 1 or commentary != @intFromBool(guest == .claude)) {
-        print(io, "blocks: user {d} call {d} result {d} answer {d} commentary {d}; notes:\n{s}", .{ user_msgs, calls, results, answers, commentary, notes.items });
+        print(io, "blocks: user {d} call {d} result {d} answer {d} commentary {d} ({d} repeated seqs dropped); notes:\n{s}", .{ user_msgs, calls, results, answers, commentary, repeats, notes.items });
         return error.GuestHandoverBlocksWrong;
     }
     if (notes.items.len > 0) {
