@@ -149,6 +149,8 @@
   /* Sent while the agent works: queued until the turn takes it (layout.zig
      wrapInputCard "Queued"). */
   .user.queued::before { content: "Queued"; display: block; color: var(--dim); font-size: 12px; font-weight: 400; }
+  /* Taken by the agent, not read yet: can't be taken back (layout.zig sent_label). */
+  .user.queued.sent::before { content: "Sent, read at its next step"; }
   /* The session's queue, the daemon's (proto `queued`), pinned above the
      composer as Claude Code does: new output never buries it. */
   #queue { order: 2; padding: 0 22px; }
@@ -766,7 +768,8 @@ function showQueue(items) {
 
 function queuedCard(item) {
   const v = item.input;
-  const node = el('div', 'block user queued', '↪ ' + (v.from ? v.from + ': ' : '') + (v.display_text || v.text));
+  const node = el('div', 'block user queued' + (item.sent ? ' sent' : ''), '↪ ' + (v.from ? v.from + ': ' : '') + (v.display_text || v.text));
+  if (item.sent) return node;
   const x = el('button', 'unqueue', '×');
   x.title = 'don’t send';
   x.setAttribute('aria-label', 'don’t send');

@@ -401,6 +401,8 @@ pub const RenderBlock = struct {
     /// An entry of the daemon's queue (proto `queued`), by its id; zero for
     /// everything else. Shown as a pending echo until the turn takes it.
     queue_id: u64 = 0,
+    /// A queue entry the agent has taken but not read yet: no longer Up's to take back.
+    queue_sent: bool = false,
 
     pub fn deinit(self: *RenderBlock, gpa: std.mem.Allocator) void {
         gpa.free(self.text);
@@ -754,8 +756,12 @@ pub fn wrapPromptCard(
     text: []const u8,
     width: usize,
 ) !void {
-    return wrapInputCard(arena, lines, text, width, false, false);
+    return wrapInputCard(arena, lines, text, width, false, "");
 }
+
+/// A queue entry the agent took but has not read (Claude Code reads its
+/// input between steps). webui.html says the same.
+pub const sent_label = "Sent, read at its next step";
 
 fn wrapInputCard(
     arena: std.mem.Allocator,
@@ -763,7 +769,8 @@ fn wrapInputCard(
     text: []const u8,
     width: usize,
     steer: bool,
-    queued: bool,
+    /// Above the text: "Queued" or "Sent…" while the agent has not read it.
+    state: []const u8,
 ) !void {
     const first_prefix = if (steer) " ↪ " else " ❯ ";
     const continuation = "   ";
@@ -772,7 +779,8 @@ fn wrapInputCard(
     const body_width = width -| (prefix_cells + 1); // keep right padding
     if (body_width < 8) return;
 
-    try lines.append(arena, .{ .text = if (queued) "   Queued" else "", .style = Palette.prompt_hint, .fill_style = Palette.prompt_panel });
+    const head = try std.fmt.allocPrint(arena, "{s}{s}", .{ if (state.len > 0) "   " else "", state });
+    try lines.append(arena, .{ .text = head, .style = Palette.prompt_hint, .fill_style = Palette.prompt_panel });
     // A message with no text (an image alone, say) still gets a visible
     // body rather than a bare prompt mark.
     if (std.mem.trim(u8, text, " \t\r\n").len == 0) {
@@ -2399,7 +2407,7 @@ pub fn layoutBlockRange(
                     try appendAgentMessage(alloc, lines, rb, transcript.show_tool_transcript, w);
                     continue;
                 }
-                try wrapInputCard(alloc, lines, rb.text, w, true, rb.pending_echo);
+                try wrapInputCard(alloc, lines, rb.text, w, true, if (rb.queue_sent) sent_label else if (rb.pending_echo) "Queued" else "");
                 if (rb.label.len > 0)
                     try wrapPrefixed(alloc, lines, "  ", rb.label, Palette.status_model, w);
                 try appendImageRows(alloc, lines, rb, transcript, w);

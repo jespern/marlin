@@ -38,7 +38,9 @@ pub const SessionState = enum { idle, running, awaiting_approval, err, done };
 pub const TurnPhase = enum { idle, starting, context, provider, approval, tool, child, compaction, finishing, background };
 
 /// An input waiting in a session's queue; `id` names it to `unqueue`.
-pub const QueuedInput = struct { id: u64, input: block.Input };
+/// `sent`: the agent has taken it but not yet read it (Claude Code holds it
+/// until its next step), so it can no longer be taken back.
+pub const QueuedInput = struct { id: u64, input: block.Input, sent: bool = false };
 
 /// Live operational work owned by a turn. Guest ids/parents come from the
 /// harness stream; native ids are tool call ids. These are not durable child

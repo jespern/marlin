@@ -310,6 +310,7 @@ pub fn replaceQueuedBlocks(
             .pending_echo = true,
             .pending_after_seq = last_seq,
             .queue_id = item.id,
+            .queue_sent = item.sent,
             .timestamp_ms = now_ms,
         }) catch {
             gpa.free(text);
@@ -329,12 +330,13 @@ fn queueHas(items: []const proto.QueuedInput, id: u64) bool {
     return false;
 }
 
-/// The newest queue entry shown, for Up to take back.
+/// The newest queue entry shown, for Up to take back. One the agent already
+/// took (sent) cannot come back.
 pub fn newestQueued(blocks: []const RenderBlock) ?*const RenderBlock {
     var i = blocks.len;
     while (i > 0) {
         i -= 1;
-        if (blocks[i].queue_id != 0) return &blocks[i];
+        if (blocks[i].queue_id != 0 and !blocks[i].queue_sent) return &blocks[i];
     }
     return null;
 }
@@ -2759,7 +2761,7 @@ pub const App = struct {
                 if (shell_tab.failed(self, e.request_id, e.code, e.msg)) return;
                 if (e.request_id != 0 and e.request_id == self.unqueue_pending.request_id) {
                     self.unqueue_pending = .{};
-                    self.setNotice("already sent", .{});
+                    self.setNotice("{s}", .{e.msg});
                     return;
                 }
                 // A missing blob answers the oldest request; an image just

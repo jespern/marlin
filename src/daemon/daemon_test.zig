@@ -707,6 +707,65 @@ test "a session's queued input reaches every client, and any client can take it 
     try std.testing.expect(!try r.daemon.store.hasPausedInputs(7));
 }
 
+// Case: Jesper queued a message on his phone while Claude Code worked; the ×
+// answered "already sent" yet the card stayed. Claude Code had it on stdin but
+// reads it only at its next step. Until then it shows as sent, with no ×.
+test "a queued input a guest took but has not read shows as sent, not cancellable" {
+    const r = try ShellRig.create();
+    defer r.destroy();
+    const gpa = r.gpa;
+    defer {
+        for (r.session.steer_queue.items) |queued| queued.input.deinit(gpa);
+        r.session.steer_queue.deinit(gpa);
+        for (r.session.steer_sent.items) |queued| queued.input.deinit(gpa);
+        r.session.steer_sent.deinit(gpa);
+    }
+    r.session.state = .running;
+    r.session.steer_accepting = true;
+    try r.send(1, "{{\"sub\":{{\"sid\":7,\"tail_limit\":10}}}}", .{});
+    try r.send(2, "{{\"input\":{{\"sid\":7,\"text\":\"also run the tests\",\"request_id\":5}}}}", .{});
+    _ = try r.drain(1);
+    _ = try r.drain(2);
+
+    // Claude Code's input pump takes it and writes it to the guest's stdin.
+    const taken = r.daemon.takeQueuedInput(&r.session).?;
+    defer taken.deinit(gpa);
+    try r.daemon.handleEvent(.{ .queue_changed = 7 });
+    var shown: ?[]const proto.QueuedInput = null;
+    for (try r.drain(1)) |msg| if (msg == .queued) {
+        shown = msg.queued.items;
+    };
+    try std.testing.expectEqual(@as(usize, 1), shown.?.len);
+    try std.testing.expect(shown.?[0].sent);
+    try std.testing.expectEqualStrings("also run the tests", shown.?[0].input.text);
+
+    // Taking it back is refused, and says why.
+    try r.send(1, "{{\"unqueue\":{{\"sid\":7,\"id\":{d},\"request_id\":6}}}}", .{shown.?[0].id});
+    var refused = false;
+    for (try r.drain(1)) |msg| if (msg == .err) {
+        try std.testing.expectEqualStrings("already sent: the agent reads it at its next step", msg.err.msg);
+        refused = true;
+    };
+    try std.testing.expect(refused);
+
+    // A subscriber arriving now sees it too.
+    try r.send(2, "{{\"sub\":{{\"sid\":7,\"tail_limit\":10}}}}", .{});
+    var late: ?[]const proto.QueuedInput = null;
+    for (try r.drain(2)) |msg| if (msg == .queued) {
+        late = msg.queued.items;
+    };
+    try std.testing.expect(late.?[0].sent);
+
+    // Claude Code echoes it: the steer block retires it and the queue empties.
+    r.daemon.retireSentInput(&r.session, taken.text);
+    const b = @import("../core/block.zig").Block{ .id = 1, .session_id = 7, .turn_id = 1, .seq = 1, .ts = 0, .body = .{ .steer = taken } };
+    const line = try proto.encode(gpa, proto.DaemonMsg{ .blk = .{ .sid = 7, .b = b } });
+    try r.daemon.handleEvent(.{ .turn_block = .{ .sid = 7, .line = line, .steer = true } });
+    const after = try r.drain(1);
+    try std.testing.expect(after[0] == .blk);
+    try std.testing.expectEqual(@as(usize, 0), after[1].queued.items.len);
+}
+
 // Case: attached from the MacBook, /voice set up the MacBook. Over --remote
 // the daemon's machine sets up and transcribes; the client only records.
 test "a remote client's voice is set up and transcribed on the daemon's machine" {

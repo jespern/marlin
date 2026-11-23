@@ -197,6 +197,8 @@ const Event = union(enum) {
     // From turn threads (loop.zig callbacks). All payloads gpa-owned.
     /// `steer`: the turn took a queued input, so the queue changed.
     turn_block: struct { sid: u64, line: []u8, ends: LiveStream = .none, steer: bool = false }, // pre-encoded proto.DaemonMsg.blk
+    /// A turn took a queued input it has not shown yet: subscribers see it as sent.
+    queue_changed: u64,
     /// A native agent's call of a tool for other sessions; name and args
     /// gpa-owned. The turn is parked on `future`.
     agent_tool: struct { sid: u64, name: []u8, args_json: []u8, future: *TaskFuture },
@@ -552,6 +554,10 @@ pub const Session = struct {
     guest_context_limit: std.atomic.Value(u64) = .init(0),
     /// Queued mid-turn steer texts (gpa-owned), drained by poll_steer.
     steer_queue: std.ArrayList(proto.QueuedInput) = .empty,
+    /// Guarded by steer_mutex. Inputs a turn took from steer_queue whose
+    /// steer block has not appeared yet, oldest first (`sent` set). Claude
+    /// Code reads its stdin only between steps, so this can last minutes.
+    steer_sent: std.ArrayList(proto.QueuedInput) = .empty,
     /// Guarded by steer_mutex. A turn closes this atomically with observing
     /// an empty queue, so dispatcher input can never be acknowledged into the
     /// final-poll/turn-done gap. Compact and handover operations leave it off.
@@ -1686,6 +1692,7 @@ pub const Daemon = struct {
                 // without a frame where neither shows.
                 if (tb.steer) if (session) |ses| self.publishQueue(ses);
             },
+            .queue_changed => |sid| if (self.sessions.get(sid)) |ses| self.publishQueue(ses),
             .agent_tool => |at| {
                 defer self.gpa.free(at.name);
                 defer self.gpa.free(at.args_json);
@@ -3193,7 +3200,14 @@ pub const Daemon = struct {
                     taken = session.steer_queue.orderedRemove(i);
                     break;
                 };
+                const sent = for (session.steer_sent.items) |queued| {
+                    if (queued.id == uq.id) break true;
+                } else false;
                 session.steer_mutex.unlock(self.io);
+                if (sent) {
+                    self.sendInputError(client, uq.request_id, "not_queued", "already sent: the agent reads it at its next step");
+                    return;
+                }
                 if (taken) |queued| queued.input.deinit(self.gpa);
                 const removed = taken != null or (self.store.deletePausedInput(uq.sid, uq.id) catch false);
                 if (!removed) {
@@ -4402,6 +4416,9 @@ pub const Daemon = struct {
         session.steer_mutex.lockUncancelable(self.io);
         defer session.steer_mutex.unlock(self.io);
         session.steer_accepting = false;
+        // What the guest took is in its journal; the successor replays it.
+        for (session.steer_sent.items) |queued| queued.input.deinit(self.gpa);
+        session.steer_sent.clearRetainingCapacity();
         if (session.steer_queue.items.len == 0) return;
         defer {
             for (session.steer_queue.items) |queued| queued.input.deinit(self.gpa);
@@ -4666,6 +4683,8 @@ pub const Daemon = struct {
         session.steer_mutex.lockUncancelable(self.io);
         for (session.steer_queue.items) |steer| steer.input.deinit(self.gpa);
         session.steer_queue.deinit(self.gpa);
+        for (session.steer_sent.items) |steer| steer.input.deinit(self.gpa);
+        session.steer_sent.deinit(self.gpa);
         session.steer_mutex.unlock(self.io);
         session.guest_activity_mutex.lockUncancelable(self.io);
         if (session.guest_activity_arena) |*arena| arena.deinit();
@@ -5064,7 +5083,12 @@ pub const Daemon = struct {
     fn settleSteeringAfterTurn(self: *Daemon, session: *Session) void {
         session.steer_mutex.lockUncancelable(self.io);
         session.steer_accepting = false;
-        var pending = session.steer_queue;
+        // Sent but never read (the turn ended first) goes ahead of the rest.
+        var pending = session.steer_sent;
+        session.steer_sent = .empty;
+        pending.appendSlice(self.gpa, session.steer_queue.items) catch
+            for (session.steer_queue.items) |queued| queued.input.deinit(self.gpa);
+        session.steer_queue.deinit(self.gpa);
         session.steer_queue = .empty;
         session.steer_mutex.unlock(self.io);
         defer pending.deinit(self.gpa);
@@ -5610,6 +5634,7 @@ pub const Daemon = struct {
         fn onBlock(ctx: ?*anyopaque, b: block.Block) void {
             const job: *TurnJob = @ptrCast(@alignCast(ctx.?));
             const self = job.daemon;
+            if (b.body == .steer) self.retireSentInput(job.session, b.body.steer.text);
             const line = proto.encode(self.gpa, proto.DaemonMsg{ .blk = .{ .sid = job.sid, .b = b } }) catch return;
             self.events.push(self.io, .{ .turn_block = .{ .sid = job.sid, .line = line, .ends = blockEndsLiveStream(b), .steer = b.body == .steer } }) catch self.gpa.free(line);
         }
@@ -5796,13 +5821,9 @@ pub const Daemon = struct {
         fn pollSteer(ctx: ?*anyopaque, gpa: std.mem.Allocator) ?block.Input {
             const job: *TurnJob = @ptrCast(@alignCast(ctx.?));
             const self = job.daemon;
-            job.session.steer_mutex.lockUncancelable(self.io);
-            defer job.session.steer_mutex.unlock(self.io);
-            if (job.session.pause_requested.load(.acquire) or job.session.steer_queue.items.len == 0) return null;
-            const text = job.session.steer_queue.orderedRemove(0).input;
             // Transfer to the loop's allocator (same gpa in practice).
             _ = gpa;
-            return text;
+            return self.takeQueuedInput(job.session);
         }
 
         /// Close only if the queue is empty while holding the same mutex used
@@ -6057,11 +6078,43 @@ pub const Daemon = struct {
         // and frees what it took.
         session.steer_mutex.lockUncancelable(self.io);
         defer session.steer_mutex.unlock(self.io);
-        const items = arena.alloc(proto.QueuedInput, session.steer_queue.items.len + paused.len) catch return null;
-        @memcpy(items[0..session.steer_queue.items.len], session.steer_queue.items);
-        @memcpy(items[session.steer_queue.items.len..], paused);
+        const sent = session.steer_sent.items;
+        const queued = session.steer_queue.items;
+        const items = arena.alloc(proto.QueuedInput, sent.len + queued.len + paused.len) catch return null;
+        @memcpy(items[0..sent.len], sent);
+        @memcpy(items[sent.len..][0..queued.len], queued);
+        @memcpy(items[sent.len + queued.len ..], paused);
         if (items.len == 0 and !allow_empty) return null;
         return proto.encode(self.gpa, proto.DaemonMsg{ .queued = .{ .sid = session.id, .items = items } }) catch null;
+    }
+
+    /// A turn takes the oldest queued input. It shows as sent, and can no
+    /// longer be taken back, until its steer block appears (retireSentInput).
+    /// Turn thread.
+    pub fn takeQueuedInput(self: *Daemon, session: *Session) ?block.Input {
+        const taken = take: {
+            session.steer_mutex.lockUncancelable(self.io);
+            defer session.steer_mutex.unlock(self.io);
+            if (session.pause_requested.load(.acquire) or session.steer_queue.items.len == 0) return null;
+            const queued = session.steer_queue.orderedRemove(0);
+            if (dupeInput(self.gpa, queued.input)) |copy| {
+                session.steer_sent.append(self.gpa, .{ .id = queued.id, .input = copy, .sent = true }) catch copy.deinit(self.gpa);
+            } else |_| {}
+            break :take queued.input;
+        };
+        self.events.push(self.io, .{ .queue_changed = session.id }) catch {};
+        return taken;
+    }
+
+    /// A steer block is the agent reading a sent input: it leaves the queue.
+    /// Matched by text, since a guest's replayed steer carries no id.
+    pub fn retireSentInput(self: *Daemon, session: *Session, text: []const u8) void {
+        session.steer_mutex.lockUncancelable(self.io);
+        defer session.steer_mutex.unlock(self.io);
+        for (session.steer_sent.items, 0..) |queued, i| if (std.mem.eql(u8, queued.input.text, text)) {
+            session.steer_sent.orderedRemove(i).input.deinit(self.gpa);
+            return;
+        };
     }
 
     /// After any change to a session's queue: every subscriber gets it whole.
@@ -7882,7 +7935,7 @@ pub const Daemon = struct {
     fn discardShutdownEvent(self: *Daemon, event: Event) void {
         switch (event) {
             .client_msg => |value| self.gpa.free(value.msg_line),
-            .client_gone, .turn_resumed, .turn_usage_credits, .turn_guest_pid, .turn_phase, .turn_detached, .shell_exited, .shell_settled, .shutdown => {},
+            .client_gone, .turn_resumed, .turn_usage_credits, .turn_guest_pid, .turn_phase, .turn_detached, .shell_exited, .shell_settled, .queue_changed, .shutdown => {},
             .cost_report_done => |value| self.gpa.free(value.line),
             .handover_snapshot, .handover_closed, .handover_deadline, .handover_command => {},
             .handover_built => |value| if (value.msg) |msg| self.gpa.free(msg),

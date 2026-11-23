@@ -7215,6 +7215,11 @@ test "the daemon's queue shows as Queued cards, and Up takes the newest back" {
     try std.testing.expectEqualStrings("already sent", app.notice.items);
     try std.testing.expectEqualStrings("", app.view.editor.text.items);
 
+    // Taken by the agent but not read yet: shown, but Up leaves it alone.
+    try Queue.set(&app, &.{.{ .id = 900, .input = .{ .text = "also check the docs" }, .sent = true }});
+    try std.testing.expect(!app.takeBackQueued());
+    try std.testing.expectEqualSlices(u64, &.{900}, Queue.ids(&app, &buf));
+
     // Delivered: the card becomes the message, and the emptied queue that
     // follows leaves the message alone.
     app.handleDaemonLine(try proto.encode(gpa, proto.DaemonMsg{ .blk = .{ .sid = 7, .b = .{
