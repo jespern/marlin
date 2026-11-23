@@ -992,6 +992,51 @@ test "agents reach other sessions: list, read, message (hop and turn limits), wa
     try std.testing.expectEqual(block_mod.ToolStatus.interrupted, (try Call.result(r, 10)).?.status);
     try std.testing.expectEqual(@as(usize, 0), r.daemon.agent_waits.items.len);
 
+    // A message to a session parked in wait_for_session ends its wait: it
+    // reads the message next instead of holding it (and everything else
+    // queued for it) until the other turn ends. Case: steward waited on
+    // chat while chat sent it message after message, and the user's tab
+    // could do nothing.
+    const Wake = struct {
+        /// The answers to requests `a` and `b` on client 1, from one drain.
+        fn results(rig: *ShellRig, a: u64, b: u64) ![2]?@FieldType(proto.DaemonMsg, "agent_tool_result") {
+            var out: [2]?@FieldType(proto.DaemonMsg, "agent_tool_result") = .{ null, null };
+            for (try rig.drain(1)) |msg| if (msg == .agent_tool_result) {
+                if (msg.agent_tool_result.request_id == a) out[0] = msg.agent_tool_result;
+                if (msg.agent_tool_result.request_id == b) out[1] = msg.agent_tool_result;
+            };
+            return out;
+        }
+    };
+    r.session.state = .running;
+    r.session.steer_accepting = true;
+    try Call.send(r, 7, 11, "wait_for_session", .{ .handle = handle });
+    try std.testing.expect(try Call.result(r, 11) == null);
+    try Call.send(r, 8, 12, "message_session", .{ .handle = caller_handle, .text = "Hold the release." });
+    const woken = try Wake.results(r, 11, 12);
+    try std.testing.expectEqual(block_mod.ToolStatus.ok, woken[1].?.status);
+    try std.testing.expectEqual(block_mod.ToolStatus.ok, woken[0].?.status);
+    try std.testing.expect(std.mem.startsWith(u8, woken[0].?.output, "Stopped waiting on "));
+    try std.testing.expect(std.mem.indexOf(u8, woken[0].?.output, handle[0..8]) != null);
+    try std.testing.expectEqual(@as(usize, 0), r.daemon.agent_waits.items.len);
+    // So does the user typing into it.
+    try Call.send(r, 7, 13, "wait_for_session", .{ .handle = handle });
+    try std.testing.expect(try Call.result(r, 13) == null);
+    try r.send(2, "{{\"input\":{{\"sid\":7,\"text\":\"what now?\",\"request_id\":31}}}}", .{});
+    const typed = (try Call.result(r, 13)).?;
+    try std.testing.expect(std.mem.indexOf(u8, typed.output, "the user sent you a message") != null);
+    try std.testing.expectEqual(@as(usize, 0), r.daemon.agent_waits.items.len);
+    // A message to some other session leaves the wait alone.
+    try Call.send(r, 7, 14, "wait_for_session", .{ .handle = handle });
+    try Call.send(r, 7, 15, "message_session", .{ .handle = handle, .text = "Still there?" });
+    const unrelated = try Wake.results(r, 14, 15);
+    try std.testing.expect(unrelated[0] == null);
+    try std.testing.expectEqual(block_mod.ToolStatus.ok, unrelated[1].?.status);
+    try std.testing.expectEqual(@as(usize, 1), r.daemon.agent_waits.items.len);
+    r.session.state = .idle;
+    try r.send(2, "{{\"interrupt\":{{\"sid\":7}}}}", .{});
+    _ = try Call.result(r, 14);
+
     // A human speaking starts the chain over.
     r.session.agent_hops = 3;
     r.session.state = .running;

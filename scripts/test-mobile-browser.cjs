@@ -564,6 +564,21 @@ async function main() {
       for(const n of [received,sent,document.querySelector('[data-call="mb1"]').closest('.tool-group')]) n.remove();
       return out;
     });
+    // Another session's queued message waits as one line (case: a few long
+    // ones pinned above the composer filled the phone); a tap shows it all.
+    const queuedMessage=await page.evaluate(()=>{
+      const long='Prefer one combined release. '.repeat(12).trim();
+      showQueue([{id:1,sent:true,input:{text:'[message]\n'+long,display_text:long,from:'chat · cbf5d5c5'}}]);
+      const card=document.querySelector('#queue .queued');
+      const folded=card.getBoundingClientRect().height;
+      card.click();
+      const opened=card.getBoundingClientRect().height;
+      const out={line:card.querySelector('.said-line').textContent.slice(0,40),arrow:getComputedStyle(card.querySelector('.arrow')).color,
+                 oneLine:folded<70,opens:opened>folded*2,cancellable:!!card.querySelector('.unqueue')};
+      showQueue([]);
+      return out;
+    });
+    assert.deepEqual(queuedMessage,{line:'← chat · cbf5d5c5 · Prefer one combined ',arrow:'rgb(139, 92, 246)',oneLine:true,opens:true,cancellable:false});
     assert.deepEqual(messages,{
       received:['← steward · 1a2b3c4d · Are you releasing?','rgb(139, 92, 246)'],
       whole:'Are you releasing?\nSoon?',

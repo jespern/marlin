@@ -3341,6 +3341,7 @@ pub const Daemon = struct {
                     session.startAgentChain(0);
                     self.sendTo(client, .{ .ok = .{ .request_id = inp.request_id } });
                     self.publishQueue(session);
+                    self.releaseWaitsForInput(session.id, "the user");
                     return;
                 }
                 session.startAgentChain(0);
@@ -6474,6 +6475,7 @@ pub const Daemon = struct {
                     got.value_ptr.* = if (got.found_existing) @max(got.value_ptr.*, hops) else hops;
                 }
                 self.publishQueue(session);
+                self.releaseWaitsForInput(target_sid, sender);
                 return .{ .text = try std.fmt.allocPrint(arena, "Delivered to {s} \"{s}\". It is busy and reads it between its steps. Call wait_for_session to get its answer.", .{ target.handle, target.title }) };
             }
             session.startAgentChain(hops);
@@ -6617,6 +6619,28 @@ pub const Daemon = struct {
             }
             _ = self.agent_waits.orderedRemove(i);
             self.finishAgentTool(w.reply, text, status);
+        }
+    }
+
+    /// Input reached session `sid` while it may be parked in wait_for_session:
+    /// end those waits, so it takes its next step and reads the input. Left
+    /// waiting, it held every message (often from the very session it waited
+    /// on) and everything the user typed until that other turn ended.
+    fn releaseWaitsForInput(self: *Daemon, sid: u64, who: []const u8) void {
+        var i: usize = 0;
+        while (i < self.agent_waits.items.len) {
+            const w = self.agent_waits.items[i];
+            if (w.caller != sid) {
+                i += 1;
+                continue;
+            }
+            _ = self.agent_waits.orderedRemove(i);
+            var buf: session_handle.Full = undefined;
+            const handle = session_handle.display(&buf, w.target, &.{});
+            var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+            defer arena_state.deinit();
+            const text = std.fmt.allocPrint(arena_state.allocator(), "Stopped waiting on {s}: {s} sent you a message, which you read next. {s} is still working; call wait_for_session again once you have dealt with the message.", .{ handle, who, handle }) catch "Stopped waiting: a message arrived for you, which you read next.";
+            self.finishAgentTool(w.reply, text, .ok);
         }
     }
 

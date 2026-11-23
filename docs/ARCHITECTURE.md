@@ -143,7 +143,9 @@ returns its last reply. Native turns reach them through `RunOpts.on_agent_tool`;
 guests through the same `cc_approve` bridge (`agent_tool` /
 `agent_tool_result`). They are never behind the approval gate. A chain of agent
 messages stops after 20 hops (a human message starts it over), two sessions
-may not wait on each other, and an interrupt releases a waiting caller. A
+may not wait on each other, and an interrupt releases a waiting caller. So
+does input reaching the caller (the user's, or another session's message):
+parked, it would hold that input until the other turn ended. A
 turn's hop count is that of what started it (`Session.agent_hops`); a message
 steered into a running turn is remembered per sender
 (`Session.agent_hops_from`), so only a message back to that sender continues

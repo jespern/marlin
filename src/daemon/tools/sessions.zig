@@ -58,7 +58,7 @@ pub const specs = [_]Spec{
     },
     .{
         .name = wait_name,
-        .description = "Wait until another Marlin session finishes its current turn, then return its last reply. Returns at once when it is idle. Use after message_session to get the answer.",
+        .description = "Wait until another Marlin session finishes its current turn, then return its last reply. Returns at once when it is idle, and early when a message for you arrives (from the user or another session), so you can read it. Use after message_session to get the answer.",
         .schema =
         \\{"type":"object","properties":{"handle":{"type":"string","description":"The session's handle (at least 4 characters of it)"}},"required":["handle"]}
         ,
