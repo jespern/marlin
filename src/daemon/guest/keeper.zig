@@ -25,6 +25,7 @@
 //! The keeper exits once the guest has ended and its output is journaled.
 //! It never deletes `dir`: the daemon that finishes the turn does.
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 
 pub const out_name = "out";
@@ -117,12 +118,24 @@ pub fn socketPath(buf: []u8, dir: []const u8) ![:0]const u8 {
     var folder_buf: [64]u8 = undefined;
     const folder = try std.fmt.bufPrintSentinel(&folder_buf, "/tmp/marlin-{d}", .{uid}, 0);
     if (std.c.mkdir(folder, 0o700) != 0 and std.c._errno().* != @backingInt(std.c.E.EXIST)) return error.SocketDirUnavailable;
-    var st: std.c.Stat = undefined;
-    if (std.c.fstatat(std.c.AT.FDCWD, folder, &st, std.c.AT.SYMLINK_NOFOLLOW) != 0) return error.SocketDirUnavailable;
+    const st = lstatOwnerMode(folder) orelse return error.SocketDirUnavailable;
     if ((st.mode & std.c.S.IFMT) != std.c.S.IFDIR or st.uid != uid or (st.mode & 0o077) != 0) return error.SocketDirUnsafe;
     const path = try std.fmt.bufPrintSentinel(buf, "{s}/k-{s}", .{ folder, std.fs.path.basename(dir) }, 0);
     if (path.len >= @typeInfo(@FieldType(std.c.sockaddr.un, "path")).array.len) return error.NameTooLong;
     return path;
+}
+
+/// Owner and mode of `path` itself, not of a symlink's target. Linux libc
+/// has statx where the BSDs have fstatat.
+fn lstatOwnerMode(path: [:0]const u8) ?struct { uid: std.c.uid_t, mode: u32 } {
+    if (builtin.os.tag == .linux) {
+        var stx: std.os.linux.Statx = undefined;
+        if (std.c.statx(std.c.AT.FDCWD, path, std.c.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true, .MODE = true, .UID = true }, &stx) != 0) return null;
+        return .{ .uid = stx.uid, .mode = stx.mode };
+    }
+    var st: std.c.Stat = undefined;
+    if (std.c.fstatat(std.c.AT.FDCWD, path, &st, std.c.AT.SYMLINK_NOFOLLOW) != 0) return null;
+    return .{ .uid = st.uid, .mode = st.mode };
 }
 
 fn listen(dir: []const u8) !std.posix.fd_t {
