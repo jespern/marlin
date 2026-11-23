@@ -94,6 +94,13 @@ fn read(alloc: std.mem.Allocator, io: Io, base: []const u8, name: []const u8, li
     return std.mem.trim(u8, bytes, " \t\r\n");
 }
 
+/// The repository `cwd` belongs to, named by its shared git directory: one
+/// key for every worktree of a clone. Null outside a repository.
+pub fn repositoryKey(alloc: std.mem.Allocator, io: Io, cwd: []const u8) ?[]const u8 {
+    const repo = discover(alloc, io, cwd) orelse return null;
+    return repo.common;
+}
+
 fn discover(alloc: std.mem.Allocator, io: Io, cwd: []const u8) ?Repository {
     var dir: []const u8 = Io.Dir.realPathFileAbsoluteAlloc(io, cwd, alloc) catch return null;
     while (true) {

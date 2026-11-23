@@ -1919,17 +1919,63 @@ pub const Store = struct {
         }
         try order.insert(self.gpa, at, id);
 
+        try self.writeTabOrder(order.items);
+        try self.execAll("COMMIT;");
+        committed = true;
+        return order.toOwnedSlice(self.gpa);
+    }
+
+    pub const RootTab = struct { id: u64, cwd: []const u8 };
+
+    /// Open roots in tab order with their working directories. Free with
+    /// freeRootTabs.
+    pub fn listRootTabs(self: Store) Error![]RootTab {
+        const stmt = try self.prepare(
+            \\SELECT id, cwd FROM sessions
+            \\WHERE parent_sid IS NULL AND kind='root' AND archived_at IS NULL
+            \\ORDER BY tab_order=0, tab_order, created_at, id
+        );
+        defer finalize(stmt);
+        var tabs: std.ArrayList(RootTab) = .empty;
+        errdefer self.freeRootTabs(tabs.items);
+        while (true) {
+            const rc = c.sqlite3_step(stmt);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return error.SqliteStep;
+            const cwd = try self.dupeCol(stmt, 1);
+            errdefer self.gpa.free(cwd);
+            try tabs.append(self.gpa, .{ .id = @bitCast(c.sqlite3_column_int64(stmt, 0)), .cwd = cwd });
+        }
+        return tabs.toOwnedSlice(self.gpa);
+    }
+
+    pub fn freeRootTabs(self: Store, tabs: []const RootTab) void {
+        for (tabs) |tab| self.gpa.free(tab.cwd);
+        self.gpa.free(tabs);
+    }
+
+    /// Give `ids` tab_order 1..N in that order (see moveRootTab).
+    pub fn setRootTabOrder(self: Store, ids: []const u64) Error!void {
+        const db_mutex = c.sqlite3_db_mutex(self.db);
+        c.sqlite3_mutex_enter(db_mutex);
+        defer c.sqlite3_mutex_leave(db_mutex);
+        try self.execAll("BEGIN IMMEDIATE;");
+        var committed = false;
+        defer if (!committed) self.execAll("ROLLBACK;") catch {};
+        try self.writeTabOrder(ids);
+        try self.execAll("COMMIT;");
+        committed = true;
+    }
+
+    fn writeTabOrder(self: Store, ids: []const u64) Error!void {
         const update = try self.prepare("UPDATE sessions SET tab_order=? WHERE id=?");
         defer finalize(update);
-        for (order.items, 1..) |row_id, rank| {
+        for (ids, 1..) |row_id, rank| {
             resetStatement(update);
             bindInt(update, 1, @intCast(rank));
             bindInt(update, 2, @bitCast(row_id));
             try stepDone(update);
         }
-        try self.execAll("COMMIT;");
-        committed = true;
-        return order.toOwnedSlice(self.gpa);
     }
 
     /// Fetch one catalog row without scanning the durable session table.

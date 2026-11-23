@@ -1203,7 +1203,7 @@ test "a changed MCP server is re-listed only once no turn is running" {
     try std.testing.expectEqual(@as(usize, 0), r.daemon.mcp_stale.items.len);
 }
 
-test "session_move stores the tab order and broadcasts every open root" {
+test "session_group and session_move store the tab order and broadcast every open root" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -1251,7 +1251,9 @@ test "session_move stores the tab order and broadcasts every open root" {
     defer daemon.clients.deinit(gpa);
     defer daemon.sessions.deinit(gpa);
     defer daemon.events.deinit();
-    for (1..4) |sid| try daemon.store.createSession(sid, @intCast(sid), "/", "m", .auto);
+    // Directories that do not exist group by their path.
+    for ([_][]const u8{ "/nowhere/a", "/nowhere/b", "/nowhere/a", "/nowhere/b" }, 1..) |cwd, sid|
+        try daemon.store.createSession(sid, @intCast(sid), cwd, "m", .auto);
     var mover = daemon_mod.Client{ .id = 1, .stream = stream, .outbox = .init(gpa), .said_hello = true };
     var watcher = daemon_mod.Client{
         .id = 2,
@@ -1271,19 +1273,23 @@ test "session_move stores the tab order and broadcasts every open root" {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const move = try proto.encode(gpa, proto.ClientMsg{ .session_move = .{ .sid = 3, .before_sid = 1 } });
-    try daemon.handleEvent(.{ .client_msg = .{ .client_id = mover.id, .msg_line = move } });
-
-    const reply = mover.outbox.tryPop(io).?;
-    defer gpa.free(reply.bytes);
-    try std.testing.expect(try proto.decode(proto.DaemonMsg, arena, try arena.dupe(u8, reply.bytes)) == .ok);
-    var ranks: [4]i64 = @splat(0);
-    while (watcher.outbox.tryPop(io)) |line| {
-        defer gpa.free(line.bytes);
-        const msg = try proto.decode(proto.DaemonMsg, arena, try arena.dupe(u8, line.bytes));
-        if (msg == .session_upsert) ranks[msg.session_upsert.session.sid] = msg.session_upsert.session.tab_order;
+    var ranks: [5]i64 = @splat(0);
+    for ([_]proto.ClientMsg{
+        .{ .session_group = .{} },
+        .{ .session_move = .{ .sid = 4, .before_sid = 1 } },
+    }, [_][4]i64{ .{ 1, 3, 2, 4 }, .{ 2, 4, 3, 1 } }) |request, expected| {
+        const line = try proto.encode(gpa, request);
+        try daemon.handleEvent(.{ .client_msg = .{ .client_id = mover.id, .msg_line = line } });
+        const reply = mover.outbox.tryPop(io).?;
+        defer gpa.free(reply.bytes);
+        try std.testing.expect(try proto.decode(proto.DaemonMsg, arena, try arena.dupe(u8, reply.bytes)) == .ok);
+        while (watcher.outbox.tryPop(io)) |update| {
+            defer gpa.free(update.bytes);
+            const msg = try proto.decode(proto.DaemonMsg, arena, try arena.dupe(u8, update.bytes));
+            if (msg == .session_upsert) ranks[msg.session_upsert.session.sid] = msg.session_upsert.session.tab_order;
+        }
+        try std.testing.expectEqualSlices(i64, &expected, ranks[1..]);
     }
-    try std.testing.expectEqualSlices(i64, &.{ 2, 3, 1 }, ranks[1..]);
 
     const child = try proto.encode(gpa, proto.ClientMsg{ .session_move = .{ .sid = 99 } });
     try daemon.handleEvent(.{ .client_msg = .{ .client_id = mover.id, .msg_line = child } });
@@ -1291,4 +1297,15 @@ test "session_move stores the tab order and broadcasts every open root" {
     defer gpa.free(refused.bytes);
     const err = try proto.decode(proto.DaemonMsg, arena, try arena.dupe(u8, refused.bytes));
     try std.testing.expectEqualStrings("no_session", err.err.code);
+}
+
+test "/group keeps each group where its first tab was and tabs in order within it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const order = try daemon_mod.groupedTabOrder(
+        arena.allocator(),
+        &.{ 1, 2, 3, 4, 5, 6 },
+        &.{ "robin", "marlin", "robin", "/tmp", "marlin", "robin" },
+    );
+    try std.testing.expectEqualSlices(u64, &.{ 1, 3, 6, 2, 5, 4 }, order);
 }

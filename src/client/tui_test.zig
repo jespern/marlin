@@ -7203,6 +7203,11 @@ test "the tab strip, Alt+N and /move follow tab_order, with unmoved tabs last by
     app.runCommand("/move 2 x");
     try std.testing.expectEqualStrings("usage: /move <pos|-1> [r|l]", app.notice.items);
     try std.testing.expectEqual(@as(usize, 0), output.written().len);
+
+    app.runCommand("/group");
+    const group = try proto.decode(proto.ClientMsg, frame.allocator(), std.mem.trimEnd(u8, output.written(), "\n"));
+    try std.testing.expect(group == .session_group);
+    try std.testing.expectEqualStrings("tabs grouped by project", app.notice.items);
 }
 
 test "returning to an idle cached tab keeps its layout and appends only what it missed" {

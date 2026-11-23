@@ -335,6 +335,11 @@ pub const ClientMsg = union(enum) {
     /// or last when null. Answered with ok; every open root's new
     /// tab_order goes out as session_upsert.
     session_move: struct { sid: u64, before_sid: ?u64 = null },
+    /// Put root tabs of the same project side by side: one group per git
+    /// repository (all its worktrees), else per working directory. Each
+    /// group takes the place of its leftmost tab; tabs keep their order
+    /// within it. Answered like session_move.
+    session_group: struct {},
     /// Change the working directory used by subsequent turns. Relative paths
     /// resolve against the session's current working directory.
     session_set_cwd: struct { sid: u64, cwd: []const u8 },

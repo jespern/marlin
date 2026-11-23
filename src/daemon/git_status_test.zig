@@ -103,3 +103,38 @@ test "git metadata covers absence, unborn, origin divergence, upstream names, wo
     try std.testing.expect(std.mem.startsWith(u8, result.branch(), "detached "));
     try std.testing.expect(result.counts == null);
 }
+
+test "a repository's worktrees and subdirectories share one group key" {
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = try temp_dir.Dir.initFromProcess(gpa, io, "marlin-repo-key");
+    defer tmp.deinit();
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put("PATH", if (std.c.getenv("PATH")) |p| std.mem.span(p) else "/usr/bin:/bin");
+    try env.put("HOME", tmp.path);
+    try env.put("GIT_CONFIG_NOSYSTEM", "1");
+    try env.put("GIT_CONFIG_GLOBAL", "/dev/null");
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const repo = try std.fs.path.join(arena, &.{ tmp.path, "marlin" });
+    const other = try std.fs.path.join(arena, &.{ tmp.path, "robin" });
+    const plain = try std.fs.path.join(arena, &.{ tmp.path, "plain" });
+    for ([_][]const u8{ repo, other, plain }) |dir| try std.Io.Dir.cwd().createDirPath(io, dir);
+    try git(io, repo, &env, &.{ "init", "--initial-branch=main" });
+    try git(io, repo, &env, &.{ "commit", "--allow-empty", "-m", "base" });
+    try git(io, other, &env, &.{ "init", "--initial-branch=main" });
+    const sub = try std.fs.path.join(arena, &.{ repo, "src" });
+    try std.Io.Dir.cwd().createDirPath(io, sub);
+    const linked = try std.fs.path.join(arena, &.{ tmp.path, "marlin-move" });
+    try git(io, repo, &env, &.{ "worktree", "add", "-b", "move", linked });
+
+    const key = git_status.repositoryKey(arena, io, repo).?;
+    try std.testing.expectEqualStrings(key, git_status.repositoryKey(arena, io, sub).?);
+    try std.testing.expectEqualStrings(key, git_status.repositoryKey(arena, io, linked).?);
+    try std.testing.expect(!std.mem.eql(u8, key, git_status.repositoryKey(arena, io, other).?));
+    try std.testing.expect(git_status.repositoryKey(arena, io, plain) == null);
+}

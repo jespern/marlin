@@ -2689,12 +2689,30 @@ pub const Daemon = struct {
                 };
                 defer self.gpa.free(order);
                 self.sendTo(client, .{ .ok = .{} });
-                for (order) |sid| {
-                    const row = self.store.getSessionListing(sid) catch continue;
-                    defer row.deinit(self.gpa);
-                    self.fanOutSessionUpsertRow(row);
+                self.broadcastTabOrder(order);
+            },
+            .session_group => {
+                var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+                defer arena_state.deinit();
+                const arena = arena_state.allocator();
+                const tabs = self.store.listRootTabs() catch {
+                    self.sendTo(client, .{ .err = .{ .code = "store", .msg = "could not group tabs" } });
+                    return;
+                };
+                defer self.store.freeRootTabs(tabs);
+                const sids = try arena.alloc(u64, tabs.len);
+                const keys = try arena.alloc([]const u8, tabs.len);
+                for (tabs, sids, keys) |tab, *id, *key| {
+                    id.* = tab.id;
+                    key.* = git_status.repositoryKey(arena, self.io, tab.cwd) orelse tab.cwd;
                 }
-                self.broadcastLegacySessionList();
+                const order = try groupedTabOrder(arena, sids, keys);
+                self.store.setRootTabOrder(order) catch {
+                    self.sendTo(client, .{ .err = .{ .code = "store", .msg = "could not group tabs" } });
+                    return;
+                };
+                self.sendTo(client, .{ .ok = .{} });
+                self.broadcastTabOrder(order);
             },
             .session_set_cwd => |sc| {
                 const session = (try self.getOrLoadSession(sc.sid)) orelse {
@@ -6768,6 +6786,16 @@ pub const Daemon = struct {
         self.fanOutSessionDelta(line);
     }
 
+    /// Every open root after a reorder, so clients re-sort the strip.
+    fn broadcastTabOrder(self: *Daemon, order: []const u64) void {
+        for (order) |sid| {
+            const row = self.store.getSessionListing(sid) catch continue;
+            defer row.deinit(self.gpa);
+            self.fanOutSessionUpsertRow(row);
+        }
+        self.broadcastLegacySessionList();
+    }
+
     fn broadcastSessionUpsert(self: *Daemon, sid: u64) void {
         const row = self.store.getSessionListing(sid) catch {
             self.broadcastLegacySessionList();
@@ -8357,6 +8385,25 @@ fn resolveSessionCwd(
 }
 
 pub const TitleState = enum { none, auto, user };
+
+/// /group: tabs of one group side by side. Groups come in the order of
+/// their first tab; tabs keep their order within a group.
+pub fn groupedTabOrder(arena: std.mem.Allocator, sids: []const u64, keys: []const []const u8) ![]u64 {
+    const order = try arena.alloc(u64, sids.len);
+    const placed = try arena.alloc(bool, sids.len);
+    @memset(placed, false);
+    var next: usize = 0;
+    for (keys, 0..) |key, first| {
+        if (placed[first]) continue;
+        for (keys[first..], first..) |other, i| {
+            if (placed[i] or !std.mem.eql(u8, key, other)) continue;
+            placed[i] = true;
+            order[next] = sids[i];
+            next += 1;
+        }
+    }
+    return order;
+}
 
 pub fn turnTitle(kind: proto.SessionKind, state: TitleState, prompt: []const u8) ?[]const u8 {
     if (kind != .root or state == .user) return null;
