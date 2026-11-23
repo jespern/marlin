@@ -812,7 +812,8 @@ test "a remote client's voice is set up and transcribed on the daemon's machine"
     try std.testing.expect(!(try Wait.reply(r, .voice_status_result)).enabled);
 
     try r.send(1, "{{\"voice_setup\":{{\"engine\":\"parakeet\",\"mode\":\"toggle\"}}}}", .{});
-    try std.testing.expect((try Wait.reply(r, .voice_setup_result)).ok);
+    // The refusal itself on failure, not just `false` (CI-only on Linux).
+    try std.testing.expectEqualStrings("", (try Wait.reply(r, .voice_setup_result)).msg);
     try r.send(1, "{{\"voice_status\":{{}}}}", .{});
     const status = try Wait.reply(r, .voice_status_result);
     try std.testing.expect(status.enabled);
