@@ -144,6 +144,7 @@ test {
     _ = @import("daemon/tools/task_test.zig");
     _ = @import("daemon/provider/codex_test.zig");
     _ = @import("daemon/provider/muse_test.zig");
+    _ = @import("daemon/provider/agy_test.zig");
     _ = @import("core/visual_effect_test.zig");
     _ = @import("client/attach_test.zig");
     _ = @import("client/session_file_test.zig");

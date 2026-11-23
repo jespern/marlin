@@ -78,6 +78,7 @@ const claude_code = @import("provider/claude_code.zig");
 const cost_report = @import("cost_report.zig");
 const codex = @import("provider/codex.zig");
 const muse = @import("provider/muse.zig");
+const agy = @import("provider/agy.zig");
 const guest_models = @import("guest_models.zig");
 const http = @import("provider/http.zig");
 const process_io = @import("process_io.zig");
@@ -3575,6 +3576,9 @@ pub const Daemon = struct {
                         .claude_code => self.claudeCodeAuthenticated(),
                         .codex => self.codexAuthenticated(),
                         .muse => self.museAuthenticated(),
+                        // agy has no status command and keeps its sign-in in
+                        // the keychain; a turn without one says so itself.
+                        .agy => self.agyAvailable(),
                     };
                     if (!available) {
                         self.sendTo(client, .{ .err = .{
@@ -6734,6 +6738,13 @@ pub const Daemon = struct {
             // `default` keeps the model the user's Muse settings choose.
             local_list.append(arena, "muse/default") catch return;
         }
+        if (self.agyAvailable()) {
+            // `default` keeps Antigravity's configured model; the concrete
+            // ones are those its last session offered (agy keeps no list on
+            // disk, and asking it means starting a conversation).
+            local_list.append(arena, "agy/default") catch return;
+            self.appendAgyIds(arena, &local_list) catch return;
+        }
         if (self.codexAvailable()) {
             // `default` delegates model selection to the user's Codex config;
             // concrete ids come from Codex's own model cache and the
@@ -6838,6 +6849,16 @@ pub const Daemon = struct {
     /// override, or `claude` executable somewhere on the daemon's PATH.
     fn claudeCodeAvailable(self: *Daemon) bool {
         return self.guestBinaryAvailable(claude_code.binary_env, claude_code.default_binary);
+    }
+
+    fn agyAvailable(self: *Daemon) bool {
+        return self.guestBinaryAvailable(agy.binary_env, agy.default_binary);
+    }
+
+    fn appendAgyIds(self: *Daemon, arena: std.mem.Allocator, list: *std.ArrayList([]const u8)) !void {
+        const saved = (self.store.kvGetText(agy.models_key) catch null) orelse return;
+        defer self.gpa.free(saved);
+        try agy.appendModelIds(arena, list, saved);
     }
 
     fn museAvailable(self: *Daemon) bool {

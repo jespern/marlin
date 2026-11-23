@@ -42,6 +42,7 @@ pub const Backend = enum {
     claude_code,
     codex,
     muse,
+    agy,
 };
 
 /// Call only on vendor error fields/stderr, never ordinary assistant prose.
@@ -68,6 +69,7 @@ pub fn loginRequiredNote(which: Backend) []const u8 {
         .claude_code => "Claude login required: authentication expired or was rejected. Run `claude auth login` on the daemon host, then retry this session. Your transcript is saved.",
         .codex => "Codex login required: authentication expired or was rejected. Run `codex login` on the daemon host, then retry this session. Your transcript is saved.",
         .muse => "Muse login required: authentication expired or was rejected. Run `muse login` on the daemon host, then retry this session. Your transcript is saved.",
+        .agy => "Antigravity login required: authentication expired or was rejected. Run `agy` on the daemon host and sign in, then retry this session. Your transcript is saved.",
     };
 }
 
@@ -75,6 +77,7 @@ pub fn loginRequiredBackend(text: []const u8) ?Backend {
     if (std.mem.startsWith(u8, text, "Claude login required:")) return .claude_code;
     if (std.mem.startsWith(u8, text, "Codex login required:")) return .codex;
     if (std.mem.startsWith(u8, text, "Muse login required:")) return .muse;
+    if (std.mem.startsWith(u8, text, "Antigravity login required:")) return .agy;
     return null;
 }
 
@@ -82,6 +85,7 @@ pub fn backend(model: []const u8) ?Backend {
     if (std.mem.startsWith(u8, model, "claudecode/")) return .claude_code;
     if (std.mem.startsWith(u8, model, "codex/")) return .codex;
     if (std.mem.startsWith(u8, model, "muse/")) return .muse;
+    if (std.mem.startsWith(u8, model, "agy/")) return .agy;
     return null;
 }
 

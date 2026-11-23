@@ -93,6 +93,18 @@ pub fn resolve(
         };
     }
 
+    if (std.mem.eql(u8, provider_name, "agy")) {
+        // No wire endpoint or API key: `agy acp` runs under the user's own
+        // Google sign-in. "agy/default" keeps Antigravity's configured model.
+        return .{
+            .url = std.fmt.allocPrintSentinel(gpa, "", .{}, 0) catch return error.OutOfMemory,
+            .bearer = null,
+            .model = try gpa.dupe(u8, model),
+            .provider_name = try gpa.dupe(u8, "google"),
+            .backend = .{ .guest = .agy },
+        };
+    }
+
     const configured = findConfigured(cfg, provider_name);
 
     if (std.mem.eql(u8, provider_name, "openrouter"))

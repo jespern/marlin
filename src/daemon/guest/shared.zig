@@ -54,11 +54,13 @@ pub fn spawnErrorNote(gpa: Allocator, io: Io, cwd: []const u8, err: std.process.
         .claude_code => "claude binary not found — install Claude Code (or set MARLIN_CLAUDE_CODE_BIN)",
         .codex => "codex binary not found — install Codex (or set MARLIN_CODEX_BIN)",
         .muse => "muse binary not found — install Muse Code (or set MARLIN_MUSE_BIN)",
+        .agy => "agy binary not found — install the Antigravity CLI (or set MARLIN_AGY_BIN)",
     });
     return std.fmt.allocPrint(gpa, "failed to spawn {s}: {t}", .{ switch (backend) {
         .claude_code => "claude",
         .codex => "codex app-server",
         .muse => "muse serve",
+        .agy => "agy acp",
     }, err });
 }
 

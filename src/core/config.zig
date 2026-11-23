@@ -434,7 +434,7 @@ pub fn setProviderSetup(
     if (provider_name.len > 0) {
         try validateToolName(provider_name);
         if (std.mem.eql(u8, provider_name, "claudecode") or std.mem.eql(u8, provider_name, "codex") or
-            std.mem.eql(u8, provider_name, "muse"))
+            std.mem.eql(u8, provider_name, "muse") or std.mem.eql(u8, provider_name, "agy"))
             return error.ReservedProviderName;
         if (base_url.len > 0 and
             !(std.mem.startsWith(u8, base_url, "http://") or std.mem.startsWith(u8, base_url, "https://")))
@@ -889,7 +889,7 @@ pub fn validate(gpa: std.mem.Allocator, cfg: Config) !void {
     for (cfg.providers, 0..) |provider, i| {
         try validateToolName(provider.name);
         if (std.mem.eql(u8, provider.name, "claudecode") or std.mem.eql(u8, provider.name, "codex") or
-            std.mem.eql(u8, provider.name, "muse"))
+            std.mem.eql(u8, provider.name, "muse") or std.mem.eql(u8, provider.name, "agy"))
             return error.ReservedProviderName;
         for (cfg.providers[0..i]) |previous| {
             if (std.mem.eql(u8, previous.name, provider.name)) return error.DuplicateProvider;

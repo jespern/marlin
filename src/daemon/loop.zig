@@ -582,6 +582,7 @@ pub fn runTurn(
             .claude_code => claude_code_turn.compactClaudeCode(gpa, io, store, opts, &ap, instructions),
             .codex => runCodexTurn(gpa, io, store, opts, &ap, ""),
             .muse => runMuseTurn(gpa, io, store, opts, &ap, ""),
+            .agy => runAgyTurn(gpa, io, store, opts, &ap, ""),
         };
         // A kept guest a previous daemon started: its prompt is persisted
         // and sent; only its journal remains to follow.
@@ -589,6 +590,7 @@ pub fn runTurn(
             .claude_code => runClaudeCodeTurn(gpa, io, store, opts, &ap, "", false),
             .codex => runCodexTurn(gpa, io, store, opts, &ap, ""),
             .muse => error.GuestAttachUnsupported,
+            .agy => runAgyTurn(gpa, io, store, opts, &ap, ""),
         };
         const fresh = ap.seq == 0;
         const user_block_id = try ap.append(.{ .user_msg = .{
@@ -611,6 +613,7 @@ pub fn runTurn(
             .claude_code => runClaudeCodeTurn(gpa, io, store, opts, &ap, delegated_prompt orelse user_text, fresh),
             .codex => runCodexTurn(gpa, io, store, opts, &ap, delegated_prompt orelse user_text),
             .muse => runMuseTurn(gpa, io, store, opts, &ap, delegated_prompt orelse user_text),
+            .agy => runAgyTurn(gpa, io, store, opts, &ap, delegated_prompt orelse user_text),
         };
     }
 
@@ -1450,6 +1453,8 @@ const runClaudeCodeTurn = claude_code_turn.runClaudeCodeTurn;
 const runCodexTurn = codex_turn.runCodexTurn;
 pub const muse_turn = @import("guest/muse_turn.zig");
 const runMuseTurn = muse_turn.runMuseTurn;
+pub const agy_turn = @import("guest/agy_turn.zig");
+const runAgyTurn = agy_turn.runAgyTurn;
 
 /// Summaries are bounded prose, not agent output; a fixed budget keeps the
 /// anthropic max_tokens requirement independent of the session's headroom.
@@ -1600,6 +1605,7 @@ pub fn writeHandover(
         .claude_code => "Claude Code",
         .codex => "Codex guest",
         .muse => "Muse Code",
+        .agy => "Antigravity",
     };
     const announce = try std.fmt.allocPrint(
         arena,

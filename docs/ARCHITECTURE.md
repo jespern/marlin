@@ -55,7 +55,7 @@ run that agent. Some sessions host someone else's.
 `task`/`task_batch`, `plan_update`, L0/L1/L2. The TUI is a client of this
 loop. This is the product.
 
-**Guest** (`claudecode/`, `codex/`, `muse/`): an official vendor agent owns
+**Guest** (`claudecode/`, `codex/`, `muse/`, `agy/`): an official vendor agent owns
 the turn. Claude Code runs through `claude -p`; Codex runs through the stable
 `codex app-server` JSONL protocol and uses the account already established by
 `codex login` (including ChatGPT subscription login). Muse Code runs through
@@ -65,7 +65,17 @@ and Muse starts a turn of its own to report them), so a Marlin turn lasts until
 the Muse session is idle with no background work; the status line shows the
 `muse serve` pid meanwhile. Muse's own approvals and questions use Marlin's
 approval bar and picker (`:ask-me` profile; `:unrestricted` under full access,
-`:read-only` for read-only children). Marlin's job is the
+`:read-only` for read-only children). Antigravity (Gemini 4 Neon and the
+other models of its sign-in) runs through `agy acp`, the Agent Client
+Protocol (newline JSON-RPC 2.0 on stdio): one process per turn, its session
+resumed by id (`sessions.agy_session_id`), Marlin's instructions appended
+through agy's `_meta.antigravity.systemPrompt.append`, model and thinking
+level set with `session/set_config_option`, and agy held in its `default`
+mode so every permission request reaches Marlin's approval bar. Marlin's own
+tools (`ask_user`, `show_image`, the session tools) reach it as an MCP server
+(`cc_approve --no-approve`). ACP cannot steer a running prompt, so steering
+queues as the next prompt; agy's model list is cached from its last session
+(`kv agy_models`). Marlin's job is the
 multiplexer: persist structured events as blocks, attach, interrupt, resume
 the vendor thread, copy, and park *their* permission prompts on *our* approval
 bar. Marlin tools, Seatbelt, network screening, MCP-as-agent-tools,
@@ -75,8 +85,9 @@ subprocess.**
 Guest authentication errors are terminal and actionable: Claude result errors,
 explicit authentication envelopes, and stderr failures, plus Codex RPC and stream
 errors (including HTTP 401), produce a durable login-required note and an error
-status. The TUI shows `LOGIN REQUIRED`; the note names `claude auth login` or
-`codex login` and specifies the daemon host. These failures bypass automatic
+status. The TUI shows `LOGIN REQUIRED`; the note names `claude auth login`,
+`codex login`, or (for ACP's "authentication required" from agy) signing in
+through `agy`, and specifies the daemon host. These failures bypass automatic
 continuation and Claude's session-identity retry. Detection uses vendor failure
 signals, not local credential-file presence or assistant prose. It does not poll
 credentials or predict expiry while a session is idle.
@@ -507,7 +518,7 @@ as running an older build against a newer store.
 
 #### Kept guest turns
 
-A Claude Code or Codex turn is not paused by a handover: its guest runs on
+A Claude Code, Codex or Antigravity turn is not paused by a handover: its guest runs on
 and the successor follows it. Each invocation runs under a keeper
 (`marlin _keep`, `src/daemon/guest/keeper.zig`): a small process in a
 session of its own that starts the guest and journals its stdout, stderr and
@@ -523,7 +534,7 @@ guest running. Any daemon that starts (the successor, or the predecessor
 after a failed start) follows every handed-over turn: it replays the journal
 from the start through the same decoding, persisting, announcing and writing
 nothing, up to the recorded offset, then carries on live. Codex's follow-up
-turns are inferred from the journal going on. Bridged calls from the guest
+turns and agy's follow-up prompts are inferred from the journal going on. Bridged calls from the guest
 (`wait_for_session`, `ask_user`, permission prompts) are asked again of the
 successor when the predecessor drops or refuses them (`cc_approve.zig`).
 

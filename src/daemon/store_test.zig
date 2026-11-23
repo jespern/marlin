@@ -597,15 +597,15 @@ test "gc removes orphans and explicitly demotes old idle blob bodies" {
     try std.testing.expectEqualStrings("referenced old output", fresh);
 }
 
-test "schema is v20 with performance telemetry and scaling indexes" {
+test "schema is v21 with performance telemetry and scaling indexes" {
     const gpa = std.testing.allocator;
     var store = try Store.open(gpa, null);
     defer store.close();
 
-    try std.testing.expectEqual(@as(i64, 20), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 21), try store.kvGetInt("schema_version"));
     // migrate() must be a no-op on a current DB (idempotent open).
     try store.migrate();
-    try std.testing.expectEqual(@as(i64, 20), try store.kvGetInt("schema_version"));
+    try std.testing.expectEqual(@as(i64, 21), try store.kvGetInt("schema_version"));
     try store.createSession(42, 1, "/tmp", "m", .auto);
     // v20: a guest's autocompact threshold, null (configured default) until set.
     try std.testing.expectEqual(@as(?u64, null), try store.getSessionGuestAutocompact(42));
@@ -622,6 +622,19 @@ test "schema is v20 with performance telemetry and scaling indexes" {
     const codex_thread_id = (try store.getCodexThreadId(42)).?;
     defer gpa.free(codex_thread_id);
     try std.testing.expectEqualStrings("thread_test", codex_thread_id);
+    // v21: the Antigravity conversation a session continues.
+    try std.testing.expect((try store.getAgySessionId(42)) == null);
+    try store.setAgySessionId(42, "agy-session");
+    const agy_session_id = (try store.getAgySessionId(42)).?;
+    defer gpa.free(agy_session_id);
+    try std.testing.expectEqualStrings("agy-session", agy_session_id);
+    try store.setAgySessionId(42, null);
+    try std.testing.expect((try store.getAgySessionId(42)) == null);
+    try std.testing.expect((try store.kvGetText("agy_models")) == null);
+    try store.kvSetText("agy_models", "gemini-4-neon");
+    const models = (try store.kvGetText("agy_models")).?;
+    defer gpa.free(models);
+    try std.testing.expectEqualStrings("gemini-4-neon", models);
     const stmt = try store.prepare("SELECT count(*) FROM sqlite_master WHERE type='index' AND name='blocks_by_session'");
     defer finalize(stmt);
     try std.testing.expectEqual(@as(c_int, c.SQLITE_ROW), c.sqlite3_step(stmt));
@@ -1007,6 +1020,7 @@ test "v13 session runtime migration preserves defaults and independent overrides
         "ALTER TABLE sessions DROP COLUMN guest_context_limit",
         "ALTER TABLE sessions DROP COLUMN draft",
         "ALTER TABLE sessions DROP COLUMN guest_autocompact_tokens",
+        "ALTER TABLE sessions DROP COLUMN agy_session_id",
         "UPDATE kv SET value='13' WHERE key='schema_version'",
     }) |sql| {
         const stmt = try store.prepare(sql);
@@ -1041,6 +1055,7 @@ test "v14 migration preserves paused grants and later revocation overrides old c
         "ALTER TABLE sessions DROP COLUMN guest_context_limit",
         "ALTER TABLE sessions DROP COLUMN draft",
         "ALTER TABLE sessions DROP COLUMN guest_autocompact_tokens",
+        "ALTER TABLE sessions DROP COLUMN agy_session_id",
         "UPDATE kv SET value='14' WHERE key='schema_version'",
     }) |sql| {
         const stmt = try store.prepare(sql);

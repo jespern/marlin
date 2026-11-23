@@ -64,7 +64,8 @@ const schema_sql =
     \\  context_used INTEGER,
     \\  guest_context_limit INTEGER,
     \\  draft TEXT NOT NULL DEFAULT '',
-    \\  guest_autocompact_tokens INTEGER
+    \\  guest_autocompact_tokens INTEGER,
+    \\  agy_session_id TEXT
     \\);
     \\CREATE TABLE IF NOT EXISTS live_shells(
     \\  session_id INTEGER PRIMARY KEY,
@@ -205,7 +206,7 @@ const schema_sql =
     \\  kind TEXT NOT NULL,
     \\  detail TEXT NOT NULL DEFAULT '{}'
     \\);
-    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','20');
+    \\INSERT OR IGNORE INTO kv(key,value) VALUES('schema_version','21');
 ;
 
 pub const SessionRow = struct {
@@ -545,6 +546,12 @@ pub const Store = struct {
                 \\UPDATE kv SET value='20' WHERE key='schema_version';
             );
         }
+        if (ver < 21) {
+            try self.execAll(
+                \\ALTER TABLE sessions ADD COLUMN agy_session_id TEXT;
+                \\UPDATE kv SET value='21' WHERE key='schema_version';
+            );
+        }
     }
 
     fn initializeSearch(self: *Store) Error!void {
@@ -642,6 +649,27 @@ pub const Store = struct {
         defer finalize(stmt);
         bindText(stmt, 1, key);
         bindText(stmt, 2, value_text);
+        try stepDone(stmt);
+    }
+
+    /// Caller owns the returned text; null when the key is unset.
+    pub fn kvGetText(self: Store, key: []const u8) Error!?[]const u8 {
+        const stmt = try self.prepare("SELECT value FROM kv WHERE key=?");
+        defer finalize(stmt);
+        bindText(stmt, 1, key);
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) return null;
+        if (rc != c.SQLITE_ROW) return error.SqliteStep;
+        return try self.dupeCol(stmt, 0);
+    }
+
+    pub fn kvSetText(self: Store, key: []const u8, value: []const u8) Error!void {
+        const stmt = try self.prepare(
+            "INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        );
+        defer finalize(stmt);
+        bindText(stmt, 1, key);
+        bindText(stmt, 2, value);
         try stepDone(stmt);
     }
 
@@ -1727,6 +1755,28 @@ pub const Store = struct {
     /// Caller owns the returned id.
     pub fn getMuseSessionId(self: Store, id: u64) Error!?[]const u8 {
         const stmt = try self.prepare("SELECT muse_session_id FROM sessions WHERE id=?");
+        defer finalize(stmt);
+        bindInt(stmt, 1, @bitCast(id));
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) return error.NotFound;
+        if (rc != c.SQLITE_ROW) return error.SqliteStep;
+        if (c.sqlite3_column_type(stmt, 0) == c.SQLITE_NULL) return null;
+        return try self.dupeCol(stmt, 0);
+    }
+
+    /// The Antigravity (agy) conversation a Marlin session continues; null
+    /// to start one.
+    pub fn setAgySessionId(self: Store, id: u64, agy_id: ?[]const u8) Error!void {
+        const stmt = try self.prepare("UPDATE sessions SET agy_session_id=? WHERE id=?");
+        defer finalize(stmt);
+        if (agy_id) |value| bindText(stmt, 1, value) else bindNull(stmt, 1);
+        bindInt(stmt, 2, @bitCast(id));
+        try stepDone(stmt);
+    }
+
+    /// Caller owns the returned id.
+    pub fn getAgySessionId(self: Store, id: u64) Error!?[]const u8 {
+        const stmt = try self.prepare("SELECT agy_session_id FROM sessions WHERE id=?");
         defer finalize(stmt);
         bindInt(stmt, 1, @bitCast(id));
         const rc = c.sqlite3_step(stmt);

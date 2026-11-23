@@ -59,7 +59,7 @@ policy that failed open. Both default false when decoding an older daemon.
 | session_watch | incremental? | initial session_list_result, then structural catalog updates; incremental clients receive session_upsert/session_remove, legacy clients receive refreshed snapshots |
 | session_kill | sid | ok (sets the turn's cancel flag, denies pending approval) |
 | session_archive | sid, archived? | ok; archives/restores the session and descendants, err{busy} if archiving active work |
-| session_set_model | sid, model | ok, or err{busy} mid-turn. Native→guest (`claudecode/` or `codex/`) starts a native handover turn. Guest→other guest does the same after the daemon puts a native author on the session (the configured default, else the first native favorite); err{guest_switch} only when nothing native is configured. |
+| session_set_model | sid, model | ok, or err{busy} mid-turn. Native→guest (`claudecode/`, `codex/`, `muse/` or `agy/`) starts a native handover turn. Guest→other guest does the same after the daemon puts a native author on the session (the configured default, else the first native favorite); err{guest_switch} only when nothing native is configured. |
 | session_set_effort | sid, effort | ok, or err{busy} mid-turn |
 | session_complete_cwd | sid, typed, request_id | session_cwd_completions{sid, cwd, typed, request_id, matches}; directory arguments resolved on the daemon host, including its HOME; replies are requested only |
 | session_set_cwd | sid, cwd | ok, or err{busy} mid-turn / err{bad_cwd}; relative paths resolve against the current session cwd, and the canonical existing directory is persisted and broadcast as session_upsert |
@@ -115,11 +115,14 @@ policy that failed open. Both default false when decoding an older daemon.
 default. Explicit values are `"none"`, `"minimal"`, `"low"`, `"medium"`,
 `"high"`, `"xhigh"`, and `"max"`; support is model-dependent. Claude Code
 maps the value to `claude -p --effort` (with `none`/`minimal` becoming `low`).
-Codex sends it as the app-server turn effort. `auto` omits the guest override.
+Codex sends it as the app-server turn effort. Antigravity sets it as agy's
+thinking level when the model offers one (`none`/`minimal` becoming `low`,
+`max` becoming `xhigh`). `auto` omits the guest override.
 
 Guest vs native is a session regime (ARCHITECTURE.md), not a `SessionKind`.
 `kind` remains hierarchy (`root`, `task_child`, `review_child`). The guest
-adapters persist Claude Code stream-json or Codex app-server items as ordinary
+adapters persist Claude Code stream-json, Codex app-server items, or ACP
+session updates from agy as ordinary
 blocks. Guest approvals are multiplexer UX, not Marlin tool dispatch.
 
 `sub.from_seq`: 0 = live-only. N ≥ 1 = replay stored blocks with seq ≥ N
