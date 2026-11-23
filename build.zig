@@ -196,7 +196,7 @@ pub fn build(b: *std.Build) void {
     // explicit -Doptimize=fast. Unit tests keep their own Debug
     // module below for safety checks and fast compile iteration.
     const optimize = b.option(std.lang.Optimize, "optimize", "Prioritize performance, safety, or binary size") orelse .fast;
-    const version = b.option([]const u8, "version", "Marlin version embedded in the binary") orelse "0.0.0-dev";
+    const release_version = b.option([]const u8, "version", "Marlin version embedded in the binary");
     // Release binaries carry no debug info: it held build-cache paths whose hashes depend
     // on the build machine's CPU (a dependency builds a code generator for the host), so
     // two builds of the same tag on different x86 runners differed in those paths alone.
@@ -264,9 +264,8 @@ pub fn build(b: *std.Build) void {
     // unrolls Ghostty's comptime sprite tables into ~85 KB more code.
     const ghostty_font = ghosttyFont(b, ghostty, target, if (optimize == .debug) .debug else .small);
     configureScreenshot(exe.root_module, target, ghostty_font);
-    const build_options = b.addOptions();
-    build_options.addOption([]const u8, "version", version);
-    exe.root_module.addOptions("build_options", build_options);
+    const build_options = buildOptions(b, release_version);
+    exe.root_module.addImport("build_options", build_options);
     if (strip) dropUnwindTables(b, exe.root_module);
     b.installArtifact(exe);
 
@@ -319,7 +318,7 @@ pub fn build(b: *std.Build) void {
     }) |sample| {
         test_module.addAnonymousImport(sample[0], .{ .root_source_file = ghostty.path(sample[1]) });
     }
-    test_module.addOptions("build_options", build_options);
+    test_module.addImport("build_options", build_options);
     const exe_tests = b.addTest(.{ .root_module = test_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
     const test_step = b.step("test", "Run unit + fixture tests");
@@ -401,4 +400,26 @@ pub fn build(b: *std.Build) void {
     smoke_cmd.has_side_effects = true;
     const smoke_step = b.step("smoke", "Live smoke tests against OpenRouter (costs ~$0.01)");
     smoke_step.dependOn(&smoke_cmd.step);
+}
+
+/// `build_options.version` is -Dversion for releases. Any other build names
+/// its commit, so two machines (or a client and its --remote daemon) can tell
+/// whether they run the same code: 0.0.0-dev+<commit>, -dirty when tracked
+/// files differ from it. git runs on every build rather than when build.zig
+/// is configured, so the stamp follows commits and edits; marlin recompiles
+/// only when the stamp changes. Outside a git checkout it stays 0.0.0-dev.
+fn buildOptions(b: *std.Build, release_version: ?[]const u8) *std.Build.Module {
+    const options = b.addOptions();
+    options.addOption([]const u8, "release_version", release_version orelse "");
+    const module = b.createModule(.{ .root_source_file = b.path("src/build_options.zig") });
+    module.addOptions("release", options);
+    const in_checkout = if (b.root.access(b.graph.io, ".git", .{})) true else |_| false;
+    const commit = if (release_version == null and in_checkout) commit: {
+        const git = b.addSystemCommand(&.{ "git", "describe", "--always", "--dirty", "--abbrev=7", "--exclude=*" });
+        git.setCwd(b.path("."));
+        git.has_side_effects = true;
+        break :commit git.captureStdOut(.{});
+    } else b.addWriteFiles().add("commit", "");
+    module.addAnonymousImport("commit", .{ .root_source_file = commit });
+    return module;
 }

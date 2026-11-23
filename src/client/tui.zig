@@ -1042,6 +1042,25 @@ pub const App = struct {
         self.welcome_dnsblock_rules = if (self.conn.network_filtering) self.conn.network_rule_count else 0;
     }
 
+    /// Sets build_mismatch, and names the mismatch in the notice, from the
+    /// daemon's hello against this client. Runs on attach and on every
+    /// reconnect, so a daemon restarted onto this build clears the warning.
+    pub fn checkDaemonBuild(self: *App, own_exe_mtime_ms: ?i64) void {
+        const daemon_version = self.conn.daemonVersion();
+        const mismatch = buildMismatch(daemon_version, build_options.version, self.conn.daemon_exe_mtime_ms, own_exe_mtime_ms);
+        self.build_mismatch = mismatch != .none;
+        switch (mismatch) {
+            .none => {},
+            .version => if (self.remote_transport) {
+                const host = self.conn.hostname();
+                self.setNotice("{s} runs marlin {s} but this client is {s}", .{ if (host.len > 0) host else "the remote", daemon_version, build_options.version });
+            } else {
+                self.setNotice("daemon is {s} but this client is {s} — /reboot to sync", .{ daemon_version, build_options.version });
+            },
+            .binary => self.setNotice("daemon runs a different build than this client — /reboot to sync", .{}),
+        }
+    }
+
     pub fn setModelStr(self: *App, m: []const u8) void {
         self.view.model.clearRetainingCapacity();
         self.view.model.appendSlice(self.gpa, m) catch {};
@@ -6058,7 +6077,21 @@ fn adoptReconnectedConn(app: *App, loop: *vaxis.Loop(Event), rt: *std.Thread, ne
         app.handover_token_len = 0;
         app.setNotice("Marlin restarted · v{s}", .{new_conn.daemonVersion()});
     }
+    app.checkDaemonBuild(if (new_conn.transport == .socket) selfExeMtimeMs(app.gpa, app.io) else null);
     return true;
+}
+
+pub const BuildMismatch = enum { none, version, binary };
+
+/// Does the daemon run another build than this client? A version names its
+/// commit (build_options.version), which settles it across machines. Equal
+/// versions can still be different builds of uncommitted edits, so a local
+/// client also compares binary mtimes; pass null for own_exe_mtime_ms over
+/// --remote, where the daemon's binary is another machine's file.
+pub fn buildMismatch(daemon_version: []const u8, client_version: []const u8, daemon_exe_mtime_ms: i64, own_exe_mtime_ms: ?i64) BuildMismatch {
+    if (!std.mem.eql(u8, daemon_version, client_version)) return .version;
+    const own = own_exe_mtime_ms orelse return .none;
+    return if (daemon_exe_mtime_ms != 0 and own != daemon_exe_mtime_ms) .binary else .none;
 }
 
 /// mtime (ms) of this client's own binary, for stale-daemon detection
@@ -6512,24 +6545,10 @@ pub fn run(
     if (!conn.network_filtering and conn.network_configured) {
         app.setNotice("dnsblock configured but unavailable — feed load failed; networking is fail-open", .{});
     }
-    // Stale-daemon warning (ordered after the network notice so it wins the
-    // single notice slot). The handshake only checks proto_version, and every
-    // dev build shares one version string — so also compare the daemon's
-    // exe mtime at ITS startup against this client's binary. Local socket
-    // only: a remote daemon is another machine's binary by design.
+    // Stale-daemon warning, ordered after the network notice so it wins the
+    // single notice slot.
     app.cacheWelcomeFacts();
-    if (conn.transport == .socket) {
-        const daemon_ver = conn.daemonVersion();
-        if (!std.mem.eql(u8, daemon_ver, build_options.version)) {
-            app.build_mismatch = true;
-            app.setNotice("daemon is {s} but this client is {s} — /reboot to sync", .{ daemon_ver, build_options.version });
-        } else if (conn.daemon_exe_mtime_ms != 0) {
-            if (selfExeMtimeMs(gpa, io)) |mine| if (mine != conn.daemon_exe_mtime_ms) {
-                app.build_mismatch = true;
-                app.setNotice("daemon runs a different build than this client — /reboot to sync", .{});
-            };
-        }
-    }
+    app.checkDaemonBuild(if (conn.transport == .socket) selfExeMtimeMs(gpa, io) else null);
     if (start_setup) app.requestSetup(true);
 
     var daemon_disconnect_reason: ?[]const u8 = null;

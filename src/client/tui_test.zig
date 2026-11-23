@@ -7864,3 +7864,39 @@ test "clicking a transcript image opens it full size; any click or key closes it
     try std.testing.expect(app.viewedImage() == null);
     try std.testing.expectEqual(Mode.insert, app.mode);
 }
+
+test "buildMismatch: versions settle it; mtimes only for a local daemon" {
+    try std.testing.expectEqual(tui.BuildMismatch.none, tui.buildMismatch("0.0.0-dev+b919e56", "0.0.0-dev+b919e56", 0, null));
+    try std.testing.expectEqual(tui.BuildMismatch.version, tui.buildMismatch("0.0.0-dev+b919e56", "0.0.0-dev+655dbf8", 0, null));
+    try std.testing.expectEqual(tui.BuildMismatch.binary, tui.buildMismatch("0.0.0-dev+b919e56-dirty", "0.0.0-dev+b919e56-dirty", 100, 200));
+    try std.testing.expectEqual(tui.BuildMismatch.none, tui.buildMismatch("0.0.0-dev+b919e56-dirty", "0.0.0-dev+b919e56-dirty", 0, 200));
+    // Over --remote the daemon's mtime is another machine's file.
+    try std.testing.expectEqual(tui.BuildMismatch.none, tui.buildMismatch("0.0.0-dev+b919e56", "0.0.0-dev+b919e56", 100, null));
+}
+
+test "a --remote client names the host running another build, and a matching reconnect clears it" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var conn: attach.Conn = undefined;
+    conn.daemon_exe_mtime_ms = 0;
+    const host = "victory";
+    @memcpy(conn.hostname_buf[0..host.len], host);
+    conn.hostname_len = host.len;
+    const old = "0.0.0-dev+5ca9d4e";
+    @memcpy(conn.daemon_version_buf[0..old.len], old);
+    conn.daemon_version_len = old.len;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .remote_transport = true, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+
+    app.checkDaemonBuild(null);
+    try std.testing.expect(app.build_mismatch);
+    const want = try std.fmt.allocPrint(gpa, "victory runs marlin 0.0.0-dev+5ca9d4e but this client is {s}", .{build_options.version});
+    defer gpa.free(want);
+    try std.testing.expectEqualStrings(want, app.notice.items);
+
+    @memcpy(conn.daemon_version_buf[0..build_options.version.len], build_options.version);
+    conn.daemon_version_len = build_options.version.len;
+    app.checkDaemonBuild(null);
+    try std.testing.expect(!app.build_mismatch);
+}

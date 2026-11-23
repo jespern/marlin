@@ -433,7 +433,8 @@ fn drawWelcome(app: *const App, win: vaxis.Window, top_rows: usize, view_h: usiz
         }) });
     }
     if (app.build_mismatch) {
-        try rows.append(arena, .{ .text = "⚠ daemon runs a different build — /reboot to sync", .style = Palette.welcome_warn });
+        const text = if (app.remote_transport) "⚠ the remote daemon runs a different build" else "⚠ daemon runs a different build — /reboot to sync";
+        try rows.append(arena, .{ .text = text, .style = Palette.welcome_warn });
     }
     try rows.append(arena, .{ .text = "" });
     if (app.setup.required) {
