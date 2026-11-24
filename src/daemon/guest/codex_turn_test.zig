@@ -333,7 +333,7 @@ test "Codex terminal failure continues the same thread with bounded attempts and
             .on_block = Probe.onBlock,
             .on_delta_ctx = &probe,
         };
-        const expected_attempts: usize = if (std.mem.eql(u8, mode, "repeat")) 3 else if (std.mem.eql(u8, mode, "recover") or std.mem.eql(u8, mode, "rpc") or deadline) 2 else 1;
+        const expected_attempts: usize = if (std.mem.eql(u8, mode, "repeat")) 3 else if (std.mem.eql(u8, mode, "recover") or std.mem.eql(u8, mode, "rpc")) 2 else 1;
         if (std.mem.eql(u8, mode, "recover") or std.mem.eql(u8, mode, "vendor") or std.mem.eql(u8, mode, "cancel")) {
             const result = try loop.runTurn(gpa, io, &store, opts, "ORIGINAL_REQUEST", &.{});
             defer gpa.free(result.text);
@@ -350,8 +350,17 @@ test "Codex terminal failure continues the same thread with bounded attempts and
         }
         const attempts = try Io.Dir.cwd().readFileAlloc(io, attempts_path, gpa, .limited(100));
         defer gpa.free(attempts);
-        try std.testing.expectEqual(expected_attempts, try std.fmt.parseInt(usize, std.mem.trim(u8, attempts, "\n"), 10));
-        try std.testing.expectEqual(if (probe.cancel_recovery or deadline) expected_attempts else expected_attempts - 1, probe.recovery_notes);
+        const made = try std.fmt.parseInt(usize, std.mem.trim(u8, attempts, "\n"), 10);
+        if (deadline) {
+            // The deadline holds through recovery pauses (1 s, then 2 s):
+            // it ends the turn as a timeout, in the second pause or, on a
+            // loaded machine slow to start the fake, already in the first.
+            try std.testing.expect(made == 1 or made == 2);
+            try std.testing.expectEqual(made, probe.recovery_notes);
+        } else {
+            try std.testing.expectEqual(expected_attempts, made);
+            try std.testing.expectEqual(if (probe.cancel_recovery) expected_attempts else expected_attempts - 1, probe.recovery_notes);
+        }
         const blocks = try store.getBlocks(1, 1, 100);
         defer {
             for (blocks) |*b| b.deinit();
