@@ -71,15 +71,20 @@ pub const MessageArgs = struct { handle: []const u8, text: []const u8 };
 pub const HandleArgs = struct { handle: []const u8 };
 
 /// How a message from another agent reads in the receiving session: who sent
-/// it and how to answer, then the text.
-pub fn messageText(gpa: std.mem.Allocator, from_handle: []const u8, from_title: []const u8, from_model: []const u8, text: []const u8) ![]u8 {
+/// it and how to answer, then the text. `brief` (a message that starts a
+/// turn, `[ui] brief_agent_replies`) asks for a one-line close, since the
+/// user reads that turn later among their own.
+pub fn messageText(gpa: std.mem.Allocator, from_handle: []const u8, from_title: []const u8, from_model: []const u8, text: []const u8, brief: bool) ![]u8 {
     const title = if (from_title.len > 0) from_title else "(untitled)";
     return std.fmt.allocPrint(gpa,
-        \\[Message from another Marlin session: "{s}" ({s}), handle {s}. Answer with message_session to that handle if it needs an answer.]
+        \\[Message from another Marlin session: "{s}" ({s}), handle {s}. Answer with message_session to that handle if it needs an answer.{s}]
         \\
         \\{s}
-    , .{ title, from_model, from_handle, text });
+    , .{ title, from_model, from_handle, if (brief) brief_close else "", text });
 }
+
+/// What a brief turn is asked to end with.
+pub const brief_close = " The user reads this session later: end your turn with one short line for them, not a repeat of what you sent.";
 
 /// Who a session message is from, as its receiver's transcript names it.
 pub fn senderLabel(gpa: std.mem.Allocator, handle: []const u8, title: []const u8) ![]u8 {

@@ -2338,6 +2338,13 @@ pub fn layoutBlockRange(
                 try flushRanSummary(alloc, lines, &pending_ran, pending_timestamp);
                 try blankLine(alloc, lines);
                 if (rb.from_agent) {
+                    // A turn another session started is its business, not
+                    // the user's: one row, the turn whole under ctrl+t.
+                    if (!transcript.show_tool_transcript) if (agentTurnEnd(transcript.blocks, block_idx, end)) |turn_end| {
+                        try appendAgentTurn(alloc, lines, transcript, block_idx, turn_end, w);
+                        block_idx = turn_end - 1;
+                        continue;
+                    };
                     try appendAgentMessage(alloc, lines, rb, transcript.show_tool_transcript, w);
                     continue;
                 }
@@ -2610,13 +2617,24 @@ fn appendAgentMessage(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), rb:
         try wrapPrefixed(alloc, lines, "    ", rb.text, Palette.collapse_hint, w);
         return;
     }
-    // The first line of what was said, flattened and cut to the row.
+    try appendAgentLine(alloc, lines, rb, " · ctrl+t", w);
+}
+
+/// The row a message from another agent folds to: sender, how it starts
+/// (flattened and cut to fit), then `hint`. A "→" in the hint takes the
+/// sent-message colour.
+fn appendAgentLine(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), rb: RenderBlock, hint: []const u8, w: usize) !void {
     const first = std.mem.trim(u8, rb.text[0 .. std.mem.indexOfScalar(u8, rb.text, '\n') orelse rb.text.len], " \t\r");
     const head = try std.fmt.allocPrint(alloc, "  " ++ message_in_glyph ++ " {s} · ", .{rb.label});
-    const hint = " · ctrl+t";
     // clipText appends " …" past `room`.
     const room = w -| (displayWidth(head) + displayWidth(hint) + 3);
     const clipped = try clipText(alloc, first, room);
+    var spans: std.ArrayList(SyntaxSpan) = .empty;
+    try spans.appendSlice(alloc, try arrowSpan(alloc, Palette.message_in));
+    if (std.mem.indexOf(u8, hint, message_out_glyph)) |at| {
+        const start = head.len + clipped.len + at;
+        try spans.append(alloc, .{ .start = start, .end = start + message_out_glyph.len, .style = Palette.message_out });
+    }
     try lines.append(alloc, .{
         .timestamp_ms = rb.timestamp_ms,
         .text = head,
@@ -2625,8 +2643,54 @@ fn appendAgentMessage(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), rb:
         .style2 = Palette.collapse_hint,
         .text3 = hint,
         .style3 = Palette.collapse_hint,
-        .syntax = try arrowSpan(alloc, Palette.message_in),
+        .syntax = spans.items,
     });
+}
+
+/// Where the turn that the agent message at `start` began ends (exclusive,
+/// within `end`), when it folds: null when the user spoke in it, since
+/// their own words never hide behind a fold.
+fn agentTurnEnd(blocks: []const RenderBlock, start: usize, end: usize) ?usize {
+    const turn_id = blocks[start].turn_id;
+    if (turn_id == 0) return null;
+    var i = start + 1;
+    while (i < end and blocks[i].turn_id == turn_id) : (i += 1) {
+        const b = blocks[i];
+        if ((b.kind == .user_msg or b.kind == .steer) and !b.from_agent) return null;
+    }
+    return i;
+}
+
+/// A turn another session started, as one row: who asked and how it
+/// starts, whom this session messaged back, and whether it still works.
+fn appendAgentTurn(
+    alloc: std.mem.Allocator,
+    lines: *std.ArrayList(Line),
+    transcript: *const Transcript,
+    start: usize,
+    end: usize,
+    w: usize,
+) !void {
+    var names: std.ArrayList([]const u8) = .empty;
+    for (transcript.blocks[start + 1 .. end]) |b| {
+        if (b.kind != .tool_call or marlinTool(b.label) != .message) continue;
+        const line = (try marlinToolLine(alloc, b.label, b.text, transcript.sessions, true)) orelse continue;
+        if (line.name.len == 0) continue;
+        const seen = for (names.items) |n| {
+            if (std.mem.eql(u8, n, line.name)) break true;
+        } else false;
+        if (!seen) try names.append(alloc, line.name);
+    }
+    const live = end == transcript.blocks.len and
+        (transcript.state == .running or transcript.state == .awaiting_approval);
+    var hint: std.ArrayList(u8) = .empty;
+    if (names.items.len > 0) {
+        try hint.appendSlice(alloc, " · " ++ message_out_glyph ++ " ");
+        try hint.appendSlice(alloc, try std.mem.join(alloc, ", ", names.items));
+    }
+    if (live) try hint.appendSlice(alloc, " · working");
+    try hint.appendSlice(alloc, " · ctrl+t");
+    try appendAgentLine(alloc, lines, transcript.blocks[start], hint.items, w);
 }
 
 /// Range occupied by the active turn's prompt card in the most recent

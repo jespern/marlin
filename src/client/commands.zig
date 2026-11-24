@@ -62,7 +62,7 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "/archive", .usage = " [children]", .description = "archive this session, or its finished children", .accepts_args = true },
     .{ .name = "/attach", .usage = " <image-path>", .description = "attach a PNG, JPEG, GIF, or WebP image", .accepts_args = true },
     .{ .name = "/compact", .usage = " [focus]", .description = "compact the current context (guests compact their own; focus steers Claude Code's summary)", .accepts_args = true },
-    .{ .name = "/config", .usage = " [tabbar|bell|pacing on|off|screensaver <duration|effect> [effect]]", .description = "view or change UI settings (persisted)", .accepts_args = true },
+    .{ .name = "/config", .usage = " [tabbar|bell|pacing|brief on|off|screensaver <duration|effect> [effect]]", .description = "view or change UI settings (persisted)", .accepts_args = true },
     .{ .name = "/pause", .usage = " [all] [--force]", .description = "suspend active work", .accepts_args = true },
     .{ .name = "/resume", .usage = " [all]", .description = "continue paused work", .accepts_args = true },
     .{ .name = "/reboot", .usage = " [--build] [--force]", .description = "restart Marlin", .accepts_args = true },
@@ -1066,10 +1066,11 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
 pub fn configCommand(self: *App, setting: ?[]const u8, value: ?[]const u8, extra: ?[]const u8) void {
     const name = setting orelse {
         var duration_buf: [32]u8 = undefined;
-        self.setNotice("config · tabbar {s} · bell {s} · pacing {s} · screensaver {s} {s}", .{
+        self.setNotice("config · tabbar {s} · bell {s} · pacing {s} · brief {s} · screensaver {s} {s}", .{
             onOff(self.show_tab_bar),
             onOff(self.bell_enabled),
             onOff(self.stream_pacing),
+            onOff(self.brief_replies),
             config.formatDuration(&duration_buf, self.screensaver_timeout_ms) catch "invalid",
             self.screensaver_kind.name(),
         });
@@ -1133,20 +1134,21 @@ pub fn configCommand(self: *App, setting: ?[]const u8, value: ?[]const u8, extra
         return;
     }
 
-    const Flag = enum { tabbar, bell, pacing };
+    const Flag = enum { tabbar, bell, pacing, brief };
     const flag = std.meta.stringToEnum(Flag, name) orelse {
-        self.setNotice("usage: /config <tabbar|bell|pacing> [on|off] or /config screensaver <duration|effect> [effect]", .{});
+        self.setNotice("usage: /config <tabbar|bell|pacing|brief> [on|off] or /config screensaver <duration|effect> [effect]", .{});
         return;
     };
     const current = switch (flag) {
         .tabbar => self.show_tab_bar,
         .bell => self.bell_enabled,
         .pacing => self.stream_pacing,
+        .brief => self.brief_replies,
     };
     const enable = if (value) |v| blk: {
         if (std.mem.eql(u8, v, "on") or std.mem.eql(u8, v, "true")) break :blk true;
         if (std.mem.eql(u8, v, "off") or std.mem.eql(u8, v, "false")) break :blk false;
-        self.setNotice("usage: /config <tabbar|bell|pacing> [on|off]", .{});
+        self.setNotice("usage: /config <tabbar|bell|pacing|brief> [on|off]", .{});
         return;
     } else !current;
     const msg: proto.ClientMsg = switch (flag) {
@@ -1162,6 +1164,10 @@ pub fn configCommand(self: *App, setting: ?[]const u8, value: ?[]const u8, extra
         .pacing => msg: {
             self.setStreamPacing(enable);
             break :msg .{ .ui_set_stream_pacing = .{ .enabled = enable } };
+        },
+        .brief => msg: {
+            self.brief_replies = enable;
+            break :msg .{ .ui_set_brief_replies = .{ .enabled = enable } };
         },
     };
     self.conn.send(msg) catch |err| {

@@ -945,6 +945,8 @@ test "agents reach other sessions: list, read, message (hop and turn limits), wa
     try std.testing.expect(std.mem.startsWith(u8, delivered, "[Message from another Marlin session"));
     try std.testing.expect(std.mem.indexOf(u8, delivered, caller_handle) != null);
     try std.testing.expect(std.mem.endsWith(u8, delivered, "Is the lexer done?"));
+    // It lands in a turn the user started: their reply stays as it is.
+    try std.testing.expect(std.mem.indexOf(u8, delivered, @import("tools/sessions.zig").brief_close) == null);
     // The receiver's transcript folds it under the sender, showing their words.
     try std.testing.expectEqualStrings("Is the lexer done?", other.steer_queue.items[0].input.display_text.?);
     try std.testing.expect(std.mem.indexOf(u8, other.steer_queue.items[0].input.from.?, caller_handle) != null);

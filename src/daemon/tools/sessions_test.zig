@@ -17,10 +17,24 @@ test "the four tools are known by name, and only they" {
 }
 
 test "a message says who sent it and how to answer" {
-    const text = try sessions.messageText(std.testing.allocator, "5588ce26", "fix the parser", "claudecode/opus", "Is the lexer done?");
+    const text = try sessions.messageText(std.testing.allocator, "5588ce26", "fix the parser", "claudecode/opus", "Is the lexer done?", false);
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.startsWith(u8, text, "[Message from another Marlin session: \"fix the parser\" (claudecode/opus), handle 5588ce26."));
-    try std.testing.expect(std.mem.endsWith(u8, text, "\n\nIs the lexer done?"));
+    try std.testing.expect(std.mem.endsWith(u8, text, "if it needs an answer.]\n\nIs the lexer done?"));
+}
+
+test "a message that starts a turn asks for a one-line close for the user" {
+    // Case: back after a while, the user's scrollback was buried under
+    // full replies to other sessions, repeating what was already sent.
+    const gpa = std.testing.allocator;
+    const text = try sessions.messageText(gpa, "5588ce26", "fix the parser", "claudecode/opus", "Is the lexer done?", true);
+    defer gpa.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "if it needs an answer." ++ sessions.brief_close ++ "]\n\nIs the lexer done?") != null);
+    // The header still reads as an agent message, stored or not.
+    const parsed = (try @import("../../core/agent_message.zig").parseLegacy(gpa, text)).?;
+    defer gpa.free(parsed.from);
+    try std.testing.expectEqualStrings("fix the parser · 5588ce26", parsed.from);
+    try std.testing.expectEqualStrings("Is the lexer done?", parsed.body);
 }
 
 test "the transcript tail reads as who said what, tools as one line, failures only" {

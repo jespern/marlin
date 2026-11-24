@@ -719,6 +719,9 @@ pub const App = struct {
     /// [ui] stream_pacing: reveal a streaming reply row by row at 60 fps.
     /// Off, every finished line shows the moment it arrives.
     stream_pacing: bool = false,
+    /// [ui] brief_agent_replies: a turn another session starts ends with one
+    /// short line for the user. The daemon words the message; this mirrors it.
+    brief_replies: bool = true,
     /// Scroll offset of the `?` help panel (rows are static + generated).
     help_scroll: usize = 0,
     /// Wall-clock ms after which the status notice clears itself. Read by
@@ -2760,14 +2763,16 @@ pub const App = struct {
                 self.show_tab_bar = result.tab_bar;
                 self.bell_enabled = result.bell;
                 self.setStreamPacing(result.stream_pacing);
+                self.brief_replies = result.brief_replies;
                 self.screensaver_timeout_ms = result.screensaver_after_ms;
                 self.screensaver_kind = effects.Kind.parse(result.screensaver_effect) orelse .matrix;
                 self.refresh_requested = true;
                 var duration_buf: [32]u8 = undefined;
-                self.setNotice("saved · tabbar {s} · bell {s} · pacing {s} · screensaver {s} {s}", .{
+                self.setNotice("saved · tabbar {s} · bell {s} · pacing {s} · brief {s} · screensaver {s} {s}", .{
                     onOff(result.tab_bar),
                     onOff(result.bell),
                     onOff(result.stream_pacing),
+                    onOff(result.brief_replies),
                     config.formatDuration(&duration_buf, result.screensaver_after_ms) catch "invalid",
                     self.screensaver_kind.name(),
                 });
@@ -6527,6 +6532,7 @@ pub fn run(
     app.show_tab_bar = cfg.ui_tab_bar;
     app.bell_enabled = cfg.ui_bell;
     app.stream_pacing = cfg.ui_stream_pacing;
+    app.brief_replies = cfg.ui_brief_agent_replies;
     app.screensaver_timeout_ms = cfg.ui_screensaver_after_ms;
     app.screensaver_kind = effects.Kind.parse(cfg.ui_screensaver_effect) orelse .matrix;
     app.shell_prefix = shell_tab.Prefix.parse(cfg.ui_shell_prefix) orelse prefix: {

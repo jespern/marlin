@@ -493,6 +493,9 @@ pub const ClientMsg = union(enum) {
     ui_set_bell: struct { enabled: bool },
     /// Persist `[ui] stream_pacing` (paced row-by-row reveal of a reply).
     ui_set_stream_pacing: struct { enabled: bool },
+    /// Persist `[ui] brief_agent_replies` (a turn another session starts
+    /// ends with one short line for the user).
+    ui_set_brief_replies: struct { enabled: bool },
     /// Persist the client-local inactivity delay and selected effect.
     ui_set_screensaver: struct { after_ms: u64, effect: []const u8 = "matrix" },
     /// Re-read config and atomically replace extensions while no turn is live.
@@ -831,6 +834,7 @@ pub const DaemonMsg = union(enum) {
         tab_bar: bool,
         bell: bool = true,
         stream_pacing: bool = false,
+        brief_replies: bool = true,
         screensaver_after_ms: u64 = 0,
         screensaver_effect: []const u8 = "matrix",
     },

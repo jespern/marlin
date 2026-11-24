@@ -412,6 +412,8 @@ test "older ui config replies default the screensaver and pacing off" {
     try std.testing.expectEqual(@as(u64, 0), msg.ui_config_result.screensaver_after_ms);
     try std.testing.expectEqualStrings("matrix", msg.ui_config_result.screensaver_effect);
     try std.testing.expect(!msg.ui_config_result.stream_pacing);
+    // Brief replies are on unless a daemon says otherwise.
+    try std.testing.expect(msg.ui_config_result.brief_replies);
 }
 
 test "status phase is additive and decode-compatible" {

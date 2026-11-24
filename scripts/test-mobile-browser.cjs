@@ -564,6 +564,35 @@ async function main() {
       for(const n of [received,sent,document.querySelector('[data-call="mb1"]').closest('.tool-group')]) n.remove();
       return out;
     });
+    // A turn another session started folds to one row: who asked, whom it
+    // answered (case: back after a while, the user's own scrollback was
+    // buried under sessions answering each other). The user speaking into
+    // the turn opens it up.
+    const agentTurns=await page.evaluate(()=>{
+      const t=$('#transcript'), before=t.children.length;
+      const turn=(id,seq)=>[
+        {seq,turn_id:id,ts:0,body:{user_msg:{text:'[message]\nAre you releasing?',display_text:'Are you releasing?\nSoon?',from:'steward · 1a2b3c4d'}}},
+        {seq:seq+1,turn_id:id,ts:0,body:{reasoning:{text:'Thinking about it'}}},
+        {seq:seq+2,turn_id:id,ts:0,body:{tool_call:{name:'mcp__marlin__message_session',call_id:'am'+id,args_json:JSON.stringify({handle:'1a2b3c4d',text:'Yes.'})}}},
+        {seq:seq+3,turn_id:id,ts:0,body:{tool_result:{call_id:'am'+id,status:'ok',inline_body:'Delivered.'}}},
+      ];
+      for(const b of turn(901,9001)) addBlock(b);
+      addBlock({seq:9005,turn_id:901,ts:0,body:{assistant_msg:{text:'A long reply the user does not need.'}}});
+      const folded=t.lastElementChild;
+      const out={rows:t.children.length-before,summary:folded.querySelector('summary').textContent,open:folded.open,
+                 inside:folded.querySelector('.turn-body').textContent.includes('A long reply'),
+                 reply:getComputedStyle(folded.querySelector('.replies .arrow')).color};
+      folded.remove();
+      const [first,...rest]=turn(902,9010);
+      addBlock(first);
+      addBlock({seq:9011,turn_id:902,ts:0,body:{steer:{text:'Not yet'}}});
+      for(const b of rest) addBlock(b);
+      out.unfolded=!t.querySelector('.agent-turn')&&[...t.children].some(n=>n.textContent.includes('Not yet'));
+      while(t.children.length>before) t.lastElementChild.remove();
+      return out;
+    });
+    assert.deepEqual(agentTurns,{rows:1,summary:'← steward · 1a2b3c4d · Are you releasing? · → 1a2b3c4d',open:false,inside:true,
+                                 reply:'rgb(196, 181, 253)',unfolded:true});
     // Another session's queued message waits as one line (case: a few long
     // ones pinned above the composer filled the phone); a tap shows it all.
     const queuedMessage=await page.evaluate(()=>{

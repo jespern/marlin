@@ -3975,6 +3975,18 @@ pub const Daemon = struct {
                 self.cfg.ui_stream_pacing = request.enabled;
                 self.sendUiConfig(client);
             },
+            .ui_set_brief_replies => |request| {
+                config.setUiFlag(self.gpa, self.io, self.environ, "brief_agent_replies", request.enabled) catch |err| {
+                    std.log.warn("could not persist brief-replies preference: {t}", .{err});
+                    self.sendTo(client, .{ .err = .{
+                        .code = "config",
+                        .msg = "could not save brief-replies preference to config.toml",
+                    } });
+                    return;
+                };
+                self.cfg.ui_brief_agent_replies = request.enabled;
+                self.sendUiConfig(client);
+            },
             .ui_set_screensaver => |request| {
                 var duration_buf: [32]u8 = undefined;
                 const duration = config.formatDuration(&duration_buf, request.after_ms) catch {
@@ -6446,11 +6458,15 @@ pub const Daemon = struct {
                 return .{ .text = "not sent: that session is paused", .status = .err };
             if (self.sessionShell(target_sid) != null)
                 return .{ .text = "not sent: that session is a shell right now", .status = .err };
-            const message = if (from_outside) try sessions_tool.outsideMessageText(arena, outside, text) else try sessions_tool.messageText(arena, me.handle, me.title, me.model, text);
+            const busy = session.state == .running or session.state == .awaiting_approval;
+            // A message that starts a turn makes that turn the user's next
+            // read in this session: ask for a short close, not a repeat.
+            const brief = !busy and self.cfg.ui_brief_agent_replies;
+            const message = if (from_outside) try sessions_tool.outsideMessageText(arena, outside, text) else try sessions_tool.messageText(arena, me.handle, me.title, me.model, text, brief);
             // The transcript shows the sender's words, folded under who sent
             // them; the model reads the message with its reply instructions.
             const sender = if (from_outside) outside else try sessions_tool.senderLabel(arena, me.handle, me.title);
-            if (session.state == .running or session.state == .awaiting_approval) {
+            if (busy) {
                 var owned = try self.prepareSteerInput(session.model, message, text, &.{});
                 owned.from = self.gpa.dupe(u8, sender) catch |err| {
                     owned.deinit(self.gpa);
@@ -7821,6 +7837,7 @@ pub const Daemon = struct {
             .tab_bar = self.cfg.ui_tab_bar,
             .bell = self.cfg.ui_bell,
             .stream_pacing = self.cfg.ui_stream_pacing,
+            .brief_replies = self.cfg.ui_brief_agent_replies,
             .screensaver_after_ms = self.cfg.ui_screensaver_after_ms,
             .screensaver_effect = self.cfg.ui_screensaver_effect,
         } });

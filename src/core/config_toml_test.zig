@@ -90,6 +90,7 @@ test "web exposure and ui tab_bar flags parse" {
         \\tab_bar = false
         \\bell = false
         \\stream_pacing = true
+        \\brief_agent_replies = false
         \\screensaver_after = "10m"
         \\screensaver_effect = "strings"
         \\shell_prefix = "ctrl+b"
@@ -105,6 +106,7 @@ test "web exposure and ui tab_bar flags parse" {
     try std.testing.expect(!doc.ui_tab_bar.?);
     try std.testing.expect(!doc.ui_bell.?);
     try std.testing.expect(doc.ui_stream_pacing.?);
+    try std.testing.expect(!doc.ui_brief_agent_replies.?);
     try std.testing.expectEqual(@as(u64, 600_000), doc.ui_screensaver_after_ms.?);
     try std.testing.expectEqualStrings("strings", doc.ui_screensaver_effect.?);
     try std.testing.expectEqualStrings("ctrl+b", doc.ui_shell_prefix.?);

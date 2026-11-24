@@ -2113,10 +2113,17 @@ test "a run of calls to one session tool says its sessions in one row" {
     try std.testing.expect(std.mem.indexOf(u8, text, "⚙ Waiting on steward, postgres\n") != null);
 }
 
-/// Each row that leads with a message arrow: its text and the arrow's style.
-const ArrowRow = struct { text: []const u8, style: vaxis.Style };
+/// Each row that leads with a message arrow: its text, the leading arrow's
+/// style, and the style of a "→" later in the row (a folded turn's reply).
+const ArrowRow = struct { text: []const u8, style: vaxis.Style, reply: ?vaxis.Style = null };
 
 fn messageArrowRows(arena: std.mem.Allocator, gpa: std.mem.Allocator, blocks: []const RenderBlock, sessions: []const layout.SessionRef, expanded: bool) ![]const ArrowRow {
+    return (try arrowLayout(arena, gpa, blocks, sessions, expanded, .idle)).rows;
+}
+
+const ArrowLayout = struct { rows: []const ArrowRow, text: []const u8 };
+
+fn arrowLayout(arena: std.mem.Allocator, gpa: std.mem.Allocator, blocks: []const RenderBlock, sessions: []const layout.SessionRef, expanded: bool, state: proto.SessionState) !ArrowLayout {
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     var cache = LayoutCache{};
@@ -2129,7 +2136,7 @@ fn messageArrowRows(arena: std.mem.Allocator, gpa: std.mem.Allocator, blocks: []
         .io = threaded.io(),
         .blocks = blocks,
         .show_tool_transcript = expanded,
-        .state = .idle,
+        .state = state,
         .layout_epoch = 0,
         .delta = "",
         .reasoning_delta = "",
@@ -2148,17 +2155,26 @@ fn messageArrowRows(arena: std.mem.Allocator, gpa: std.mem.Allocator, blocks: []
     };
     const lines = try layoutLines(arena, gpa, &transcript, 120);
     var rows: std.ArrayList(ArrowRow) = .empty;
+    var all: std.ArrayList(u8) = .empty;
     for (lines.items) |line| {
         const text = try lineText(arena, line);
+        try all.appendSlice(arena, text);
+        try all.append(arena, '\n');
         const arrow = inline for ([_][]const u8{ layout.message_in_glyph, layout.message_out_glyph }) |glyph| {
             if (std.mem.startsWith(u8, text, "  " ++ glyph)) break glyph;
         } else continue;
-        // The span covers the arrow and nothing else.
-        try std.testing.expectEqual(@as(usize, 1), line.syntax.len);
+        // Each span covers an arrow and nothing else: the leading one, and
+        // on a folded turn the one before whom it messaged.
+        try std.testing.expect(line.syntax.len == 1 or line.syntax.len == 2);
         try std.testing.expectEqualStrings(arrow, text[line.syntax[0].start..line.syntax[0].end]);
-        try rows.append(arena, .{ .text = text, .style = line.syntax[0].style });
+        var row: ArrowRow = .{ .text = text, .style = line.syntax[0].style };
+        if (line.syntax.len == 2) {
+            try std.testing.expectEqualStrings(layout.message_out_glyph, text[line.syntax[1].start..line.syntax[1].end]);
+            row.reply = line.syntax[1].style;
+        }
+        try rows.append(arena, row);
     }
-    return rows.items;
+    return .{ .rows = rows.items, .text = all.items };
 }
 
 test "messages between sessions lead with an arrow in their direction's colour" {
@@ -2179,17 +2195,71 @@ test "messages between sessions lead with an arrow in their direction's colour" 
         .{ .kind = .tool_call, .turn_id = 1, .call_id = @constCast("w1"), .label = @constCast("mcp__marlin__wait_for_session"), .text = call },
         .{ .kind = .tool_result, .turn_id = 1, .call_id = @constCast("w1"), .text = @constCast("idle"), .label = @constCast("") },
     };
-    for ([_]bool{ false, true }) |expanded| {
-        const rows = try messageArrowRows(arena, gpa, &blocks, &sessions, expanded);
-        try std.testing.expectEqual(@as(usize, 2), rows.len);
-        try std.testing.expect(std.mem.startsWith(u8, rows[0].text, "  ← "));
-        try std.testing.expect(std.meta.eql(rows[0].style, Palette.message_in));
-        try std.testing.expect(std.mem.startsWith(u8, rows[1].text, "  → Message to steward"));
-        try std.testing.expect(std.meta.eql(rows[1].style, Palette.message_out));
-    }
+    const rows = try messageArrowRows(arena, gpa, &blocks, &sessions, true);
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expect(std.mem.startsWith(u8, rows[0].text, "  ← "));
+    try std.testing.expect(std.meta.eql(rows[0].style, Palette.message_in));
+    try std.testing.expect(std.mem.startsWith(u8, rows[1].text, "  → Message to steward"));
+    try std.testing.expect(std.meta.eql(rows[1].style, Palette.message_out));
+    // Folded, the turn is one row with both arrows.
+    const folded = try messageArrowRows(arena, gpa, &blocks, &sessions, false);
+    try std.testing.expectEqual(@as(usize, 1), folded.len);
+    try std.testing.expect(std.meta.eql(folded[0].style, Palette.message_in));
+    try std.testing.expect(std.meta.eql(folded[0].reply.?, Palette.message_out));
     // Other session tools keep the tool glyph.
-    const text = try sessionToolTranscriptText(arena, gpa, &blocks, &.{}, &sessions);
+    const text = (try arrowLayout(arena, gpa, &blocks, &sessions, true, .idle)).text;
     try std.testing.expect(std.mem.indexOf(u8, text, "⚙ Waited on steward") != null);
+}
+
+test "a turn another session started folds to one row until ctrl+t" {
+    // Case: back after a while, the user's own scrollback was buried under
+    // sessions answering each other: the message, the thinking, the work,
+    // and the full reply.
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const session_handle = @import("../core/session_handle.zig");
+    const steward = session_handle.full(1);
+    const sessions = [_]layout.SessionRef{ .{ .sid = 1, .title = "steward" }, .{ .sid = 2, .title = "postgres" } };
+    const to_steward = try std.fmt.allocPrint(arena, "{{\"handle\":\"{s}\",\"text\":\"Taking 072.\"}}", .{steward[0..8]});
+    const to_postgres = try std.fmt.allocPrint(arena, "{{\"handle\":\"{s}\",\"text\":\"FYI\"}}", .{session_handle.full(2)[0..8]});
+    const turn = [_]RenderBlock{
+        .{ .kind = .user_msg, .turn_id = 1, .text = @constCast("Fix the build"), .label = @constCast("") },
+        .{ .kind = .assistant_msg, .turn_id = 1, .text = @constCast("Fixed the build."), .label = @constCast("") },
+        .{ .kind = .user_msg, .turn_id = 2, .text = @constCast("Are you releasing?\nSecond line"), .label = @constCast("steward · 00000001"), .from_agent = true },
+        .{ .kind = .reasoning, .turn_id = 2, .text = @constCast("Thinking about the release"), .label = @constCast("") },
+        .{ .kind = .tool_call, .turn_id = 2, .call_id = @constCast("m1"), .label = @constCast("mcp__marlin__message_session"), .text = to_steward },
+        .{ .kind = .tool_result, .turn_id = 2, .call_id = @constCast("m1"), .text = @constCast("Delivered."), .label = @constCast("") },
+        .{ .kind = .tool_call, .turn_id = 2, .call_id = @constCast("m2"), .label = @constCast("mcp__marlin__message_session"), .text = to_postgres },
+        .{ .kind = .tool_result, .turn_id = 2, .call_id = @constCast("m2"), .text = @constCast("Delivered."), .label = @constCast("") },
+        .{ .kind = .tool_call, .turn_id = 2, .call_id = @constCast("m3"), .label = @constCast("mcp__marlin__message_session"), .text = to_steward },
+        .{ .kind = .tool_result, .turn_id = 2, .call_id = @constCast("m3"), .text = @constCast("Delivered."), .label = @constCast("") },
+        .{ .kind = .assistant_msg, .turn_id = 2, .text = @constCast("A long reply to steward that the user does not need."), .label = @constCast("") },
+    };
+    const folded = try arrowLayout(arena, gpa, &turn, &sessions, false, .idle);
+    try std.testing.expectEqual(@as(usize, 1), folded.rows.len);
+    try std.testing.expectEqualStrings("  ← steward · 00000001 · Are you releasing? · → steward, postgres · ctrl+t", folded.rows[0].text);
+    // The user's own turn stays; the other session's is only that row.
+    try std.testing.expect(std.mem.indexOf(u8, folded.text, "Fixed the build.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, folded.text, "A long reply") == null);
+    try std.testing.expect(std.mem.indexOf(u8, folded.text, "Delivered") == null);
+    // ctrl+t shows all of it.
+    const expanded = try arrowLayout(arena, gpa, &turn, &sessions, true, .idle);
+    try std.testing.expect(std.mem.indexOf(u8, expanded.text, "A long reply") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expanded.text, "Second line") != null);
+
+    // Still running, the row says so.
+    const live = try arrowLayout(arena, gpa, turn[0..6], &sessions, false, .running);
+    try std.testing.expectEqual(@as(usize, 1), live.rows.len);
+    try std.testing.expectEqualStrings("  ← steward · 00000001 · Are you releasing? · → steward · working · ctrl+t", live.rows[0].text);
+
+    // When the user spoke into that turn, nothing of it hides.
+    var steered = turn;
+    steered[5] = .{ .kind = .steer, .turn_id = 2, .text = @constCast("Don't release yet"), .label = @constCast("") };
+    const open = try arrowLayout(arena, gpa, &steered, &sessions, false, .idle);
+    try std.testing.expect(std.mem.indexOf(u8, open.text, "Don't release yet") != null);
+    try std.testing.expect(std.mem.indexOf(u8, open.text, "A long reply") != null);
 }
 
 test "a guest's live session tool says what it does and which session, not its MCP name" {

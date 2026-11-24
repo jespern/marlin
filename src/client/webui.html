@@ -220,6 +220,11 @@
   .arrow.in { color: #8b5cf6; }
   .arrow.out { color: #c4b5fd; }
   .message-in summary .name { color: var(--code); }
+  /* A turn another session started folds to its message's row
+     (layout.zig appendAgentTurn); a tap opens the whole turn. */
+  .agent-turn > summary { color: var(--dim); cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .agent-turn > .turn-body { margin: 8px 0 0 18px; }
+  .agent-turn .sent-message { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--dim); }
   .note { color: var(--code); font-size: 13px; } /* render.zig: note = soft blue */
   /* markdown */
   .md p, .md ul, .md ol, .md blockquote, .md table, .md h1, .md h2, .md h3, .md h4 { margin: 0 0 8px; }
@@ -1329,6 +1334,43 @@ function agentMessage(v) {
   return node;
 }
 
+// A turn another session started (layout.zig appendAgentTurn): one row
+// saying who asked and whom this session answered; the whole turn, message
+// first, a tap away.
+function agentTurn(v, b) {
+  const node = el('details', 'block agent-turn message-in');
+  node.dataset.turn = b.turn_id;
+  const said = v.display_text || v.text || '';
+  const summary = el('summary');
+  summary.append(el('span', 'arrow in', '←'), ' ', el('span', 'name', v.from),
+    el('span', 'said', ' · ' + said.split('\n', 1)[0].trim().slice(0, 400)), el('span', 'replies'));
+  const body = el('div', 'turn-body');
+  const message = el('div', 'block sent-message', said);
+  body.appendChild(message);
+  node.append(summary, body);
+  node.agentTurn = {v, names: []};
+  return node;
+}
+// Whom the folded turn messaged, as its row says.
+function noteAgentTurn(node, kind, v) {
+  if (kind !== 'tool_call' || marlinTool(v.name) !== 'message') return;
+  const line = marlinToolLine(v.name, v.args_json, true);
+  const name = (line.target || '').split(' · ')[0];
+  const names = node.agentTurn.names;
+  if (!name || names.includes(name)) return;
+  names.push(name);
+  node.querySelector('summary .replies').replaceChildren(' · ', el('span', 'arrow out', '→'), ' ' + names.join(', '));
+}
+// The user spoke into the turn: their words never hide, so it opens up into
+// the transcript as if it had never folded.
+function unfoldAgentTurn(node) {
+  const message = agentMessage(node.agentTurn.v);
+  if (node.dataset.seq) message.dataset.seq = node.dataset.seq;
+  const body = node.querySelector('.turn-body');
+  body.firstElementChild.remove();
+  node.replaceWith(message, ...body.children);
+}
+
 const rehydrationPrefix = '[rehydrated after compaction]';
 
 function rehydrationNote(text) {
@@ -1374,8 +1416,23 @@ function addBlock(b, target = $('#transcript'), live = true) {
   const t = target;
   const kind = Object.keys(b.body)[0];
   const v = b.body[kind];
+  // The rest of a folded turn goes inside it, unless it is the user.
+  const turn = t.agentTurn;
+  if (turn && turn.parentNode === t && b.turn_id && turn.dataset.turn === String(b.turn_id)) {
+    if ((kind === 'user_msg' || kind === 'steer') && !v.from) {
+      t.agentTurn = null;
+      unfoldAgentTurn(turn);
+    } else {
+      addBlock(b, turn.querySelector('.turn-body'), live);
+      noteAgentTurn(turn, kind, v);
+      return;
+    }
+  }
   let node = null;
-  if ((kind === 'user_msg' || kind === 'steer') && v.from) {
+  if (kind === 'user_msg' && v.from && b.turn_id) {
+    node = agentTurn(v, b);
+    t.agentTurn = node;
+  } else if ((kind === 'user_msg' || kind === 'steer') && v.from) {
     node = agentMessage(v);
   } else if (kind === 'user_msg') {
     const synthetic = v.synthetic || (v.text || '').startsWith(rehydrationPrefix);

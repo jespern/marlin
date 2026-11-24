@@ -153,6 +153,17 @@ its chain. Two running sessions answering each other are still bounded; a
 cycle of three running sessions is not. Plan mode and read-only children may
 read but not message.
 
+A turn another session started is that session's business, so it stays out of
+the user's way. With ctrl+t off, the TUI folds it into one row
+(`layout.zig appendAgentTurn`): the sender, how its message starts, whom this
+session messaged back, and "working" while it runs. The web companion does the
+same (`webui.html agentTurn`). If the user types into that turn, it is not
+folded, because the user's own words never hide. The message that starts such
+a turn also asks the agent to end it with one short line for the user rather
+than repeating what it sent (`sessions.brief_close`, `[ui]
+brief_agent_replies`, `/config brief`, on by default). A message steered into
+a busy session lands in a turn the user started and keeps the plain wording.
+
 The same tools serve assistants outside Marlin through its MCP server
 (`client/mcp_server.zig`, `POST /mcp` on the web companion, bearer tokens with
 `read`/`act` scopes from `mobile/mcp_tokens.zig`). They arrive as
