@@ -164,9 +164,11 @@
      a tap shows it whole. */
   .user.queued .said-line { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 400; }
   .user.queued.open .said-line { white-space: pre-wrap; overflow-wrap: anywhere; }
-  /* The session's queue, the daemon's (proto `queued`), pinned above the
-     composer as Claude Code does: new output never buries it. */
-  #queue { order: 2; padding: 0 22px; }
+  /* The session's queue, the daemon's (proto `queued`), at the end of the
+     transcript as in the TUI: new output goes above it, and it scrolls with
+     the transcript, so however long it gets it never covers a question, an
+     approval or the composer (case: two long messages from other sessions
+     filled the phone). */
   #queue:empty { display: none; }
   #queue .user { margin: 8px 0; position: relative; padding-right: 40px; }
   #queue .unqueue {
@@ -436,7 +438,6 @@
     #side h1 { padding: 16px 16px 12px; }
     #side h1 button { padding: 4px 10px; }
     #transcript { padding: 12px; }
-    #queue { padding: 0 12px; }
     #input { font-size: 16px; } /* <16px makes iOS zoom the page on focus */
     #composer .prompt, #attach-btn { padding-top: 13px; }
     button.act { padding: 8px 14px; }
@@ -482,9 +483,8 @@
     <span class="title">marlin</span>
     <span id="connection-badge" role="status">Connecting…</span>
   </div>
-  <div id="transcript"><button id="history-more" class="act">load older</button></div>
+  <div id="transcript"><button id="history-more" class="act">load older</button><div id="queue" aria-label="queued messages"></div></div>
   <div id="term" aria-label="shell"></div>
-  <div id="queue" aria-label="queued messages"></div>
   <div id="approval">
     <span class="q"></span>
     <button class="act yes">approve</button>
@@ -725,7 +725,7 @@ function addOptimisticInput(targetSid, text, steer) {
   const requestId = ++nextInputRequestId;
   const node = el('div', 'block user optimistic' + (steer ? ' queued' : ''), (steer ? '↪ ' : '') + text);
   node.dataset.requestId = String(requestId);
-  $(steer ? '#queue' : '#transcript').appendChild(node);
+  if (steer) $('#queue').appendChild(node); else appendToTranscript($('#transcript'), node);
   pendingInputs.push({ requestId, sid: targetSid, text, steer, node });
   scrollBottom(true);
   return pendingInputs[pendingInputs.length - 1];
@@ -793,7 +793,7 @@ function settleOptimisticInput(kind, text, attachments) {
   // Move the optimistic row to the durable event's actual position. This is
   // observable for steering: the in-flight row can precede the assistant's
   // final block locally, while the durable steer correctly follows it.
-  $('#transcript').appendChild(pending.node);
+  appendToTranscript($('#transcript'), pending.node);
   scrollBottom();
   return true;
 }
@@ -931,8 +931,14 @@ function shellHtml(cmd) {
 // Consecutive tool calls fold into one "Ran N commands" line, as in the TUI;
 // the description notes and approvals between them fold in with them. A
 // lone call shows as its own row.
+// What the transcript gains goes above the queue, which stays at its end.
+function appendToTranscript(t, node) {
+  const queue = $('#queue');
+  if (queue.parentNode === t) t.insertBefore(node, queue); else t.appendChild(node);
+}
 function lastToolGroup(t) {
-  const last = t.lastElementChild;
+  const queue = $('#queue');
+  const last = queue.parentNode === t ? queue.previousElementSibling : t.lastElementChild;
   return last && last.classList.contains('tool-group') ? last : null;
 }
 function updateToolGroup(g) {
@@ -958,7 +964,7 @@ function addToToolGroup(t, node, kind) {
     g = el('details', 'block tool-group single');
     g.open = true;
     g.appendChild(el('summary'));
-    t.appendChild(g);
+    appendToTranscript(t, g);
   }
   g.appendChild(node);
   updateToolGroup(g);
@@ -1396,12 +1402,12 @@ let marlinVersion = '', replayed = false;
 function syncWelcome() {
   const t = $('#transcript');
   let card = $('#welcome');
-  const content = [...t.children].some(c => c.id !== 'history-more' && c.id !== 'welcome');
+  const content = [...t.children].some(c => c.id !== 'history-more' && c.id !== 'welcome' && !(c.id === 'queue' && !c.children.length));
   const state = $('#status .state').className;
   const show = !!cur && replayed && !content && !/running|awaiting_approval|shell/.test(state);
   t.classList.toggle('empty', show);
   if (!show) { if (card) card.remove(); return; }
-  if (!card) { card = el('div'); card.id = 'welcome'; t.appendChild(card); }
+  if (!card) { card = el('div'); card.id = 'welcome'; appendToTranscript(t, card); }
   const rows = [['marlin', marlinVersion ? 'v' + marlinVersion : '', 'dim'], null,
     ['model', cur.model || '', 'v'], ['folder', displayCwd(cur.cwd), 'path'], null,
     ['prompt', 'type below and send', 'dim'],
@@ -1519,7 +1525,7 @@ function addBlock(b, target = $('#transcript'), live = true) {
       shown.appendChild(strip);
       if (b.seq) shown.dataset.seq = b.seq;
       const anchor = call ? (call.closest('.tool-group') || call) : null;
-      if (anchor) anchor.after(shown); else t.appendChild(shown);
+      if (anchor) anchor.after(shown); else appendToTranscript(t, shown);
       if (live) scrollBottom();
     }
     if (call) {
@@ -1559,7 +1565,7 @@ function addBlock(b, target = $('#transcript'), live = true) {
     const foldable = (kind === 'tool_call' && !node.classList.contains('question-record') &&
                       !node.classList.contains('message-out')) ||
       kind === 'tool_result' || kind === 'system_note' || kind === 'approval';
-    if (!foldable || !addToToolGroup(t, node, kind)) t.appendChild(node);
+    if (!foldable || !addToToolGroup(t, node, kind)) appendToTranscript(t, node);
     if (live) scrollBottom();
   }
 }
@@ -1723,14 +1729,14 @@ function handle(m) {
     }
   } else if (m.delta) {
     if (m.delta.sid !== sid) return;
-    if (!deltaEl) { deltaEl = el('div', 'block md'); $('#transcript').appendChild(deltaEl); }
+    if (!deltaEl) { deltaEl = el('div', 'block md'); appendToTranscript($('#transcript'), deltaEl); }
     // Opened mid-stream: the daemon sends all of it so far.
     if (m.delta.replace) deltaText = '';
     deltaText += m.delta.text;
     deltaEl.innerHTML = renderMd(deltaText);
   } else if (m.reasoning_delta) {
     if (m.reasoning_delta.sid !== sid) return;
-    if (!reasoningEl) { reasoningEl = el('div', 'block reasoning md'); $('#transcript').appendChild(reasoningEl); }
+    if (!reasoningEl) { reasoningEl = el('div', 'block reasoning md'); appendToTranscript($('#transcript'), reasoningEl); }
     if (m.reasoning_delta.replace) reasoningText = '';
     reasoningText += m.reasoning_delta.text;
     reasoningEl.innerHTML = renderMd(reasoningText);
@@ -1892,7 +1898,7 @@ function open(s) {
   approvalId = null;
   clearDelta();
   clearReasoning();
-  $('#transcript').replaceChildren($('#history-more'));
+  $('#transcript').replaceChildren($('#history-more'), $('#queue'));
   updateHistoryButton();
   $('#approval').classList.remove('show');
   hideQuestion();

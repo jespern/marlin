@@ -161,7 +161,8 @@ async function main() {
       const call=(id,command)=>addBlock({ts:now,body:{tool_call:{name:'Bash',call_id:id,args_json:JSON.stringify({command})}}});
       const result=(id,status='ok')=>addBlock({ts:now,body:{tool_result:{call_id:id,status,inline_body:'out'}}});
       call('c1','git status | head -3');
-      const g=t.lastElementChild;
+      const last=()=>$('#queue').previousElementSibling;
+      const g=last();
       const lone={single:g.classList.contains('single'),open:g.open,exe:g.querySelector('.sh-exe').textContent,op:g.querySelector('.sh-op').textContent};
       addBlock({ts:now,body:{system_note:{text:'Show status'}}});
       result('c1'); call('c2','zsh -lc "rg -n x src/"'); result('c2');
@@ -173,7 +174,7 @@ async function main() {
       const failed={summary:g.firstElementChild.textContent,open:g.open,callOpen:c3.open,marked:c3.classList.contains('err')};
       addBlock({ts:now,body:{assistant_msg:{text:'done'}}});
       call('c4','ls');
-      const next=t.lastElementChild!==g && t.lastElementChild.classList.contains('single');
+      const next=last()!==g && last().classList.contains('single');
       addBlock({ts:now,body:{reasoning:{text:'thinking'}}});
       const cs=sel=>getComputedStyle(t.querySelector(sel)).color;
       return {lone,folded,failed,next,reasoning:cs('.reasoning'),body:getComputedStyle(document.body).color,note:cs('.block.note')};
@@ -578,7 +579,7 @@ async function main() {
       ];
       for(const b of turn(901,9001)) addBlock(b);
       addBlock({seq:9005,turn_id:901,ts:0,body:{assistant_msg:{text:'A long reply the user does not need.'}}});
-      const folded=t.lastElementChild;
+      const folded=$('#queue').previousElementSibling;
       const out={rows:t.children.length-before,summary:folded.querySelector('summary').textContent,open:folded.open,
                  inside:folded.querySelector('.turn-body').textContent.includes('A long reply'),
                  reply:getComputedStyle(folded.querySelector('.replies .arrow')).color};
@@ -588,11 +589,40 @@ async function main() {
       addBlock({seq:9011,turn_id:902,ts:0,body:{steer:{text:'Not yet'}}});
       for(const b of rest) addBlock(b);
       out.unfolded=!t.querySelector('.agent-turn')&&[...t.children].some(n=>n.textContent.includes('Not yet'));
-      while(t.children.length>before) t.lastElementChild.remove();
+      while(t.children.length>before) $('#queue').previousElementSibling.remove();
       return out;
     });
     assert.deepEqual(agentTurns,{rows:1,summary:'← steward · 1a2b3c4d · Are you releasing? · → 1a2b3c4d',open:false,inside:true,
                                  reply:'rgb(196, 181, 253)',unfolded:true});
+    // Queued messages sit at the end of the transcript and scroll with it,
+    // as in the TUI: however long, they never cover a question or the
+    // composer (case: two long messages from other sessions filled the
+    // phone while its session waited on a question).
+    const queueRoom=await page.evaluate(async()=>{
+      const frame=()=>new Promise(r=>requestAnimationFrame(()=>r()));
+      const sent=[], realSend=window.send;
+      window.send=async raw=>{sent.push(JSON.parse(raw)); return {ok:{}};};
+      try {
+        const long='No. I ran no pkill, no sweep and no launchctl. '.repeat(14).trim();
+        addBlock({seq:0,ts:0,body:{assistant_msg:{text:'Before the queue'}}});
+        showQueue([{id:1,sent:true,input:{text:long,display_text:long,from:'postgres · 509b9325'}},
+                   {id:2,sent:true,input:{text:long}}]);
+        handle({question_request:{sid,question_id:'qq',question:'Ship it?',options:['Yes','No']}});
+        await frame();
+        const t=$('#transcript'), queue=$('#queue'), view=window.innerHeight;
+        const q=$('#question').getBoundingClientRect(), c=$('#composer').getBoundingClientRect();
+        const out={inTranscript:queue.parentNode===t&&queue.previousElementSibling.textContent==='Before the queue',
+                   question:q.height>0&&q.bottom<=c.top+1,composer:c.bottom<=view+1&&c.top<view,
+                   scrolls:t.scrollHeight>t.clientHeight,transcriptRoom:t.clientHeight>=100};
+        // New output goes above the queue.
+        addBlock({seq:0,ts:0,body:{assistant_msg:{text:'After the queue'}}});
+        out.stillLast=t.lastElementChild===queue&&queue.previousElementSibling.textContent==='After the queue';
+        document.querySelectorAll('#question .opts button')[0].click();
+        for(const n of [...t.querySelectorAll('.block.md')].filter(n=>/(Before|After) the queue/.test(n.textContent))) n.remove();
+        return out;
+      } finally { showQueue([]); window.send=realSend; }
+    });
+    assert.deepEqual(queueRoom,{inTranscript:true,question:true,composer:true,scrolls:true,transcriptRoom:true,stillLast:true});
     // Another session's queued message waits as one line (case: a few long
     // ones pinned above the composer filled the phone); a tap shows it all.
     const queuedMessage=await page.evaluate(()=>{
