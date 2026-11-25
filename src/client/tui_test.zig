@@ -556,6 +556,46 @@ test "model picker accepts priced and legacy catalogs" {
     try std.testing.expect(app.pricingForModel("openrouter/legacy/model") == null);
 }
 
+test "model picker refreshes an existing catalog and preserves selection" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+
+    // Seed an initial catalog (as if the picker was opened before the first agy session).
+    app.handleDaemonLine(try gpa.dupe(u8,
+        \\{"model_list_result":{"models":["agy/default","openrouter/example/model"]}}
+    ));
+    app.setModelStr("openrouter/example/model");
+
+    // Re-opening /model must still request model_list even though catalog is non-empty.
+    app.runCommand("/model");
+    try std.testing.expectEqual(PickerKind.model, app.picker_kind);
+    try std.testing.expectEqual(@as(?usize, 1), app.picker);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"model_list\"") != null);
+
+    // When the refreshed catalog arrives with newly discovered agy models ahead of the
+    // highlighted entry, keep the highlight on the same model.
+    app.handleDaemonLine(try gpa.dupe(u8,
+        \\{"model_list_result":{"models":["agy/default","agy/gemini-4-neon","openrouter/example/model"]}}
+    ));
+    try std.testing.expectEqual(@as(usize, 3), app.catalog.items.len);
+    try std.testing.expectEqualStrings("agy/gemini-4-neon", app.catalog.items[1]);
+    try std.testing.expectEqual(@as(?usize, 2), app.picker);
+
+    // If the highlighted model disappears on refresh, clamp within bounds.
+    app.handleDaemonLine(try gpa.dupe(u8,
+        \\{"model_list_result":{"models":["agy/default","agy/gemini-4-neon"]}}
+    ));
+    try std.testing.expectEqual(@as(?usize, 1), app.picker);
+}
+
 test "composer suggestions include commands, council actions, and council names" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -1140,10 +1180,15 @@ test "council list opens inspection before explicit editing" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
     var app = App{
         .gpa = gpa,
         .io = threaded.io(),
-        .conn = undefined,
+        .conn = &conn,
         .view = .{
             .sid = 1,
             .editor = Editor.init(gpa),
@@ -1182,16 +1227,22 @@ test "council list opens inspection before explicit editing" {
     try std.testing.expectEqual(PickerKind.council, app.picker_kind);
     try std.testing.expectEqualStrings("core", app.council_edit_name.items);
     try std.testing.expect(app.councilModelSelected("openrouter/example/model"));
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\"model_list\"") != null);
 }
 
 test "council picker reuses catalog with Done and checked multi-select seats" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &output.writer;
     var app = App{
         .gpa = gpa,
         .io = threaded.io(),
-        .conn = undefined,
+        .conn = &conn,
         .view = .{
             .sid = 1,
             .editor = Editor.init(gpa),

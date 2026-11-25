@@ -2734,6 +2734,19 @@ pub const App = struct {
             },
             .blob_result => |blob| self.blobArrived(blob.hash, blob.bytes),
             .model_list_result => |ml| {
+                const track_picker = self.picker != null and (self.picker_kind == .model or self.picker_kind == .council);
+                var picker_arena_state = std.heap.ArenaAllocator.init(self.gpa);
+                defer picker_arena_state.deinit();
+                const picker_arena = picker_arena_state.allocator();
+                var highlighted: ?[]u8 = null;
+                defer if (highlighted) |h| self.gpa.free(h);
+                if (track_picker) {
+                    const idx = self.picker.?;
+                    if (self.pickerItems(picker_arena)) |items| {
+                        if (idx < items.len) highlighted = self.gpa.dupe(u8, items[idx]) catch null;
+                    } else |_| {}
+                }
+
                 for (self.catalog.items) |old| self.gpa.free(old);
                 self.catalog.clearRetainingCapacity();
                 for (self.catalog_pricing.items) |old| self.gpa.free(old.model);
@@ -2750,6 +2763,25 @@ pub const App = struct {
                         .output_per_million = validCatalogRate(pricing.output_per_million),
                         .tiered = pricing.tiered,
                     }) catch self.gpa.free(model);
+                }
+
+                if (track_picker) {
+                    if (self.pickerItems(picker_arena)) |items| {
+                        if (items.len == 0) {
+                            self.picker = 0;
+                        } else if (highlighted) |wanted| {
+                            var matched: ?usize = null;
+                            for (items, 0..) |item, i| {
+                                if (std.mem.eql(u8, item, wanted)) {
+                                    matched = i;
+                                    break;
+                                }
+                            }
+                            self.picker = matched orelse @min(self.picker.?, items.len - 1);
+                        } else {
+                            self.picker = @min(self.picker.?, items.len - 1);
+                        }
+                    } else |_| {}
                 }
             },
             .setup_status_result => |status| self.applySetupStatus(status),
@@ -4815,7 +4847,7 @@ pub const App = struct {
             }
         }
         self.openPicker(.council);
-        if (self.catalog.items.len == 0) self.conn.send(.{ .model_list = .{} }) catch {};
+        self.conn.send(.{ .model_list = .{} }) catch {};
     }
 
     pub fn toggleCouncilModel(self: *App, model: []const u8) void {

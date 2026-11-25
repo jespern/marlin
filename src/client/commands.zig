@@ -499,11 +499,10 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
         const m = it.rest();
         if (m.len == 0) {
             self.openPicker(.model);
-            // Ask the daemon for the full catalog (async; picker shows
-            // favorites until the reply lands).
-            if (self.catalog.items.len == 0) {
-                self.conn.send(.{ .model_list = .{} }) catch {};
-            }
+            // Always ask the daemon for the current catalog (its remote list
+            // is cached for 1h, while local/guest models like agy_models are
+            // rebuilt fresh on each request).
+            self.conn.send(.{ .model_list = .{} }) catch {};
             return;
         }
         self.applyModel(m);
