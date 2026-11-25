@@ -57,6 +57,11 @@ test "the bridge is Marlin's own tools without approve, with what finds the daem
     try std.testing.expectEqualStrings(
         \\[{"name":"marlin","command":"/bin/marlin","args":["cc_approve","--sid","7","--no-approve"],"env":[{"name":"HOME","value":"/home/me"},{"name":"MARLIN_SOCKET","value":"/tmp/m.sock"}]}]
     , json);
+    const child_servers = try agy.mcpServers(arena, .{ .marlin_exe = "/bin/marlin", .sid = 8, .allow_tasks = false }, &environ);
+    const child_json = try std.json.Stringify.valueAlloc(arena, child_servers, .{});
+    try std.testing.expectEqualStrings(
+        \\[{"name":"marlin","command":"/bin/marlin","args":["cc_approve","--sid","8","--no-approve","--no-tasks"],"env":[{"name":"HOME","value":"/home/me"},{"name":"MARLIN_SOCKET","value":"/tmp/m.sock"}]}]
+    , child_json);
 }
 
 test "tool calls become Marlin tools with the arguments its transcript reads" {

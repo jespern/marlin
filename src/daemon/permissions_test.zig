@@ -164,8 +164,10 @@ test "cc bridge policy: reads auto, edits containment-checked, unknown asks" {
 
     // Unknown tools (MCP and future ones) always ask.
     try std.testing.expect(!ccAutoAllow(gpa, io, "/work/api", "mcp__x__y", "{}"));
-    // Except marlin's own picker, which is itself a question to the user.
+    // Except marlin's own picker and read-only child delegation tools.
     try std.testing.expect(ccAutoAllow(gpa, io, "/work/api", "mcp__marlin__ask_user", "{\"question\":\"?\"}"));
+    try std.testing.expect(ccAutoAllow(gpa, io, "/work/api", "mcp__marlin__task", "{\"prompt\":\"check\"}"));
+    try std.testing.expect(ccAutoAllow(gpa, io, "/work/api", "mcp__marlin__task_batch", "{\"tasks\":[]}"));
     try std.testing.expect(!ccAutoAllow(gpa, io, "/work/api", "mcp__marlin__approve", "{}"));
 }
 
@@ -255,6 +257,9 @@ test "secret collection and exact-value redaction" {
 test "guest child bridge policy: reads and searches only, nothing else" {
     const allowed = [_][]const u8{ "Read", "Glob", "Grep", "WebFetch", "TodoWrite" };
     for (allowed) |tool| try std.testing.expect(ccReadOnlyAllow(tool));
-    const denied = [_][]const u8{ "Bash", "Edit", "Write", "MultiEdit", "NotebookEdit", "Task", "mcp__x__y", "" };
+    const denied = [_][]const u8{
+        "Bash",              "Edit",                    "Write",     "MultiEdit", "NotebookEdit", "Task",
+        "mcp__marlin__task", "mcp__marlin__task_batch", "mcp__x__y", "",
+    };
     for (denied) |tool| try std.testing.expect(!ccReadOnlyAllow(tool));
 }

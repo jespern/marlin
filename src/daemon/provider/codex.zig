@@ -94,7 +94,7 @@ pub fn buildArgv(
     return buildArgvWithBridge(arena, environ, otel, null);
 }
 
-pub const Bridge = struct { marlin_exe: []const u8, sid: u64 };
+pub const Bridge = struct { marlin_exe: []const u8, sid: u64, allow_tasks: bool = true };
 
 pub fn buildArgvWithBridge(
     arena: std.mem.Allocator,
@@ -115,9 +115,14 @@ pub fn buildArgvWithBridge(
         var config: std.ArrayList(u8) = .empty;
         try config.appendSlice(arena, "mcp_servers.marlin={ command = ");
         try appendTomlString(arena, &config, target.marlin_exe);
+        const args_tail: []const u8 = if (target.allow_tasks) "" else ", \"--no-tasks\"";
+        const tools_list: []const u8 = if (target.allow_tasks)
+            "\"ask_user\", \"show_image\", \"sessions\", \"read_session\", \"message_session\", \"wait_for_session\", \"task\", \"task_batch\""
+        else
+            "\"ask_user\", \"show_image\", \"sessions\", \"read_session\", \"message_session\", \"wait_for_session\"";
         try config.appendSlice(arena, try std.fmt.allocPrint(arena,
-            \\, args = ["cc_approve", "--sid", "{d}"], enabled = true, required = true, enabled_tools = ["ask_user", "show_image", "sessions", "read_session", "message_session", "wait_for_session"], disabled_tools = [], tool_timeout_sec = 604800, env_vars = ["HOME", "MARLIN_SOCKET", "XDG_RUNTIME_DIR"] }}
-        , .{target.sid}));
+            \\, args = ["cc_approve", "--sid", "{d}"{s}], enabled = true, required = true, enabled_tools = [{s}], disabled_tools = [], tool_timeout_sec = 604800, env_vars = ["HOME", "MARLIN_SOCKET", "XDG_RUNTIME_DIR"] }}
+        , .{ target.sid, args_tail, tools_list }));
         try argv.appendSlice(arena, &.{ "-c", config.items });
     }
     try argv.appendSlice(arena, &.{ "app-server", "--listen", "stdio://" });

@@ -2992,8 +2992,12 @@ pub fn toolDisplayName(tool_name: []const u8) []const u8 {
     if (std.ascii.eqlIgnoreCase(tool_name, "glob")) return "Glob";
     if (std.ascii.eqlIgnoreCase(tool_name, "fetch") or std.ascii.eqlIgnoreCase(tool_name, "webfetch")) return "Fetch";
     if (std.ascii.eqlIgnoreCase(tool_name, "websearch")) return "Search";
-    if (std.ascii.eqlIgnoreCase(tool_name, "task")) return "Task";
-    if (std.mem.eql(u8, tool_name, "task_batch")) return "Tasks";
+    if (std.ascii.eqlIgnoreCase(tool_name, "task") or
+        std.mem.eql(u8, tool_name, "mcp__marlin__task") or
+        std.mem.eql(u8, tool_name, "MCP marlin/task")) return "Task";
+    if (std.mem.eql(u8, tool_name, "task_batch") or
+        std.mem.eql(u8, tool_name, "mcp__marlin__task_batch") or
+        std.mem.eql(u8, tool_name, "MCP marlin/task_batch")) return "Tasks";
     if (std.mem.eql(u8, tool_name, "plan_update")) return "Plan";
     return tool_name;
 }

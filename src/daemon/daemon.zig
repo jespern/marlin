@@ -129,7 +129,7 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 
 const ChildStart = struct {
     parent_sid: u64,
-    parent_block_id: u64,
+    parent_block_id: ?u64,
     prompt: []u8,
     model: ?[]u8,
     effort: ?proto.ReasoningEffort,
@@ -439,6 +439,34 @@ const AgentReply = union(enum) {
 const AgentWait = struct { caller: u64, target: u64, reply: AgentReply };
 const AgentResult = struct { text: []const u8, status: block.ToolStatus = .ok, parked: bool = false };
 
+const BridgeTaskSlot = struct {
+    done: bool = false,
+    output: ?[]u8 = null,
+    status: block.ToolStatus = .ok,
+};
+
+/// One parked `task` or `task_batch` call from a guest session's MCP bridge.
+/// Dispatcher-owned: created in runBridgeTask, filled as children complete,
+/// replied and freed when `remaining` reaches zero (or dropped on disconnect).
+const BridgeTaskBatch = struct {
+    caller_sid: u64,
+    reply: AgentReply,
+    is_batch: bool,
+    slots: []BridgeTaskSlot,
+    remaining: usize,
+
+    pub fn deinit(self: *BridgeTaskBatch, gpa: std.mem.Allocator) void {
+        for (self.slots) |slot| if (slot.output) |output| gpa.free(output);
+        gpa.free(self.slots);
+        gpa.destroy(self);
+    }
+};
+
+const TaskWaiter = union(enum) {
+    future: *TaskFuture,
+    bridge: struct { batch: *BridgeTaskBatch, index: usize },
+};
+
 /// A Claude Code permission prompt parked on the approval bar, keyed by the
 /// same approval_id namespace the native gate uses so `approve` answers both.
 const CcPending = struct { approval_id: u64, client_id: u64 };
@@ -569,7 +597,7 @@ pub const Session = struct {
     steer_accepting: bool = false,
     steer_mutex: Io.Mutex = .init,
     /// Non-null only while a task child is running for a parked parent call.
-    task_waiter: ?*TaskFuture = null,
+    task_waiter: ?TaskWaiter = null,
     /// session_kill releases the in-memory object after its active turn has
     /// acknowledged cancellation. Durable state remains reloadable.
     evict_when_idle: bool = false,
@@ -658,6 +686,9 @@ pub const Daemon = struct {
     /// Agents waiting on another session's turn (wait_for_session).
     /// Dispatcher-owned.
     agent_waits: std.ArrayList(AgentWait) = .empty,
+    /// Guest MCP bridge `task` / `task_batch` calls waiting on child turns.
+    /// Dispatcher-owned.
+    bridge_tasks: std.ArrayList(*BridgeTaskBatch) = .empty,
     /// Held while any session is running a turn (macOS: prevents idle system
     /// sleep; elsewhere a no-op). Dispatcher-owned, synced after every event.
     sleep_assertion: power.SleepAssertion = .{},
@@ -1635,6 +1666,7 @@ pub const Daemon = struct {
             .client_gone => |cg| {
                 _ = self.presence.update(self.io, .terminal, cg.client_id, 0, false, nowMs(self.io));
                 self.dropClientAgentWaits(cg.client_id);
+                self.dropClientBridgeTasks(cg.client_id);
                 // A reboot request belongs to its waiting client. If that
                 // client times out or exits before the daemon can acknowledge
                 // quiescence, cancel the pending reboot instead of surprising
@@ -2056,7 +2088,7 @@ pub const Daemon = struct {
                 if (!paused and !continued and !td.interrupted) self.needsUser(td.sid, false, terminal_error);
                 // A child is an ordinary durable session plus this one-shot
                 // rendezvous back to the parent tool call.
-                if (session.task_waiter) |future| {
+                if (session.task_waiter) |waiter| {
                     session.task_waiter = null;
                     const outcome_status: block.ToolStatus = if (paused or td.interrupted)
                         .interrupted
@@ -2075,8 +2107,17 @@ pub const Daemon = struct {
                         .final_text = td.final_text orelse "",
                         .error_message = td.err_text,
                     }, .{}) catch self.gpa.dupe(u8, "error: could not encode child result") catch @panic("oom");
-                    const result_delivered = future.resolve(self.io, result_json, outcome_status);
-                    if (!result_delivered) self.gpa.free(result_json);
+                    const result_delivered = switch (waiter) {
+                        .future => |future| blk: {
+                            const delivered = future.resolve(self.io, result_json, outcome_status);
+                            if (!delivered) self.gpa.free(result_json);
+                            break :blk delivered;
+                        },
+                        .bridge => |b| blk: {
+                            self.resolveBridgeTaskSlot(b.batch, b.index, result_json, outcome_status);
+                            break :blk true;
+                        },
+                    };
                     if (result_delivered and !paused and shouldAutoArchiveChild(session.kind, td.interrupted, td.err_text)) {
                         if (self.store.setSessionTreeArchived(td.sid, nowMs(self.io))) |_| {
                             session.archived = true;
@@ -4760,18 +4801,39 @@ pub const Daemon = struct {
         self.gpa.destroy(session);
     }
 
-    /// Dispatcher-only child creation. The caller is a parent turn thread,
-    /// but it reaches this function solely through Event.child_start.
+    /// Dispatcher-only child creation. Native turns reach this through
+    /// Event.child_start; guest MCP bridges call startChildWithWaiter directly.
     fn startChild(self: *Daemon, cs: ChildStart) !void {
-        const parent = self.sessions.get(cs.parent_sid) orelse return error.ParentSessionMissing;
+        return self.startChildWithWaiter(
+            cs.parent_sid,
+            cs.parent_block_id,
+            cs.prompt,
+            cs.model,
+            cs.effort,
+            cs.max_rounds,
+            .{ .future = cs.future },
+        );
+    }
+
+    fn startChildWithWaiter(
+        self: *Daemon,
+        parent_sid: u64,
+        parent_block_id: ?u64,
+        prompt: []const u8,
+        requested_model: ?[]const u8,
+        requested_effort: ?proto.ReasoningEffort,
+        max_rounds: u32,
+        waiter: TaskWaiter,
+    ) !void {
+        const parent = self.sessions.get(parent_sid) orelse return error.ParentSessionMissing;
         if (parent.kind != .root) return error.NestedTaskDenied;
         if (parent.archived) return error.ParentSessionArchived;
         if (parent.cancel.load(.acquire) or parent.pause_requested.load(.acquire)) return error.Cancelled;
 
         const sid = ids.next(self.io);
-        const model_src = cs.model orelse parent.model;
-        const effort = cs.effort orelse parent.effort;
-        const title = taskTitle(cs.prompt);
+        const model_src = requested_model orelse parent.model;
+        const effort = requested_effort orelse parent.effort;
+        const title = taskTitle(prompt);
 
         const session = try self.gpa.create(Session);
         var session_transferred = false;
@@ -4784,15 +4846,15 @@ pub const Daemon = struct {
             .id = sid,
             .parent_sid = parent.id,
             .kind = .task_child,
-            .parent_block_id = cs.parent_block_id,
-            .max_rounds = cs.max_rounds,
+            .parent_block_id = parent_block_id,
+            .max_rounds = max_rounds,
             .model = model,
             .effort = effort,
             .cwd = cwd,
             .approval_mode = .default,
             .sandbox_enabled = parent.sandbox_enabled,
             .network_filtering_enabled = parent.network_filtering_enabled,
-            .task_waiter = cs.future,
+            .task_waiter = waiter,
         };
 
         // As with root creation, reserve the map slot before the durable
@@ -4802,19 +4864,19 @@ pub const Daemon = struct {
             sid,
             nowMs(self.io),
             parent.id,
-            cs.parent_block_id,
+            parent_block_id,
             title,
             parent.cwd,
             model_src,
             effort,
-            cs.max_rounds,
+            max_rounds,
         );
         self.sessions.putAssumeCapacityNoClobber(sid, session);
         session_transferred = true;
         // Structural catalog change: publish the new child once. Subsequent
         // state changes use the compact status watcher path.
         self.broadcastSessionUpsert(sid);
-        self.startTurn(session, cs.prompt, &.{}) catch |e| {
+        self.startTurn(session, prompt, &.{}) catch |e| {
             session.task_waiter = null;
             session.state = .err;
             self.store.setSessionStatus(sid, "err") catch {};
@@ -4822,6 +4884,43 @@ pub const Daemon = struct {
             self.broadcastStatusErr(sid, .err, std.fmt.bufPrint(&err_buf, "failed to start turn: {t}", .{e}) catch "failed to start turn");
             return e;
         };
+    }
+
+    const ResolvedTaskModel = union(enum) {
+        ok: []u8,
+        err: []u8,
+    };
+
+    /// Validate a requested child task model BEFORE creating the child: an
+    /// unresolvable model would otherwise die pre-loop and leave a blank
+    /// err-state session behind. Provider-native ids returned by APIs (for
+    /// example openai/gpt-5.2) inherit the parent's gateway when it has one.
+    fn resolveTaskModel(self: *Daemon, parent_model: []const u8, requested: []const u8) ResolvedTaskModel {
+        if (requested.len == 0)
+            return .{ .err = self.gpa.dupe(u8, "error: task model must not be empty") catch @panic("oom") };
+        if (registry.resolve(self.gpa, self.environ, self.cfg, requested)) |probe| {
+            probe.deinit(self.gpa);
+            return .{ .ok = self.gpa.dupe(u8, requested) catch return .{ .err = self.gpa.dupe(u8, "error: out of memory") catch @panic("oom") } };
+        } else |direct_err| {
+            const qualified = task_tool.qualifyModel(self.gpa, parent_model, requested) catch |err| switch (err) {
+                error.OutOfMemory => return .{ .err = self.gpa.dupe(u8, "error: out of memory") catch @panic("oom") },
+                error.InvalidModel, error.NoParentGateway => null,
+            };
+            if (qualified) |candidate| {
+                if (registry.resolve(self.gpa, self.environ, self.cfg, candidate)) |probe| {
+                    probe.deinit(self.gpa);
+                    return .{ .ok = candidate };
+                } else |_| {
+                    self.gpa.free(candidate);
+                }
+            }
+            const msg = std.fmt.allocPrint(
+                self.gpa,
+                "error: task model '{s}' is not resolvable ({t}); use a full registry id like 'openrouter/{s}' or omit model to inherit this session's",
+                .{ requested, direct_err, requested },
+            ) catch return .{ .err = self.gpa.dupe(u8, "error: out of memory") catch @panic("oom") };
+            return .{ .err = msg };
+        }
     }
 
     // ------------------------------------------------------------- turns --
@@ -5803,38 +5902,11 @@ pub const Daemon = struct {
             if (args.max_rounds == 0 or args.max_rounds > 32)
                 return taskError(self.gpa, "task max_rounds must be between 1 and 32");
 
-            // Validate a requested model BEFORE creating the child: an
-            // unresolvable model would otherwise die pre-loop and leave a
-            // blank err-state session behind. Provider-native ids returned by
-            // APIs (for example openai/gpt-5.2) inherit the parent's gateway.
             var model: ?[]u8 = null;
             if (args.model) |requested| {
-                if (requested.len == 0) return taskError(self.gpa, "task model must not be empty");
-                if (registry.resolve(self.gpa, self.environ, self.cfg, requested)) |probe| {
-                    probe.deinit(self.gpa);
-                    model = self.gpa.dupe(u8, requested) catch return taskError(self.gpa, "out of memory");
-                } else |direct_err| {
-                    const qualified = task_tool.qualifyModel(self.gpa, job.model, requested) catch |err| switch (err) {
-                        error.OutOfMemory => return taskError(self.gpa, "out of memory"),
-                        error.InvalidModel, error.NoParentGateway => null,
-                    };
-                    if (qualified) |candidate| {
-                        if (registry.resolve(self.gpa, self.environ, self.cfg, candidate)) |probe| {
-                            probe.deinit(self.gpa);
-                            model = candidate;
-                        } else |_| {
-                            self.gpa.free(candidate);
-                        }
-                    }
-                    if (model == null) {
-                        const msg = std.fmt.allocPrint(
-                            self.gpa,
-                            "task model '{s}' is not resolvable ({t}); use a full registry id like 'openrouter/{s}' or omit model to inherit this session's",
-                            .{ requested, direct_err, requested },
-                        ) catch return taskError(self.gpa, "out of memory");
-                        defer self.gpa.free(msg);
-                        return taskError(self.gpa, msg);
-                    }
+                switch (self.resolveTaskModel(job.model, requested)) {
+                    .ok => |resolved| model = resolved,
+                    .err => |msg| return .{ .output = msg, .status = .err },
                 }
             }
 
@@ -6362,6 +6434,7 @@ pub const Daemon = struct {
     const AgentPeer = struct { sid: u64, handle: []const u8, title: []const u8, model: []const u8, cwd: []const u8, state: proto.SessionState, parent: bool };
 
     fn runAgentTool(self: *Daemon, arena: std.mem.Allocator, caller_sid: u64, outside: []const u8, name: []const u8, args_json: []const u8, reply: AgentReply) !AgentResult {
+        if (task_tool.isTool(name)) return self.runBridgeTask(arena, caller_sid, name, args_json, reply);
         const from_outside = caller_sid == 0;
         if (from_outside and outside.len == 0) return .{ .text = "error: name the caller", .status = .err };
         // Answering prompts and reading the log are for the user's own
@@ -6667,6 +6740,241 @@ pub const Daemon = struct {
             const w = self.agent_waits.items[i];
             if (w.reply == .client and w.reply.client.client_id == client_id) {
                 _ = self.agent_waits.orderedRemove(i);
+            } else i += 1;
+        }
+    }
+
+    /// Bridged `task` / `task_batch` from a guest session's MCP server: spawn
+    /// durable read-only child session(s) on the dispatcher and park until all
+    /// complete, matching native TurnHooks.onTask / loop.runTaskBatch.
+    fn runBridgeTask(
+        self: *Daemon,
+        arena: std.mem.Allocator,
+        caller_sid: u64,
+        name: []const u8,
+        args_json: []const u8,
+        reply: AgentReply,
+    ) !AgentResult {
+        if (caller_sid == 0) return .{ .text = "error: task is only available inside a session", .status = .err };
+        const parent = (try self.getOrLoadSession(caller_sid)) orelse
+            return .{ .text = "error: parent session is not active", .status = .err };
+        if (parent.kind != .root) return .{ .text = "error: nested task calls are disabled", .status = .err };
+        if (parent.archived) return .{ .text = "error: parent session is archived", .status = .err };
+        if (parent.cancel.load(.acquire) or parent.pause_requested.load(.acquire))
+            return .{ .text = "error: cancelled", .status = .interrupted };
+
+        const is_batch = std.mem.eql(u8, name, task_tool.batch_spec_name);
+        if (!is_batch) {
+            const args = std.json.parseFromSliceLeaky(task_tool.Args, arena, args_json, .{
+                .ignore_unknown_fields = false,
+            }) catch return .{ .text = "error: task arguments do not match the schema", .status = .err };
+            if (std.mem.trim(u8, args.prompt, " \t\r\n").len == 0)
+                return .{ .text = "error: task prompt must not be empty", .status = .err };
+            if (args.max_rounds == 0 or args.max_rounds > 32)
+                return .{ .text = "error: task max_rounds must be between 1 and 32", .status = .err };
+            var model: ?[]u8 = null;
+            defer if (model) |m| self.gpa.free(m);
+            if (args.model) |requested| {
+                switch (self.resolveTaskModel(parent.model, requested)) {
+                    .ok => |resolved| model = resolved,
+                    .err => |msg| {
+                        defer self.gpa.free(msg);
+                        return .{ .text = try arena.dupe(u8, msg), .status = .err };
+                    },
+                }
+            }
+            try self.bridge_tasks.ensureUnusedCapacity(self.gpa, 1);
+            const batch = try self.gpa.create(BridgeTaskBatch);
+            const slots = self.gpa.alloc(BridgeTaskSlot, 1) catch |err| {
+                self.gpa.destroy(batch);
+                return err;
+            };
+            slots[0] = .{};
+            batch.* = .{
+                .caller_sid = caller_sid,
+                .reply = reply,
+                .is_batch = false,
+                .slots = slots,
+                .remaining = 1,
+            };
+            self.startChildWithWaiter(
+                caller_sid,
+                null,
+                args.prompt,
+                model,
+                args.effort,
+                args.max_rounds,
+                .{ .bridge = .{ .batch = batch, .index = 0 } },
+            ) catch |e| {
+                batch.deinit(self.gpa);
+                return .{ .text = try std.fmt.allocPrint(arena, "error: could not start child session: {t}", .{e}), .status = .err };
+            };
+            self.bridge_tasks.appendAssumeCapacity(batch);
+            return .{ .text = "", .parked = true };
+        }
+
+        const parsed = std.json.parseFromSliceLeaky(task_tool.BatchArgs, arena, args_json, .{
+            .ignore_unknown_fields = false,
+        }) catch return .{ .text = "error: task_batch arguments do not match the schema", .status = .err };
+        if (parsed.tasks.len < 2 or parsed.tasks.len > task_tool.max_batch_tasks)
+            return .{ .text = "error: task_batch requires between two and eight tasks", .status = .err };
+
+        try self.bridge_tasks.ensureUnusedCapacity(self.gpa, 1);
+        const batch = try self.gpa.create(BridgeTaskBatch);
+        const slots = self.gpa.alloc(BridgeTaskSlot, parsed.tasks.len) catch |err| {
+            self.gpa.destroy(batch);
+            return err;
+        };
+        @memset(slots, .{});
+        batch.* = .{
+            .caller_sid = caller_sid,
+            .reply = reply,
+            .is_batch = true,
+            .slots = slots,
+            .remaining = parsed.tasks.len,
+        };
+
+        for (parsed.tasks, 0..) |args, index| {
+            if (std.mem.trim(u8, args.prompt, " \t\r\n").len == 0) {
+                batch.slots[index] = .{
+                    .done = true,
+                    .output = self.gpa.dupe(u8, "error: task prompt must not be empty") catch @panic("oom"),
+                    .status = .err,
+                };
+                batch.remaining -= 1;
+                continue;
+            }
+            if (args.max_rounds == 0 or args.max_rounds > 32) {
+                batch.slots[index] = .{
+                    .done = true,
+                    .output = self.gpa.dupe(u8, "error: task max_rounds must be between 1 and 32") catch @panic("oom"),
+                    .status = .err,
+                };
+                batch.remaining -= 1;
+                continue;
+            }
+            var model: ?[]u8 = null;
+            defer if (model) |m| self.gpa.free(m);
+            if (args.model) |requested| {
+                switch (self.resolveTaskModel(parent.model, requested)) {
+                    .ok => |resolved| model = resolved,
+                    .err => |msg| {
+                        batch.slots[index] = .{ .done = true, .output = msg, .status = .err };
+                        batch.remaining -= 1;
+                        continue;
+                    },
+                }
+            }
+            self.startChildWithWaiter(
+                caller_sid,
+                null,
+                args.prompt,
+                model,
+                args.effort,
+                args.max_rounds,
+                .{ .bridge = .{ .batch = batch, .index = index } },
+            ) catch |e| {
+                batch.slots[index] = .{
+                    .done = true,
+                    .output = std.fmt.allocPrint(self.gpa, "error: could not start child session: {t}", .{e}) catch @panic("oom"),
+                    .status = .err,
+                };
+                batch.remaining -= 1;
+            };
+        }
+
+        if (batch.remaining == 0) {
+            defer batch.deinit(self.gpa);
+            const formatted = self.formatBridgeTaskBatch(batch);
+            defer if (formatted.owned) self.gpa.free(formatted.output);
+            return .{ .text = try arena.dupe(u8, formatted.output), .status = formatted.status };
+        }
+        self.bridge_tasks.appendAssumeCapacity(batch);
+        return .{ .text = "", .parked = true };
+    }
+
+    const FormattedBatch = struct { output: []const u8, status: block.ToolStatus, owned: bool };
+
+    fn formatBridgeTaskBatch(self: *Daemon, batch: *const BridgeTaskBatch) FormattedBatch {
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const BatchResult = struct {
+            index: usize,
+            status: []const u8,
+            result: std.json.Value,
+        };
+        const results = arena.alloc(BatchResult, batch.slots.len) catch
+            return .{ .output = "error: task_batch out of memory", .status = .err, .owned = false };
+        var overall_status: block.ToolStatus = .ok;
+        for (batch.slots, results, 0..) |slot, *result, index| {
+            const text = slot.output orelse "";
+            if (slot.status == .interrupted) overall_status = .interrupted;
+            result.* = .{
+                .index = index,
+                .status = @tagName(slot.status),
+                .result = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch .{ .string = text },
+            };
+        }
+        const output = std.json.Stringify.valueAlloc(self.gpa, .{ .results = results }, .{}) catch
+            return .{ .output = "error: task_batch could not encode results", .status = .err, .owned = false };
+        return .{ .output = output, .status = overall_status, .owned = true };
+    }
+
+    fn resolveBridgeTaskSlot(
+        self: *Daemon,
+        batch: *BridgeTaskBatch,
+        index: usize,
+        result_json: []u8,
+        outcome_status: block.ToolStatus,
+    ) void {
+        const slot = &batch.slots[index];
+        if (slot.done) {
+            self.gpa.free(result_json);
+            return;
+        }
+        slot.done = true;
+        slot.output = result_json;
+        slot.status = outcome_status;
+        batch.remaining -= 1;
+        if (batch.remaining > 0) return;
+
+        for (self.bridge_tasks.items, 0..) |entry, i| {
+            if (entry == batch) {
+                _ = self.bridge_tasks.orderedRemove(i);
+                break;
+            }
+        }
+        defer batch.deinit(self.gpa);
+        if (!batch.is_batch) {
+            self.finishAgentTool(batch.reply, batch.slots[0].output orelse "", batch.slots[0].status);
+            return;
+        }
+        const formatted = self.formatBridgeTaskBatch(batch);
+        defer if (formatted.owned) self.gpa.free(formatted.output);
+        self.finishAgentTool(batch.reply, formatted.output, formatted.status);
+    }
+
+    /// A bridge connection went away mid-task: cancel orphaned children and
+    /// release the parked batch so no turn hangs or leaks.
+    fn dropClientBridgeTasks(self: *Daemon, client_id: u64) void {
+        var i: usize = 0;
+        while (i < self.bridge_tasks.items.len) {
+            const batch = self.bridge_tasks.items[i];
+            if (batch.reply == .client and batch.reply.client.client_id == client_id) {
+                _ = self.bridge_tasks.orderedRemove(i);
+                var sit = self.sessions.valueIterator();
+                while (sit.next()) |sp| {
+                    const session = sp.*;
+                    if (session.task_waiter) |waiter| switch (waiter) {
+                        .bridge => |b| if (b.batch == batch) {
+                            session.task_waiter = null;
+                            cancelActiveSession(self, session);
+                        },
+                        .future => {},
+                    };
+                }
+                batch.deinit(self.gpa);
             } else i += 1;
         }
     }
@@ -7918,9 +8226,22 @@ pub const Daemon = struct {
         }
         self.shells.deinit(self.gpa);
         self.shells = .empty;
-        // Nobody is left to answer: parked native turns get told.
+        // Nobody is left to answer: parked native turns and bridge tasks get told.
         while (self.agent_waits.pop()) |w| self.finishAgentTool(w.reply, "error: Marlin is shutting down", .err);
         self.agent_waits.deinit(self.gpa);
+        {
+            var bit = self.sessions.valueIterator();
+            while (bit.next()) |sp| {
+                if (sp.*.task_waiter) |w| if (w == .bridge) {
+                    sp.*.task_waiter = null;
+                };
+            }
+            while (self.bridge_tasks.pop()) |batch| {
+                self.finishAgentTool(batch.reply, "error: child interrupted by daemon shutdown", .interrupted);
+                batch.deinit(self.gpa);
+            }
+            self.bridge_tasks.deinit(self.gpa);
+        }
         for (self.mcp_stale.items) |name| self.gpa.free(name);
         self.mcp_stale.deinit(self.gpa);
         if (self.web_service) |service| service.stop();
@@ -7985,10 +8306,15 @@ pub const Daemon = struct {
         while (cancel_it.next()) |sp| {
             const session = sp.*;
             cancelActiveSession(self, session);
-            if (session.task_waiter) |future| {
+            if (session.task_waiter) |waiter| {
                 session.task_waiter = null;
-                const output = self.gpa.dupe(u8, "error: child interrupted by daemon shutdown") catch continue;
-                if (!future.resolve(self.io, output, .interrupted)) self.gpa.free(output);
+                switch (waiter) {
+                    .future => |future| {
+                        const output = self.gpa.dupe(u8, "error: child interrupted by daemon shutdown") catch continue;
+                        if (!future.resolve(self.io, output, .interrupted)) self.gpa.free(output);
+                    },
+                    .bridge => {},
+                }
             }
         }
 
@@ -8760,6 +9086,7 @@ test "a dying bridge client unparks its session's parked cc approval" {
     daemon.presence = .{};
     daemon.shells = .empty;
     daemon.agent_waits = .empty;
+    daemon.bridge_tasks = .empty;
     defer daemon.clients.deinit(gpa);
     daemon.sessions = .empty;
     defer daemon.sessions.deinit(gpa);
@@ -8813,6 +9140,7 @@ test "a /permissions grant survives the unload/rehydrate cycle" {
     daemon.presence = .{};
     daemon.shells = .empty;
     daemon.agent_waits = .empty;
+    daemon.bridge_tasks = .empty;
     defer daemon.clients.deinit(gpa);
     daemon.sessions = .empty;
     defer daemon.sessions.deinit(gpa);
@@ -8863,6 +9191,7 @@ test "a disconnected requester cannot leave a delayed reboot armed" {
     daemon.presence = .{};
     daemon.shells = .empty;
     daemon.agent_waits = .empty;
+    daemon.bridge_tasks = .empty;
     defer daemon.clients.deinit(gpa);
     daemon.sessions = .empty;
     defer daemon.sessions.deinit(gpa);

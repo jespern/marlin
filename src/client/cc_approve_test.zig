@@ -152,7 +152,7 @@ test "bridge: the tools for other sessions are listed and forwarded, failures fl
         \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
     , decider).?;
     defer gpa.free(listed);
-    for ([_][]const u8{ "\"approve\"", "\"ask_user\"", "\"sessions\"", "\"read_session\"", "\"message_session\"", "\"wait_for_session\"" }) |name|
+    for ([_][]const u8{ "\"approve\"", "\"ask_user\"", "\"sessions\"", "\"read_session\"", "\"message_session\"", "\"wait_for_session\"", "\"task\"", "\"task_batch\"" }) |name|
         try std.testing.expect(std.mem.indexOf(u8, listed, name) != null);
     // Without a daemon behind it, the bridge offers only what it had.
     const bare = handleLine(gpa,
@@ -160,6 +160,30 @@ test "bridge: the tools for other sessions are listed and forwarded, failures fl
     , Decider{ .decide = Probe.decide }).?;
     defer gpa.free(bare);
     try std.testing.expect(std.mem.indexOf(u8, bare, "message_session") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bare, "\"task\"") == null);
+
+    // Child bridges (--no-tasks) omit task and task_batch and reject calls.
+    const child_decider = Decider{ .decide = Probe.decide, .agent_tool = Probe.agent, .tasks = false };
+    const child_listed = handleLine(gpa,
+        \\{"jsonrpc":"2.0","id":11,"method":"tools/list"}
+    , child_decider).?;
+    defer gpa.free(child_listed);
+    try std.testing.expect(std.mem.indexOf(u8, child_listed, "\"task\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, child_listed, "\"task_batch\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, child_listed, "\"sessions\"") != null);
+    const child_task = handleLine(gpa,
+        \\{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"task","arguments":{"prompt":"hi"}}}
+    , child_decider).?;
+    defer gpa.free(child_task);
+    try std.testing.expect(std.mem.indexOf(u8, child_task, "unknown tool") != null);
+
+    // Root bridge forwards task_batch through agent_tool.
+    const batch_reply = handleLine(gpa,
+        \\{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"task_batch","arguments":{"tasks":[{"prompt":"a"},{"prompt":"b"}]}}}
+    , decider).?;
+    defer gpa.free(batch_reply);
+    try std.testing.expectEqualStrings("task_batch", Probe.name_buf[0..Probe.name_len]);
+    try std.testing.expect(std.mem.indexOf(u8, batch_reply, "\"isError\":false") != null);
 
     const reply = handleLine(gpa,
         \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"message_session","arguments":{"handle":"ab12","text":"hi"}}}

@@ -197,6 +197,7 @@ test "shells outlive their opener and are shared by every viewer" {
     defer daemon.sessions.deinit(gpa);
     daemon.shells = .empty;
     daemon.agent_waits = .empty;
+    daemon.bridge_tasks = .empty;
     daemon.next_shell_id = 1;
     daemon.store = try store.Store.open(gpa, null);
     defer daemon.store.close();
@@ -410,6 +411,7 @@ const ShellRig = struct {
             .sessions = .empty,
             .shells = .empty,
             .agent_waits = .empty,
+            .bridge_tasks = .empty,
             .next_shell_id = 1,
             .store = try store.Store.open(gpa, null),
             .cfg = .{},
@@ -458,6 +460,8 @@ const ShellRig = struct {
         r.daemon.clients.deinit(gpa);
         r.daemon.sessions.deinit(gpa);
         r.daemon.agent_waits.deinit(gpa);
+        for (r.daemon.bridge_tasks.items) |batch| batch.deinit(gpa);
+        r.daemon.bridge_tasks.deinit(gpa);
         for (r.daemon.mcp_stale.items) |name| gpa.free(name);
         r.daemon.mcp_stale.deinit(gpa);
         r.session.live_text.deinit(gpa);
@@ -1355,4 +1359,88 @@ test "/group keeps each group where its first tab was and tabs in order within i
         &.{ "robin", "marlin", "robin", "/tmp", "marlin", "robin" },
     );
     try std.testing.expectEqualSlices(u64, &.{ 1, 3, 6, 2, 5, 4 }, order);
+}
+
+test "guest MCP bridge task and task_batch validate callers, reject nesting, and aggregate batch errors" {
+    const r = try ShellRig.create();
+    defer r.destroy();
+    const gpa = r.gpa;
+
+    const Call = struct {
+        fn send(rig: *ShellRig, caller: u64, request_id: u64, name: []const u8, args: anytype) !void {
+            const args_json = try std.json.Stringify.valueAlloc(rig.gpa, args, .{});
+            defer rig.gpa.free(args_json);
+            const msg = try std.json.Stringify.valueAlloc(rig.gpa, .{ .agent_tool = .{
+                .request_id = request_id,
+                .sid = caller,
+                .name = name,
+                .args_json = args_json,
+            } }, .{});
+            defer rig.gpa.free(msg);
+            try rig.send(1, "{s}", .{msg});
+        }
+        fn result(rig: *ShellRig, id: u64) !@FieldType(proto.DaemonMsg, "agent_tool_result") {
+            for (try rig.drain(1)) |msg| if (msg == .agent_tool_result and msg.agent_tool_result.request_id == id) return msg.agent_tool_result;
+            return error.NoResult;
+        }
+    };
+
+    // Outside callers (sid 0) cannot spawn child tasks.
+    try Call.send(r, 0, 1, "task", .{ .prompt = "inspect" });
+    const outside = try Call.result(r, 1);
+    try std.testing.expectEqual(block_mod.ToolStatus.err, outside.status);
+    try std.testing.expect(std.mem.indexOf(u8, outside.output, "inside a session") != null);
+
+    // Child sessions cannot spawn nested tasks even if they bypass --no-tasks.
+    try r.daemon.store.createChildSession(8, 0, 7, null, "child", "/", "m", .auto, 8);
+    var child = daemon_mod.Session{
+        .id = 8,
+        .parent_sid = 7,
+        .kind = .task_child,
+        .model = try gpa.dupe(u8, "m"),
+        .cwd = try gpa.dupe(u8, "/"),
+    };
+    defer {
+        _ = r.daemon.sessions.remove(8);
+        gpa.free(child.model);
+        gpa.free(child.cwd);
+    }
+    try r.daemon.sessions.put(gpa, 8, &child);
+    try Call.send(r, 8, 2, "task", .{ .prompt = "nested" });
+    const nested = try Call.result(r, 2);
+    try std.testing.expectEqual(block_mod.ToolStatus.err, nested.status);
+    try std.testing.expect(std.mem.indexOf(u8, nested.output, "nested task calls are disabled") != null);
+
+    // Nullable parent_block_id persists cleanly in SQLite without FK violation.
+    const stored_child = try r.daemon.store.getSession(8);
+    defer r.daemon.store.freeSession(stored_child);
+    try std.testing.expectEqual(@as(?u64, null), stored_child.parent_block_id);
+
+    // Single task with unresolvable model fails cleanly before spawning a child.
+    try Call.send(r, 7, 3, "task", .{ .prompt = "review", .model = "bogus/model" });
+    const bad_single = try Call.result(r, 3);
+    try std.testing.expectEqual(block_mod.ToolStatus.err, bad_single.status);
+    try std.testing.expect(std.mem.indexOf(u8, bad_single.output, "not resolvable") != null);
+
+    // task_batch enforces 2..8 tasks and formats per-slot errors in input order.
+    try Call.send(r, 7, 4, "task_batch", .{ .tasks = &.{.{ .prompt = "only one" }} });
+    const too_few = try Call.result(r, 4);
+    try std.testing.expectEqual(block_mod.ToolStatus.err, too_few.status);
+    try std.testing.expect(std.mem.indexOf(u8, too_few.output, "between two and eight") != null);
+
+    try Call.send(r, 7, 5, "task_batch", .{ .tasks = &.{
+        .{ .prompt = "first", .model = "bogus/a" },
+        .{ .prompt = "", .model = "bogus/b" },
+    } });
+    const bad_batch = try Call.result(r, 5);
+    try std.testing.expectEqual(block_mod.ToolStatus.ok, bad_batch.status);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, r.arena.allocator(), bad_batch.output, .{});
+    const results = parsed.object.get("results").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqual(@as(i64, 0), results[0].object.get("index").?.integer);
+    try std.testing.expectEqualStrings("err", results[0].object.get("status").?.string);
+    try std.testing.expect(std.mem.indexOf(u8, results[0].object.get("result").?.string, "not resolvable") != null);
+    try std.testing.expectEqual(@as(i64, 1), results[1].object.get("index").?.integer);
+    try std.testing.expect(std.mem.indexOf(u8, results[1].object.get("result").?.string, "empty") != null);
+    try std.testing.expectEqual(@as(usize, 0), r.daemon.bridge_tasks.items.len);
 }

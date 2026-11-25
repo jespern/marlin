@@ -33,10 +33,10 @@ pub const strField = codex.strField;
 pub const intField = codex.intField;
 pub const stringify = codex.stringify;
 
-/// Marlin's own tools (ask_user, show_image, the session tools) through
-/// `marlin cc_approve`, as an ACP stdio MCP server. agy asks for permission
-/// over ACP, so the bridge leaves out Claude Code's `approve`.
-pub const Bridge = struct { marlin_exe: []const u8, sid: u64 };
+/// Marlin's own tools (ask_user, show_image, the session tools, task/task_batch)
+/// through `marlin cc_approve`, as an ACP stdio MCP server. agy asks for
+/// permission over ACP, so the bridge leaves out Claude Code's `approve`.
+pub const Bridge = struct { marlin_exe: []const u8, sid: u64, allow_tasks: bool = true };
 
 pub const EnvVar = struct { name: []const u8, value: []const u8 };
 pub const McpServer = struct {
@@ -56,11 +56,16 @@ pub fn mcpServers(arena: std.mem.Allocator, bridge: ?Bridge, environ: ?*const st
     if (environ) |map| for (bridge_env) |name| {
         if (map.get(name)) |value| try env.append(arena, .{ .name = name, .value = value });
     };
+    const sid_arg = try std.fmt.allocPrint(arena, "{d}", .{target.sid});
+    const args: []const []const u8 = if (target.allow_tasks)
+        try arena.dupe([]const u8, &.{ "cc_approve", "--sid", sid_arg, "--no-approve" })
+    else
+        try arena.dupe([]const u8, &.{ "cc_approve", "--sid", sid_arg, "--no-approve", "--no-tasks" });
     const servers = try arena.alloc(McpServer, 1);
     servers[0] = .{
         .name = "marlin",
         .command = target.marlin_exe,
-        .args = try arena.dupe([]const u8, &.{ "cc_approve", "--sid", try std.fmt.allocPrint(arena, "{d}", .{target.sid}), "--no-approve" }),
+        .args = args,
         .env = env.items,
     };
     return servers;

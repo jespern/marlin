@@ -247,9 +247,13 @@ then the wall is how Marlin stays small.
   never a shell parser, never applied to native `read_file`. Auto-allow
   of CC `Read` (including paths outside the workspace) is CC's policy,
   documented as such, not Marlin protected-path enforcement.
-- Do not spawn Marlin `task` children from a guest parent. Do not grow
-  `ccAutoAllow`. Do not add guest-specific product (CC plan sync, wrapping
-  Seatbelt around their bash, vision side-channel).
+- Root guest sessions with the `marlin` MCP bridge (`claudecode/`, `codex/`,
+  `agy/`) may spawn read-only `task` / `task_batch` children and run `/review`
+  councils through `marlin cc_approve` (auto-allowed in `ccAutoAllow` since
+  children are read-only by construction). Child bridges pass `--no-tasks`
+  and the daemon rejects `parent.kind != .root`, keeping nesting at one level.
+  Do not add guest-specific product (CC plan sync, wrapping Seatbelt around
+  their bash, vision side-channel).
 - Guest models as council/task *children* are allowed (SHIPPED): the
   bridge enforces read-only for any non-root guest session —
   `permissions.ccReadOnlyAllow` grants reads/searches and DENIES

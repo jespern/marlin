@@ -23,7 +23,7 @@ env_vars = re.search(r'env_vars = (\[[^\]]*\])', config).group(1)
 bridge = {"command": json.loads(command), "args": json.loads(args),
           "env_vars": json.loads(env_vars)}
 for required in ('enabled = true', 'required = true',
-                 'enabled_tools = ["ask_user", "show_image", "sessions", "read_session", "message_session", "wait_for_session"]',
+                 'enabled_tools = ["ask_user", "show_image", "sessions", "read_session", "message_session", "wait_for_session", "task", "task_batch"]',
                  'disabled_tools = []', 'tool_timeout_sec = 604800'):
     assert required in config
 sid = bridge["args"][-1]
@@ -64,11 +64,30 @@ for line in sys.stdin:
                                   "clientInfo": {"name": "codex-fixture", "version": "1"}})
             listed = {t["name"] for t in rpc(2, "tools/list", {})["tools"]}
             assert {"ask_user", "show_image", "sessions", "read_session", "message_session",
-                    "wait_for_session"} <= listed, listed
+                    "wait_for_session", "task", "task_batch"} <= listed, listed
             # The tools for other sessions answer through the real daemon.
             peers = rpc(4, "tools/call", {"name": "sessions", "arguments": {}})
             assert not peers["isError"], peers
             assert peers["content"][0]["text"].startswith("You are "), peers
+            # Once per scenario, fan out a real read-only task_batch council
+            # from this guest session through the MCP bridge.
+            council_marker = pathlib.Path("council-done")
+            if not council_marker.exists():
+                council_marker.write_text("1")
+                batch = rpc(5, "tools/call", {"name": "task_batch", "arguments": {
+                    "tasks": [
+                        {"prompt": "guest council prompt alpha", "model": "local/testing", "max_rounds": 4},
+                        {"prompt": "guest council prompt beta", "model": "local/testing", "max_rounds": 4},
+                    ],
+                }})
+                assert not batch["isError"], batch
+                payload = json.loads(batch["content"][0]["text"])
+                results = payload["results"]
+                assert len(results) == 2, payload
+                assert [r["index"] for r in results] == [0, 1], payload
+                assert all(r["status"] == "ok" and r["result"]["status"] == "completed" for r in results), payload
+                verdicts = {r["result"]["final_text"] for r in results}
+                assert verdicts == {"guest council verdict one", "guest council verdict two"}, verdicts
             result = rpc(3, "tools/call", {"name": "ask_user", "arguments": {
                 "question": "Where should history live?", "options": ["Per session", "Globally"]}})
             answer = result["content"][0]["text"]

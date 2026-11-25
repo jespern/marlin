@@ -24,10 +24,20 @@ test "Codex question bridge scopes the session, escapes paths, and allows human 
     try std.testing.expectEqual(@as(usize, 8), argv.len);
     try std.testing.expectEqualStrings("-c", argv[3]);
     try std.testing.expectEqualStrings(
-        "mcp_servers.marlin={ command = \"/a space/\\\"quoted\\\"/back\\\\slash\\u000Amarlin\", args = [\"cc_approve\", \"--sid\", \"42\"], enabled = true, required = true, enabled_tools = [\"ask_user\", \"show_image\", \"sessions\", \"read_session\", \"message_session\", \"wait_for_session\"], disabled_tools = [], tool_timeout_sec = 604800, env_vars = [\"HOME\", \"MARLIN_SOCKET\", \"XDG_RUNTIME_DIR\"] }",
+        "mcp_servers.marlin={ command = \"/a space/\\\"quoted\\\"/back\\\\slash\\u000Amarlin\", args = [\"cc_approve\", \"--sid\", \"42\"], enabled = true, required = true, enabled_tools = [\"ask_user\", \"show_image\", \"sessions\", \"read_session\", \"message_session\", \"wait_for_session\", \"task\", \"task_batch\"], disabled_tools = [], tool_timeout_sec = 604800, env_vars = [\"HOME\", \"MARLIN_SOCKET\", \"XDG_RUNTIME_DIR\"] }",
         argv[4],
     );
     try std.testing.expectEqualStrings("app-server", argv[5]);
+
+    const child_argv = try codex.buildArgvWithBridge(arena_state.allocator(), null, null, .{
+        .marlin_exe = "/bin/marlin",
+        .sid = 43,
+        .allow_tasks = false,
+    });
+    try std.testing.expectEqualStrings(
+        "mcp_servers.marlin={ command = \"/bin/marlin\", args = [\"cc_approve\", \"--sid\", \"43\", \"--no-tasks\"], enabled = true, required = true, enabled_tools = [\"ask_user\", \"show_image\", \"sessions\", \"read_session\", \"message_session\", \"wait_for_session\"], disabled_tools = [], tool_timeout_sec = 604800, env_vars = [\"HOME\", \"MARLIN_SOCKET\", \"XDG_RUNTIME_DIR\"] }",
+        child_argv[4],
+    );
 }
 
 test "otel overrides compose per-signal URLs and gate the content-bearing log exporter" {
