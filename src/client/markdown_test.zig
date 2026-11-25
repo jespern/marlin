@@ -67,6 +67,26 @@ test "assistant Markdown renders absolute local file links as labels" {
     const relative = try inlineMarkdown(arena, "Keep [this](src/main.zig:1) literal.");
     try std.testing.expectEqualStrings("Keep [this](src/main.zig:1) literal.", relative.text);
     try std.testing.expectEqual(@as(usize, 0), relative.links.len);
+
+    const file_scheme = try inlineMarkdown(
+        arena,
+        "In [commands.zig](file:///Users/jespern/Work/marlin/src/client/commands.zig#L504-L506) and ([tui.zig](file://victory.local/Users/jespern/tui.zig#L10)).",
+    );
+    try std.testing.expectEqualStrings("In commands.zig and (tui.zig).", file_scheme.text);
+    try std.testing.expectEqual(@as(usize, 2), file_scheme.links.len);
+    try std.testing.expectEqualStrings("commands.zig", file_scheme.text[file_scheme.links[0].start..file_scheme.links[0].end]);
+    try std.testing.expectEqualStrings("file:///Users/jespern/Work/marlin/src/client/commands.zig#L504-L506", file_scheme.links[0].uri);
+    try std.testing.expectEqualStrings("tui.zig", file_scheme.text[file_scheme.links[1].start..file_scheme.links[1].end]);
+    try std.testing.expectEqualStrings("file://victory.local/Users/jespern/tui.zig#L10", file_scheme.links[1].uri);
+
+    const spaced_file_scheme = try inlineMarkdown(arena, "Open [the report](<file:///Users/jespern/My Project/report.md#L3>).");
+    try std.testing.expectEqualStrings("Open the report.", spaced_file_scheme.text);
+    try std.testing.expectEqual(@as(usize, 1), spaced_file_scheme.links.len);
+    try std.testing.expectEqualStrings("file:///Users/jespern/My%20Project/report.md#L3", spaced_file_scheme.links[0].uri);
+
+    const invalid_file_scheme = try inlineMarkdown(arena, "Keep [a](file://) [b](file:///) [c](file:///tmp/\x1b]8;;bad) literal.");
+    try std.testing.expectEqualStrings("Keep [a](file://) [b](file:///) [c](file:///tmp/\x1b]8;;bad) literal.", invalid_file_scheme.text);
+    try std.testing.expectEqual(@as(usize, 0), invalid_file_scheme.links.len);
 }
 
 test "assistant Markdown renders bounded tables with header surfaces and inline styles" {

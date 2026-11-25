@@ -84,11 +84,34 @@ pub fn localFileUri(arena: std.mem.Allocator, raw_target: []const u8) !?[]const 
     return uri.items;
 }
 
+fn fileUri(arena: std.mem.Allocator, target: []const u8) !?[]const u8 {
+    if (!std.mem.startsWith(u8, target, "file://")) return null;
+    // Require a non-empty path after `file://` (`file:///…` or `file://host/…`).
+    const slash = std.mem.indexOfScalarPos(u8, target, "file://".len, '/') orelse return null;
+    if (slash + 1 >= target.len) return null;
+    var has_space = false;
+    for (target) |byte| {
+        if (byte < ' ' or byte == 0x7f) return null;
+        if (byte == ' ') has_space = true;
+    }
+    if (!has_space) return target;
+    var uri: std.ArrayList(u8) = .empty;
+    for (target) |byte| {
+        if (byte == ' ') {
+            try uri.appendSlice(arena, "%20");
+        } else {
+            try uri.append(arena, byte);
+        }
+    }
+    return uri.items;
+}
+
 fn linkUri(arena: std.mem.Allocator, raw_target: []const u8) !?[]const u8 {
     var target = std.mem.trim(u8, raw_target, " \t");
     if (target.len >= 2 and target[0] == '<' and target[target.len - 1] == '>')
         target = target[1 .. target.len - 1];
     if (isUrlStart(target, 0)) return target;
+    if (try fileUri(arena, target)) |uri| return uri;
     return localFileUri(arena, raw_target);
 }
 
