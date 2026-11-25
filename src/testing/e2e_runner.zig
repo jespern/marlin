@@ -1973,16 +1973,23 @@ fn checkPauseFlow(gpa: std.mem.Allocator, io: Io, env: *const std.process.Enviro
         const pid = uintField(hello, "daemon_pid") orelse return error.DaemonPidMissing;
         try requester.send(.{ .reboot = .{ .suspend_sessions = true, .handover = handover_flow } });
         try pauseWaitState(conn, arena, second, "pausing", "running");
+        // The second session's tool waits for this file, so its pause (and
+        // with it the reboot) cannot complete before this flow has acted:
+        // a fixed sleep raced a slow CI runner.
+        const second_release = try std.fs.path.join(arena, &.{ cwd, "second-release" });
         if (crash_flow) {
             if (std.c.kill(@intCast(pid), std.posix.SIG.KILL) != 0) return error.DaemonKillFailed;
+            try Io.Dir.cwd().writeFile(io, .{ .sub_path = second_release, .data = "" });
         } else if (disconnect_flow) {
             requester.deinit();
             requester_open = false;
+            try Io.Dir.cwd().writeFile(io, .{ .sub_path = second_release, .data = "" });
             try pauseWaitState(conn, arena, second, "paused", "idle");
             try pauseAssertListed(conn, arena, second, "paused");
             // Shutdown without reboot intent: both sessions must remain paused.
             try conn.send(.{ .shutdown = struct {}{} });
         } else {
+            try Io.Dir.cwd().writeFile(io, .{ .sub_path = second_release, .data = "" });
             _ = try recvTagBounded(requester, arena, "ok");
         }
         // EOF confirms the old daemon has released this connection; before

@@ -15,7 +15,7 @@
         "second restart task"
       ],
       "sse": [
-        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_pause\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\": \\\"sleep 0.8; printf second\\\"}\"}}]}}]}",
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_pause\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\": \\\"while [ ! -f second-release ]; do sleep 0.01; done; printf second\\\"}\"}}]}}]}",
         "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
         "[DONE]"
       ]
