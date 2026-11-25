@@ -38,6 +38,7 @@ const shared = @import("shared.zig");
 const kept_mod = @import("kept.zig");
 const Kept = kept_mod.Kept;
 const guest_activity = @import("activity.zig");
+const agy_watch = @import("agy_watch.zig");
 const compactDiagnostic = @import("claude_code_turn.zig").compactDiagnostic;
 const compactionNote = @import("claude_code_turn.zig").compactionNote;
 const setDelegateError = shared.setDelegateError;
@@ -50,6 +51,15 @@ const line_bytes: usize = 4 * 1024 * 1024;
 const shutdown_grace_ms: u32 = 2000;
 /// ACP's "authentication required".
 const auth_required_code: i64 = -32000;
+/// While waiting on background work, wake cadence to notice queued steers or
+/// subagents that finished on disk.
+const background_poll_ms: i32 = 500;
+/// After a background subagent finishes on disk, how long to wait for agy to
+/// start its reactive wakeup (matches muse_turn.zig).
+pub const follow_up_wait_ms: i64 = 5_000;
+/// After `usage_update` in a reactive wakeup (no RPC response marks its end),
+/// how long to wait for a follow-up `tool_call` before finishing the turn.
+const reactive_settle_ms: i32 = 1_500;
 
 /// Idempotent teardown shared by the happy path and the error path, which
 /// must join the stderr drain before reading its tail (as codex_turn.zig).
@@ -174,13 +184,134 @@ fn failWith(ap: *Appender, message: []const u8) !TurnResult {
 }
 
 /// The replay caught up: persist, announce and write from here on.
-fn goLive(opts: RunOpts, ap: *Appender, activity: *guest_activity.Tracker, line_writer: *kept_mod.LineWriter) !void {
+fn goLive(opts: RunOpts, ap: *Appender, activity: *guest_activity.Tracker, line_writer: *kept_mod.LineWriter, phase: TurnPhase) !void {
     ap.replaying = false;
     ap.seq = try ap.store.lastSeq(opts.session_id);
     line_writer.replaying = false;
     activity.unmute();
-    publishPhase(opts, .provider);
+    publishPhase(opts, if (phase == .waiting_background) .background else .provider);
 }
+
+/// The reply landed but the run stays alive for its background work: say so
+/// in the transcript and the phase, matching claude_code_turn.zig.
+fn noteBackgroundWait(gpa: std.mem.Allocator, opts: RunOpts, ap: *Appender, open: usize, description: []const u8) !void {
+    const note = if (description.len > 0 and open == 1)
+        try std.fmt.allocPrint(gpa, "waiting on background task: {s}", .{description})
+    else if (description.len > 0)
+        try std.fmt.allocPrint(gpa, "waiting on {d} background tasks: {s}, …", .{ open, description })
+    else
+        try std.fmt.allocPrint(gpa, "waiting on {d} background task{s}", .{ open, if (open == 1) "" else "s" });
+    defer gpa.free(note);
+    _ = try ap.append(.{ .system_note = .{ .text = note } });
+    if (!ap.replaying) publishPhase(opts, .background);
+}
+
+pub const TurnPhase = enum {
+    /// Waiting for the JSON-RPC response to our active `session/prompt`.
+    prompt_active,
+    /// `session/prompt` returned `end_turn` while background commands or
+    /// subagents are still running; keep `agy acp` alive in `.background`.
+    waiting_background,
+    /// A background task/subagent woke `agy` up for a reactive turn (which has
+    /// no JSON-RPC response to mark its end).
+    reactive_active,
+    /// The reactive wakeup emitted `usage_update` with no open background work;
+    /// waiting briefly for a subsequent `tool_call` or silence (turn done).
+    reactive_settling,
+};
+
+pub const TurnState = struct {
+    phase: TurnPhase = .prompt_active,
+    awaiting_wakeup: bool = false,
+    wakeup_deadline_ms: i64 = 0,
+
+    pub const Action = enum { keep_reading, enter_background, enter_provider, finish_turn };
+
+    pub fn onPromptEnd(self: *TurnState, open_bg: usize) Action {
+        if (open_bg > 0) {
+            self.phase = .waiting_background;
+            self.awaiting_wakeup = false;
+            return .enter_background;
+        }
+        return .finish_turn;
+    }
+
+    pub fn onPromptSent(self: *TurnState) void {
+        self.phase = .prompt_active;
+        self.awaiting_wakeup = false;
+    }
+
+    pub fn onUpdate(self: *TurnState, is_usage: bool, is_work: bool, open_bg: usize) Action {
+        switch (self.phase) {
+            .prompt_active => return .keep_reading,
+            .waiting_background => {
+                if (!is_usage and !is_work) return .keep_reading;
+                self.awaiting_wakeup = false;
+                self.phase = if (is_usage and open_bg == 0) .reactive_settling else .reactive_active;
+                return .enter_provider;
+            },
+            .reactive_active => {
+                if (is_work or is_usage) self.awaiting_wakeup = false;
+                if (is_usage) {
+                    if (open_bg > 0) {
+                        self.phase = .waiting_background;
+                        return .enter_background;
+                    }
+                    self.phase = .reactive_settling;
+                }
+                return .keep_reading;
+            },
+            .reactive_settling => {
+                if (is_work) {
+                    self.phase = .reactive_active;
+                    self.awaiting_wakeup = false;
+                } else if (is_usage and open_bg > 0) {
+                    self.phase = .waiting_background;
+                    return .enter_background;
+                }
+                return .keep_reading;
+            },
+        }
+    }
+
+    pub fn onWaitTimeout(self: *TurnState, open_bg: usize, subagent_replied: bool, now_ms: i64) Action {
+        switch (self.phase) {
+            .prompt_active => return .keep_reading,
+            .waiting_background => {
+                if (open_bg > 0) return .keep_reading;
+                self.phase = .reactive_active;
+                self.awaiting_wakeup = true;
+                self.wakeup_deadline_ms = now_ms + follow_up_wait_ms;
+                return .enter_provider;
+            },
+            .reactive_active => {
+                if (!self.awaiting_wakeup) return .keep_reading;
+                if (open_bg > 0) {
+                    self.phase = .waiting_background;
+                    self.awaiting_wakeup = false;
+                    return .enter_background;
+                }
+                if (now_ms < self.wakeup_deadline_ms) return .keep_reading;
+                self.awaiting_wakeup = false;
+                return .finish_turn;
+            },
+            .reactive_settling => {
+                if (open_bg > 0) {
+                    self.phase = .waiting_background;
+                    self.awaiting_wakeup = false;
+                    return .enter_background;
+                }
+                if (subagent_replied) {
+                    self.phase = .reactive_active;
+                    self.awaiting_wakeup = true;
+                    self.wakeup_deadline_ms = now_ms + follow_up_wait_ms;
+                    return .keep_reading;
+                }
+                return .finish_turn;
+            },
+        }
+    }
+};
 
 /// The agent's prose and thinking stream in chunks with no end marker; each
 /// becomes a block when something else starts. Prose followed by more work
@@ -218,25 +349,56 @@ const Pending = struct {
     }
 };
 
-/// Tool calls seen this turn: started (a tool_call block exists) and
-/// finished (its result does).
+/// Tool calls seen this turn: started (a tool_call block exists, with its
+/// title for background wait notes) and finished (its result does).
 const Calls = struct {
     gpa: std.mem.Allocator,
-    started: std.StringHashMapUnmanaged(void) = .empty,
+    started: std.StringHashMapUnmanaged([]u8) = .empty,
     finished: std.StringHashMapUnmanaged(void) = .empty,
 
     fn deinit(self: *Calls) void {
-        inline for (.{ &self.started, &self.finished }) |map| {
-            var it = map.keyIterator();
-            while (it.next()) |key| self.gpa.free(key.*);
-            map.deinit(self.gpa);
+        var sit = self.started.iterator();
+        while (sit.next()) |entry| {
+            self.gpa.free(entry.key_ptr.*);
+            self.gpa.free(entry.value_ptr.*);
         }
+        self.started.deinit(self.gpa);
+        var fit = self.finished.keyIterator();
+        while (fit.next()) |key| self.gpa.free(key.*);
+        self.finished.deinit(self.gpa);
     }
 
-    fn mark(self: *Calls, map: *std.StringHashMapUnmanaged(void), id: []const u8) !bool {
-        if (map.contains(id)) return false;
-        try map.put(self.gpa, try self.gpa.dupe(u8, id), {});
+    fn markStarted(self: *Calls, id: []const u8, title: []const u8) !bool {
+        if (self.started.contains(id)) return false;
+        const owned_id = try self.gpa.dupe(u8, id);
+        errdefer self.gpa.free(owned_id);
+        const owned_title = try self.gpa.dupe(u8, title);
+        errdefer self.gpa.free(owned_title);
+        try self.started.put(self.gpa, owned_id, owned_title);
         return true;
+    }
+
+    fn markFinished(self: *Calls, id: []const u8) !bool {
+        if (self.finished.contains(id)) return false;
+        try self.finished.put(self.gpa, try self.gpa.dupe(u8, id), {});
+        return true;
+    }
+
+    fn openCount(self: *const Calls) usize {
+        var count: usize = 0;
+        var it = self.started.keyIterator();
+        while (it.next()) |key| if (!self.finished.contains(key.*)) {
+            count += 1;
+        };
+        return count;
+    }
+
+    fn firstOpenTitle(self: *const Calls) ?[]const u8 {
+        var it = self.started.iterator();
+        while (it.next()) |entry| if (!self.finished.contains(entry.key_ptr.*)) {
+            if (entry.value_ptr.*.len > 0) return entry.value_ptr.*;
+        };
+        return null;
     }
 };
 
@@ -263,11 +425,13 @@ fn startCall(
     opts: RunOpts,
     calls: *Calls,
     activity: *guest_activity.Tracker,
+    bg_watch: *agy_watch.Watcher,
     update: std.json.Value,
     id: []const u8,
     now_ms: i64,
 ) !void {
-    if (!try calls.mark(&calls.started, id)) return;
+    const detail = agy.strField(update, "title") orelse "";
+    if (!try calls.markStarted(id, detail)) return;
     const name = agy.toolName(update);
     const args = try agy.toolArgs(arena, update);
     // Same redaction discipline as the native tool_call append.
@@ -275,7 +439,7 @@ fn startCall(
     _ = try ap.append(.{ .tool_call = .{ .call_id = id, .name = name, .args_json = persisted_args } });
     if (!ap.replaying) if (opts.on_tool) |callback| callback(opts.on_delta_ctx, name, .start);
     const kind = agy.strField(update, "kind") orelse "";
-    const detail = agy.strField(update, "title") orelse "";
+    if (std.mem.eql(u8, kind, "execute")) bg_watch.noteCommandStart(id);
     try activity.start(id, "", if (std.mem.eql(u8, kind, "execute")) .process else .tool, name, detail, now_ms);
 }
 
@@ -286,11 +450,14 @@ fn finishCall(
     opts: RunOpts,
     calls: *Calls,
     activity: *guest_activity.Tracker,
+    bg_watch: *agy_watch.Watcher,
     update: std.json.Value,
     id: []const u8,
     status: []const u8,
 ) !void {
-    if (!try calls.mark(&calls.finished, id)) return;
+    if (!try calls.markFinished(id)) return;
+    bg_watch.noteCommandFinish(id);
+    noteSubagentTool(bg_watch, update);
     activity.finish(id);
     const images = try resultImages(arena, update);
     const raw_body = try agy.toolBody(arena, update);
@@ -306,8 +473,27 @@ fn finishCall(
     if (!ap.replaying) if (opts.on_tool) |callback| callback(opts.on_delta_ctx, agy.toolName(update), .done);
 }
 
-/// One `session/update` of our session. Returns nothing; prose and tools
-/// become blocks, usage feeds the context gauge.
+fn noteSubagentTool(bg_watch: *agy_watch.Watcher, update: std.json.Value) void {
+    const raw_name = agy.strField(update, "name") orelse return;
+    const input = agy.field(update, "rawInput") orelse return;
+    if (std.mem.eql(u8, raw_name, "send_message")) {
+        if (agy.strField(input, "Recipient")) |recipient| bg_watch.noteSubagentMessaged(recipient);
+    } else if (std.mem.eql(u8, raw_name, "manage_subagents")) {
+        const action = agy.strField(input, "Action") orelse return;
+        if (std.mem.eql(u8, action, "kill_all")) {
+            bg_watch.noteAllSubagentsKilled();
+        } else if (std.mem.eql(u8, action, "kill")) {
+            if (agy.field(input, "ConversationIds")) |ids| if (ids == .array) for (ids.array.items) |entry| {
+                if (entry == .string) bg_watch.noteSubagentKilled(entry.string);
+            };
+        }
+    }
+}
+
+const UpdateSignal = struct { is_usage: bool = false, is_work: bool = false };
+
+/// One `session/update` of our session. Returns whether it was a usage or work
+/// event so the turn state machine tracks reactive wakeups.
 fn handleUpdate(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -317,40 +503,64 @@ fn handleUpdate(
     pending: *Pending,
     calls: *Calls,
     activity: *guest_activity.Tracker,
+    bg_watch: *agy_watch.Watcher,
     final_text: *std.ArrayList(u8),
     update: std.json.Value,
     replaying: bool,
-) !void {
-    const kind = agy.strField(update, "sessionUpdate") orelse return;
+) !UpdateSignal {
+    const kind = agy.strField(update, "sessionUpdate") orelse return .{};
     if (std.mem.eql(u8, kind, "agent_message_chunk")) {
-        const text = agy.strField(agy.field(update, "content") orelse return, "text") orelse return;
+        const text = agy.strField(agy.field(update, "content") orelse return .{}, "text") orelse return .{};
         try pending.flushThought(ap);
         try pending.message.appendSlice(gpa, text);
         if (!replaying) if (opts.on_delta) |callback| callback(opts.on_delta_ctx, text);
+        return .{ .is_work = true };
     } else if (std.mem.eql(u8, kind, "agent_thought_chunk")) {
-        const text = agy.strField(agy.field(update, "content") orelse return, "text") orelse return;
+        const text = agy.strField(agy.field(update, "content") orelse return .{}, "text") orelse return .{};
         _ = try pending.flushMessage(ap, false, final_text);
         try pending.thought.appendSlice(gpa, text);
         if (!replaying) if (opts.on_reasoning_delta) |callback| callback(opts.on_delta_ctx, text);
+        return .{ .is_work = true };
     } else if (std.mem.eql(u8, kind, "tool_call") or std.mem.eql(u8, kind, "tool_call_update")) {
-        const id = agy.strField(update, "toolCallId") orelse return;
+        const id = agy.strField(update, "toolCallId") orelse return .{};
         _ = try pending.flushMessage(ap, false, final_text);
         // An update for a call never announced still names it.
         if (std.mem.eql(u8, kind, "tool_call") or agy.strField(update, "title") != null)
-            try startCall(arena, ap, opts, calls, activity, update, id, nowMs(io));
+            try startCall(arena, ap, opts, calls, activity, bg_watch, update, id, nowMs(io));
         const status = agy.strField(update, "status") orelse "";
         if (std.mem.eql(u8, status, "completed") or std.mem.eql(u8, status, "failed")) {
-            if (!calls.started.contains(id)) return;
-            try finishCall(gpa, arena, ap, opts, calls, activity, update, id, status);
+            if (!calls.started.contains(id)) return .{};
+            try finishCall(gpa, arena, ap, opts, calls, activity, bg_watch, update, id, status);
         }
+        return .{ .is_work = true };
     } else if (std.mem.eql(u8, kind, "usage_update")) {
         if (agy.intField(update, "used")) |used| if (opts.context_used_out) |out|
             out.store(@intCast(@max(0, used)), .release);
         if (agy.intField(update, "size")) |size| if (size > 0) if (opts.context_limit_out) |out|
             out.store(@intCast(size), .release);
+        return .{ .is_usage = true };
     }
-    // user_message_chunk (only replayed history), plan, session_info_update,
-    // available_commands_update, mode and config updates: not transcript.
+    return .{};
+}
+
+fn waitReadable(
+    reader: *Io.Reader,
+    partial: usize,
+    kept: ?*Kept,
+    child: ?*std.process.Child,
+    timeout_ms: i32,
+) error{Detached}!bool {
+    if (reader.bufferedLen() > 0 or partial > 0) return true;
+    if (kept) |k| return k.waitReadable(timeout_ms);
+    const fd = child.?.stdout.?.handle;
+    var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    const ready = std.posix.poll(&fds, timeout_ms) catch return true;
+    return ready > 0;
+}
+
+fn backgroundDescription(calls: *const Calls, bg_watch: *agy_watch.Watcher, buf: []u8) []const u8 {
+    if (calls.firstOpenTitle()) |title| return title;
+    return bg_watch.firstActiveSubagentName(buf) orelse "";
 }
 
 pub fn runAgyTurn(
@@ -593,14 +803,86 @@ pub fn runAgyTurn(
     var failed = false;
     var failure_text: []const u8 = "Antigravity turn failed";
     var activity = guest_activity.Tracker.init(gpa, opts.on_guest_activity, opts.on_delta_ctx);
+    activity.io = io;
     defer activity.deinit();
     if (replaying) activity.mute();
+    var bg_watch = try agy_watch.Watcher.init(gpa, io, &activity, session_id, null, opts.tool_environ);
+    defer bg_watch.deinit();
+    if (!replaying) bg_watch.start();
+    var turn_state = TurnState{};
+    var bg_desc_buf: [128]u8 = undefined;
 
     var line_arena_state = std.heap.ArenaAllocator.init(gpa);
     defer line_arena_state.deinit();
     var line_acc: std.ArrayList(u8) = .empty;
     defer line_acc.deinit(gpa);
     events: while (!done) {
+        if (!replaying and (turn_state.phase == .waiting_background or
+            turn_state.phase == .reactive_settling or
+            (turn_state.phase == .reactive_active and turn_state.awaiting_wakeup)))
+        {
+            const wait_ms: i32 = switch (turn_state.phase) {
+                .waiting_background => background_poll_ms,
+                .reactive_settling => reactive_settle_ms,
+                .reactive_active => @intCast(@max(@as(i64, 50), @min(@as(i64, background_poll_ms), turn_state.wakeup_deadline_ms - nowMs(io)))),
+                .prompt_active => unreachable,
+            };
+            const ready = waitReadable(reader, line_acc.items.len, kept, if (child != null) &child.? else null, wait_ms) catch {
+                detached = true;
+                detach_offset = kept.?.consumed() - line_acc.items.len;
+                break :events;
+            };
+            if (!ready) {
+                if (turn_state.phase == .waiting_background) if (opts.poll_steer) |poll| if (poll(opts.on_delta_ctx, gpa)) |steer| {
+                    defer steer.deinit(gpa);
+                    _ = try ap.append(.{ .steer = steer });
+                    final_text.clearRetainingCapacity();
+                    prompt_id = try wire.request(arena, "session/prompt", .{
+                        .sessionId = session_id,
+                        .prompt = &[_]TextBlock{.{ .text = steer.text }},
+                    });
+                    turn_state.onPromptSent();
+                    publishPhase(opts, .provider);
+                    rounds += 1;
+                    continue :events;
+                };
+                bg_watch.refresh();
+                const open_bg = calls.openCount() + bg_watch.activeSubagentCount();
+                switch (turn_state.onWaitTimeout(open_bg, bg_watch.takeSubagentReply(), nowMs(io))) {
+                    .keep_reading => continue :events,
+                    .enter_provider => {
+                        publishPhase(opts, .provider);
+                        continue :events;
+                    },
+                    .enter_background => {
+                        _ = try pending.flushMessage(ap, true, &final_text);
+                        try noteBackgroundWait(gpa, opts, ap, open_bg, backgroundDescription(&calls, &bg_watch, &bg_desc_buf));
+                        continue :events;
+                    },
+                    .finish_turn => {
+                        _ = try pending.flushMessage(ap, true, &final_text);
+                        var follow_up: ?block.Input = if (opts.poll_steer) |poll| poll(opts.on_delta_ctx, gpa) else null;
+                        if (follow_up == null and !tryCloseSteering(opts))
+                            follow_up = if (opts.poll_steer) |poll| poll(opts.on_delta_ctx, gpa) else null;
+                        if (follow_up) |text| {
+                            defer text.deinit(gpa);
+                            _ = try ap.append(.{ .steer = text });
+                            final_text.clearRetainingCapacity();
+                            prompt_id = try wire.request(arena, "session/prompt", .{
+                                .sessionId = session_id,
+                                .prompt = &[_]TextBlock{.{ .text = text.text }},
+                            });
+                            turn_state.onPromptSent();
+                            publishPhase(opts, .provider);
+                            rounds += 1;
+                            continue :events;
+                        }
+                        done = true;
+                        break :events;
+                    },
+                }
+            }
+        }
         const raw = shared.takeEventLine(reader, gpa, &line_acc, shared.max_event_line_bytes) catch |err| switch (err) {
             error.LineTooLong => {
                 _ = try ap.append(.{ .system_note = .{ .text = "agy: one event line exceeded 64 MiB and was dropped" } });
@@ -618,7 +900,8 @@ pub fn runAgyTurn(
         } orelse break;
         if (replaying and kept.?.consumed() > replay_until) {
             replaying = false;
-            try goLive(opts, ap, &activity, &line_writer);
+            try goLive(opts, ap, &activity, &line_writer, turn_state.phase);
+            bg_watch.start();
         }
         _ = line_arena_state.reset(.retain_capacity);
         const line_arena = line_arena_state.allocator();
@@ -645,6 +928,13 @@ pub fn runAgyTurn(
                     done = true;
                     break :events;
                 }
+                if (!replaying) bg_watch.refresh();
+                bg_watch.clearSubagentReply();
+                const open_bg = calls.openCount() + if (replaying) @as(usize, 0) else bg_watch.activeSubagentCount();
+                if (turn_state.onPromptEnd(open_bg) == .enter_background) {
+                    try noteBackgroundWait(gpa, opts, ap, open_bg, backgroundDescription(&calls, &bg_watch, &bg_desc_buf));
+                    continue :events;
+                }
                 // ACP has no steering into a running prompt: what the user
                 // queued meanwhile is the next prompt. Replaying, the journal
                 // says whether the first daemon sent one: it did when more
@@ -662,6 +952,7 @@ pub fn runAgyTurn(
                         .sessionId = session_id,
                         .prompt = &[_]TextBlock{.{ .text = text.text }},
                     });
+                    turn_state.onPromptSent();
                     rounds += 1;
                 } else done = true;
             },
@@ -688,12 +979,23 @@ pub fn runAgyTurn(
                 const params = notification.params;
                 if (!std.mem.eql(u8, agy.strField(params, "sessionId") orelse session_id, session_id)) continue;
                 const update = agy.field(params, "update") orelse continue;
-                try handleUpdate(gpa, line_arena, io, ap, opts, &pending, &calls, &activity, &final_text, update, replaying);
+                const signal = try handleUpdate(gpa, line_arena, io, ap, opts, &pending, &calls, &activity, &bg_watch, &final_text, update, replaying);
+                if (signal.is_usage and !replaying and turn_state.phase != .prompt_active) bg_watch.refresh();
+                const open_bg = calls.openCount() + if (replaying) @as(usize, 0) else bg_watch.activeSubagentCount();
+                switch (turn_state.onUpdate(signal.is_usage, signal.is_work, open_bg)) {
+                    .keep_reading, .finish_turn => {},
+                    .enter_provider => if (!replaying) publishPhase(opts, .provider),
+                    .enter_background => {
+                        _ = try pending.flushMessage(ap, true, &final_text);
+                        try noteBackgroundWait(gpa, opts, ap, open_bg, backgroundDescription(&calls, &bg_watch, &bg_desc_buf));
+                    },
+                }
             },
         }
         if (replaying and kept.?.consumed() >= replay_until) {
             replaying = false;
-            try goLive(opts, ap, &activity, &line_writer);
+            try goLive(opts, ap, &activity, &line_writer, turn_state.phase);
+            bg_watch.start();
         }
         // Handing over: stop between events; the next daemon replays to here.
         if (!done) if (kept) |k| if (k.detachRequested()) {

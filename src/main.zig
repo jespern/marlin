@@ -71,6 +71,8 @@ test {
     _ = @import("daemon/guest/shared_test.zig");
     _ = @import("daemon/guest/codex_turn_test.zig");
     _ = @import("daemon/guest/muse_turn_test.zig");
+    _ = @import("daemon/guest/agy_turn_test.zig");
+    _ = @import("daemon/guest/agy_watch_test.zig");
     _ = @import("daemon/guest/claude_code_turn_test.zig");
     _ = @import("daemon/guest/tail_test.zig");
     _ = @import("daemon/guest/kept_test.zig");

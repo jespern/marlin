@@ -315,6 +315,37 @@ pub const Kept = struct {
         return true;
     }
 
+    /// True when the journal has bytes past the reader's current position.
+    fn hasUnread(self: *const Kept) bool {
+        if (self.reader.interface.bufferedLen() > 0) return true;
+        if (self.out_fd < 0) return false;
+        const size = std.c.lseek(self.out_fd, 0, std.c.SEEK.END);
+        return size > 0 and @as(u64, @intCast(size)) > self.reader.file_pos;
+    }
+
+    /// Block up to `timeout_ms` for more journal bytes or the guest's exit.
+    /// False on timeout; error.Detached if detach() woke it.
+    pub fn waitReadable(self: *Kept, timeout_ms: i32) error{Detached}!bool {
+        if (self.hasUnread() or self.exited) return true;
+        const deadline = if (timeout_ms >= 0) nowMs(self.io) + timeout_ms else 0;
+        while (true) {
+            if (self.hasUnread() or self.exited) return true;
+            if (self.detachRequested()) {
+                self.detached = true;
+                return error.Detached;
+            }
+            const left: i32 = if (timeout_ms < 0) -1 else blk: {
+                const rem = deadline - nowMs(self.io);
+                if (rem <= 0) return false;
+                break :blk @intCast(@min(rem, std.math.maxInt(i32)));
+            };
+            self.waitNote(left) catch {
+                self.detached = true;
+                return error.Detached;
+            };
+        }
+    }
+
     /// One wait on the keeper's socket (and the wake pipe). error.Detached
     /// when detach() woke it.
     fn waitNote(self: *Kept, timeout_ms: i32) error{Detached}!void {
