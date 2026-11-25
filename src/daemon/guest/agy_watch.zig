@@ -72,6 +72,38 @@ pub fn condenseTranscriptLine(arena: std.mem.Allocator, line: []const u8, out: *
     return model;
 }
 
+/// Returns whether a line from the parent session's `transcript.jsonl` leaves
+/// `agy` idle (`true`) or actively working on a next step (`false`). Only a
+/// completed `PLANNER_RESPONSE` with no `tool_calls` is idle; `SYSTEM_MESSAGE`,
+/// `GENERIC`, `USER_INPUT`, `CHECKPOINT`, and tool-calling responses mean `agy`
+/// still has work in flight.
+pub fn parseParentTranscriptIdle(arena: std.mem.Allocator, line: []const u8) ?bool {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch return null;
+    if (parsed != .object) return null;
+    const kind = strField(parsed, "type") orelse return null;
+    if (std.mem.eql(u8, kind, "PLANNER_RESPONSE")) {
+        const status = strField(parsed, "status") orelse "";
+        if (!std.mem.eql(u8, status, "DONE")) return false;
+        if (parsed.object.get("tool_calls")) |tc| {
+            if (tc == .array and tc.array.items.len > 0) return false;
+        }
+        return true;
+    }
+    return false;
+}
+
+/// True when a `.system_generated/messages/<id>.json` message triggers a
+/// reactive wakeup (background command completion, subagent reply, timer),
+/// false for low-priority system notices such as restart banners.
+pub fn isWakeupMessage(value: std.json.Value) bool {
+    if (value != .object) return false;
+    const priority = strField(value, "priority") orelse "";
+    if (std.mem.eql(u8, priority, "MESSAGE_PRIORITY_HIGH")) return true;
+    const sender = strField(value, "sender") orelse "";
+    if (std.mem.eql(u8, sender, "system") or std.mem.eql(u8, priority, "MESSAGE_PRIORITY_LOW")) return false;
+    return sender.len > 0;
+}
+
 fn strField(value: std.json.Value, key: []const u8) ?[]const u8 {
     if (value != .object) return null;
     const field = value.object.get(key) orelse return null;
@@ -160,17 +192,33 @@ pub const Watcher = struct {
     tasks_watch: ?DirWatch = null,
     subagents_watch: ?DirWatch = null,
     messages_watch: ?DirWatch = null,
+    undelivered_watch: ?DirWatch = null,
+
+    /// Parent session's own `.system_generated/logs/transcript.jsonl` tail.
+    parent_transcript_path: ?[]u8 = null,
+    parent_transcript_handle: ?file_watch.Handle = null,
+    parent_transcript_discovery: ?DirWatch = null,
+    parent_transcript_offset: u64 = 0,
+    parent_partial: std.ArrayList(u8) = .empty,
+    parent_skip_long: bool = false,
+    parent_transcript_busy: bool = false,
 
     /// Filenames already present before this turn started (or already processed).
     seen_tasks: std.StringHashMapUnmanaged(void) = .empty,
     seen_subagents: std.StringHashMapUnmanaged(void) = .empty,
     seen_messages: std.StringHashMapUnmanaged(void) = .empty,
+    /// Wakeup message IDs seen this turn not yet marked read in `read.json`.
+    unread_bg_messages: std.StringHashMapUnmanaged(void) = .empty,
     /// Senders whose reply message arrived before we scanned `subagents/`.
     early_replies: std.StringHashMapUnmanaged(void) = .empty,
 
     commands: std.ArrayList(OpenCommand) = .empty,
     subagents: std.ArrayList(Subagent) = .empty,
     subagent_replied: bool = false,
+    has_undelivered: bool = false,
+    read_json_exists: bool = false,
+    saw_bg_message: bool = false,
+    bg_message_arrived: bool = false,
 
     pub fn init(
         gpa: std.mem.Allocator,
@@ -216,9 +264,15 @@ pub const Watcher = struct {
         self.dropDirWatch(&self.tasks_watch);
         self.dropDirWatch(&self.subagents_watch);
         self.dropDirWatch(&self.messages_watch);
+        self.dropDirWatch(&self.undelivered_watch);
+        if (self.parent_transcript_handle) |h| self.notifier.unwatch(h);
+        self.dropDirWatch(&self.parent_transcript_discovery);
+        if (self.parent_transcript_path) |p| self.gpa.free(p);
+        self.parent_partial.deinit(self.gpa);
         freeKeys(self.gpa, &self.seen_tasks);
         freeKeys(self.gpa, &self.seen_subagents);
         freeKeys(self.gpa, &self.seen_messages);
+        freeKeys(self.gpa, &self.unread_bg_messages);
         freeKeys(self.gpa, &self.early_replies);
         self.notifier.deinit();
         if (self.brain_dir) |b| self.gpa.free(b);
@@ -255,6 +309,17 @@ pub const Watcher = struct {
         self.seedDir("tasks", &self.seen_tasks);
         self.seedDir("subagents", &self.seen_subagents);
         self.seedDir("messages", &self.seen_messages);
+        self.seedParentTranscript();
+    }
+
+    fn seedParentTranscript(self: *Watcher) void {
+        const brain = self.brain_dir orelse return;
+        if (self.session_id.len == 0) return;
+        const path = std.fs.path.join(self.gpa, &.{ brain, self.session_id, ".system_generated", "logs", "transcript.jsonl" }) catch return;
+        self.parent_transcript_path = path;
+        const file = Io.Dir.cwd().openFile(self.io, path, .{}) catch return;
+        defer file.close(self.io);
+        self.parent_transcript_offset = file.length(self.io) catch 0;
     }
 
     pub fn noteCommandStart(self: *Watcher, call_id: []const u8) void {
@@ -373,6 +438,51 @@ pub const Watcher = struct {
         self.subagent_replied = false;
     }
 
+    /// True while agy's on-disk state shows a reactive step or undelivered
+    /// background completion message still in flight for the parent session.
+    pub fn isParentBusy(self: *Watcher) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.isParentBusyLocked();
+    }
+
+    fn isParentBusyLocked(self: *const Watcher) bool {
+        return self.has_undelivered or
+            (self.read_json_exists and self.unread_bg_messages.count() > 0) or
+            self.parent_transcript_busy;
+    }
+
+    /// True at `session/prompt` end when a background task or subagent finished
+    /// mid-prompt and still has a reactive wakeup pending. False on ordinary
+    /// prompts that never received a background message.
+    pub fn hasPendingPromptWakeup(self: *Watcher) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.has_undelivered or
+            (self.read_json_exists and self.unread_bg_messages.count() > 0) or
+            self.bg_message_arrived or
+            self.subagent_replied or
+            (self.saw_bg_message and self.parent_transcript_busy);
+    }
+
+    /// Consumes the one-shot wakeup signal (subagent reply or background task
+    /// completion message newly seen on disk).
+    pub fn takeWakeupSignal(self: *Watcher) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const hit = self.subagent_replied or self.bg_message_arrived;
+        self.subagent_replied = false;
+        self.bg_message_arrived = false;
+        return hit;
+    }
+
+    pub fn clearWakeupSignal(self: *Watcher) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.subagent_replied = false;
+        self.bg_message_arrived = false;
+    }
+
     fn run(self: *Watcher) void {
         while (!self.stop.load(.acquire)) {
             self.refresh();
@@ -393,6 +503,8 @@ pub const Watcher = struct {
             self.scanTasksLocked();
             self.scanMessagesLocked();
             self.scanSubagentsLocked();
+            self.armParentTranscript();
+            self.readParentTranscript();
             for (self.commands.items) |*cmd| self.readCommandLog(cmd);
             for (self.subagents.items) |*sub| if (sub.active) {
                 self.armSubagentTranscript(sub);
@@ -400,7 +512,8 @@ pub const Watcher = struct {
             };
             const moved = self.watchSessionSubdir("tasks", &self.tasks_watch) or
                 self.watchSessionSubdir("subagents", &self.subagents_watch) or
-                self.watchSessionSubdir("messages", &self.messages_watch);
+                self.watchSessionSubdir("messages", &self.messages_watch) or
+                self.watchSessionSubdir("messages/undelivered", &self.undelivered_watch);
             if (!moved) break;
         }
     }
@@ -517,6 +630,13 @@ pub const Watcher = struct {
             const parsed = std.json.parseFromSlice(std.json.Value, self.gpa, raw, .{}) catch continue;
             defer parsed.deinit();
             _ = markSeen(self.gpa, &self.seen_messages, entry.name) catch {};
+            const wakeup = isWakeupMessage(parsed.value);
+            if (wakeup) {
+                self.saw_bg_message = true;
+                self.bg_message_arrived = true;
+                const msg_id = strField(parsed.value, "id") orelse entry.name[0 .. entry.name.len - ".json".len];
+                _ = markSeen(self.gpa, &self.unread_bg_messages, msg_id) catch {};
+            }
             const sender = strField(parsed.value, "sender") orelse continue;
             var matched = false;
             for (self.subagents.items) |*sub| {
@@ -532,6 +652,8 @@ pub const Watcher = struct {
                     }
                     self.dropDirWatch(&sub.discovery);
                     self.subagent_replied = true;
+                    self.saw_bg_message = true;
+                    self.bg_message_arrived = true;
                 }
                 break;
             }
@@ -539,6 +661,117 @@ pub const Watcher = struct {
                 // Subagent replied before we scanned subagents/: remember so
                 // it is not mistakenly marked active when its descriptor loads.
                 _ = markSeen(self.gpa, &self.early_replies, sender) catch {};
+            }
+        }
+        self.scanUndeliveredLocked(dir);
+        self.pruneReadMessagesLocked(dir);
+    }
+
+    fn scanUndeliveredLocked(self: *Watcher, msg_dir: Io.Dir) void {
+        var sub = msg_dir.openDir(self.io, "undelivered", .{ .iterate = true }) catch {
+            self.has_undelivered = false;
+            return;
+        };
+        defer sub.close(self.io);
+        var it = sub.iterate();
+        while (it.next(self.io) catch null) |entry| {
+            if (entry.kind == .file) {
+                self.has_undelivered = true;
+                return;
+            }
+        }
+        self.has_undelivered = false;
+    }
+
+    fn pruneReadMessagesLocked(self: *Watcher, msg_dir: Io.Dir) void {
+        if (self.unread_bg_messages.count() == 0) return;
+        const raw = msg_dir.readFileAlloc(self.io, "read.json", self.gpa, .limited(max_meta_bytes)) catch return;
+        defer self.gpa.free(raw);
+        const parsed = std.json.parseFromSlice(std.json.Value, self.gpa, raw, .{}) catch return;
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+        self.read_json_exists = true;
+        var to_remove: std.ArrayList([]const u8) = .empty;
+        defer to_remove.deinit(self.gpa);
+        var it = self.unread_bg_messages.keyIterator();
+        while (it.next()) |key| {
+            const flag = parsed.value.object.get(key.*) orelse continue;
+            if (flag == .bool and flag.bool) to_remove.append(self.gpa, key.*) catch {};
+        }
+        for (to_remove.items) |key| {
+            if (self.unread_bg_messages.fetchRemove(key)) |kv| self.gpa.free(kv.key);
+        }
+    }
+
+    fn armParentTranscript(self: *Watcher) void {
+        if (self.parent_transcript_handle != null) return;
+        const path = self.parent_transcript_path orelse return;
+        const z = self.gpa.dupeSentinel(u8, path, 0) catch return;
+        defer self.gpa.free(z);
+        if (self.notifier.watch(z)) |handle| {
+            self.parent_transcript_handle = handle;
+            self.dropDirWatch(&self.parent_transcript_discovery);
+        } else if (std.fs.path.dirname(path)) |parent| {
+            _ = self.watchDeepest(parent, &self.parent_transcript_discovery);
+        }
+    }
+
+    fn readParentTranscript(self: *Watcher) void {
+        const path = self.parent_transcript_path orelse return;
+        const file = Io.Dir.cwd().openFile(self.io, path, .{}) catch return;
+        defer file.close(self.io);
+        const size = file.length(self.io) catch return;
+        if (size < self.parent_transcript_offset) {
+            self.parent_transcript_offset = 0;
+            self.parent_partial.clearRetainingCapacity();
+            self.parent_skip_long = false;
+        }
+        if (size == self.parent_transcript_offset) return;
+
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        var rounds: usize = 0;
+        while (self.parent_transcript_offset < size and rounds < 32) : (rounds += 1) {
+            const want: usize = @intCast(@min(size - self.parent_transcript_offset, max_read_bytes));
+            const buf = self.gpa.alloc(u8, want) catch return;
+            defer self.gpa.free(buf);
+            const n = file.readPositionalAll(self.io, buf, self.parent_transcript_offset) catch return;
+            if (n == 0) return;
+            self.parent_transcript_offset += n;
+
+            var rest = buf[0..n];
+            while (std.mem.indexOfScalar(u8, rest, '\n')) |nl| {
+                const piece = rest[0..nl];
+                rest = rest[nl + 1 ..];
+                if (self.parent_skip_long) {
+                    self.parent_skip_long = false;
+                    self.parent_partial.clearRetainingCapacity();
+                    continue;
+                }
+                _ = arena_state.reset(.retain_capacity);
+                const arena = arena_state.allocator();
+                const line = if (self.parent_partial.items.len > 0) blk: {
+                    self.parent_partial.appendSlice(self.gpa, piece) catch {
+                        self.parent_partial.clearRetainingCapacity();
+                        continue;
+                    };
+                    defer self.parent_partial.clearRetainingCapacity();
+                    break :blk arena.dupe(u8, self.parent_partial.items) catch continue;
+                } else piece;
+                if (parseParentTranscriptIdle(arena, line)) |idle| {
+                    self.parent_transcript_busy = !idle;
+                }
+            }
+            if (rest.len > 0 and !self.parent_skip_long) {
+                if (self.parent_partial.items.len + rest.len <= max_line_bytes) {
+                    self.parent_partial.appendSlice(self.gpa, rest) catch {
+                        self.parent_partial.clearRetainingCapacity();
+                        self.parent_skip_long = true;
+                    };
+                } else {
+                    self.parent_partial.clearRetainingCapacity();
+                    self.parent_skip_long = true;
+                }
             }
         }
     }

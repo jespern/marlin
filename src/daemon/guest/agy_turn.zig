@@ -227,11 +227,16 @@ pub const TurnState = struct {
 
     pub const Action = enum { keep_reading, enter_background, enter_provider, finish_turn };
 
-    pub fn onPromptEnd(self: *TurnState, open_bg: usize) Action {
+    pub fn onPromptEnd(self: *TurnState, open_bg: usize, pending_wakeup: bool) Action {
         if (open_bg > 0) {
             self.phase = .waiting_background;
             self.awaiting_wakeup = false;
             return .enter_background;
+        }
+        if (pending_wakeup) {
+            self.phase = .reactive_settling;
+            self.awaiting_wakeup = false;
+            return .keep_reading;
         }
         return .finish_turn;
     }
@@ -274,7 +279,7 @@ pub const TurnState = struct {
         }
     }
 
-    pub fn onWaitTimeout(self: *TurnState, open_bg: usize, subagent_replied: bool, now_ms: i64) Action {
+    pub fn onWaitTimeout(self: *TurnState, open_bg: usize, parent_busy: bool, wakeup_signal: bool, now_ms: i64) Action {
         switch (self.phase) {
             .prompt_active => return .keep_reading,
             .waiting_background => {
@@ -291,6 +296,10 @@ pub const TurnState = struct {
                     self.awaiting_wakeup = false;
                     return .enter_background;
                 }
+                if (parent_busy) {
+                    self.wakeup_deadline_ms = now_ms + follow_up_wait_ms;
+                    return .keep_reading;
+                }
                 if (now_ms < self.wakeup_deadline_ms) return .keep_reading;
                 self.awaiting_wakeup = false;
                 return .finish_turn;
@@ -301,11 +310,11 @@ pub const TurnState = struct {
                     self.awaiting_wakeup = false;
                     return .enter_background;
                 }
-                if (subagent_replied) {
+                if (parent_busy or wakeup_signal) {
                     self.phase = .reactive_active;
                     self.awaiting_wakeup = true;
                     self.wakeup_deadline_ms = now_ms + follow_up_wait_ms;
-                    return .keep_reading;
+                    return .enter_provider;
                 }
                 return .finish_turn;
             },
@@ -848,9 +857,12 @@ pub fn runAgyTurn(
                 };
                 bg_watch.refresh();
                 const open_bg = calls.openCount() + bg_watch.activeSubagentCount();
-                switch (turn_state.onWaitTimeout(open_bg, bg_watch.takeSubagentReply(), nowMs(io))) {
+                const parent_busy = bg_watch.isParentBusy();
+                const wakeup_signal = bg_watch.takeWakeupSignal();
+                switch (turn_state.onWaitTimeout(open_bg, parent_busy, wakeup_signal, nowMs(io))) {
                     .keep_reading => continue :events,
                     .enter_provider => {
+                        _ = try pending.flushMessage(ap, false, &final_text);
                         publishPhase(opts, .provider);
                         continue :events;
                     },
@@ -929,11 +941,16 @@ pub fn runAgyTurn(
                     break :events;
                 }
                 if (!replaying) bg_watch.refresh();
-                bg_watch.clearSubagentReply();
+                const pending_wakeup = if (replaying) false else bg_watch.hasPendingPromptWakeup();
+                bg_watch.clearWakeupSignal();
                 const open_bg = calls.openCount() + if (replaying) @as(usize, 0) else bg_watch.activeSubagentCount();
-                if (turn_state.onPromptEnd(open_bg) == .enter_background) {
-                    try noteBackgroundWait(gpa, opts, ap, open_bg, backgroundDescription(&calls, &bg_watch, &bg_desc_buf));
-                    continue :events;
+                switch (turn_state.onPromptEnd(open_bg, pending_wakeup)) {
+                    .enter_background => {
+                        try noteBackgroundWait(gpa, opts, ap, open_bg, backgroundDescription(&calls, &bg_watch, &bg_desc_buf));
+                        continue :events;
+                    },
+                    .keep_reading => continue :events,
+                    .enter_provider, .finish_turn => {},
                 }
                 // ACP has no steering into a running prompt: what the user
                 // queued meanwhile is the next prompt. Replaying, the journal
@@ -984,7 +1001,10 @@ pub fn runAgyTurn(
                 const open_bg = calls.openCount() + if (replaying) @as(usize, 0) else bg_watch.activeSubagentCount();
                 switch (turn_state.onUpdate(signal.is_usage, signal.is_work, open_bg)) {
                     .keep_reading, .finish_turn => {},
-                    .enter_provider => if (!replaying) publishPhase(opts, .provider),
+                    .enter_provider => {
+                        bg_watch.clearWakeupSignal();
+                        if (!replaying) publishPhase(opts, .provider);
+                    },
                     .enter_background => {
                         _ = try pending.flushMessage(ap, true, &final_text);
                         try noteBackgroundWait(gpa, opts, ap, open_bg, backgroundDescription(&calls, &bg_watch, &bg_desc_buf));

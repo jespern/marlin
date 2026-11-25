@@ -153,3 +153,132 @@ test "watcher tails new task logs and tracks subagent spawn, transcript, and rep
     watcher.noteSubagentKilled("sub-1");
     try std.testing.expectEqual(@as(usize, 0), watcher.activeSubagentCount());
 }
+
+test "parseParentTranscriptIdle distinguishes idle text reply from active work steps" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try std.testing.expectEqual(@as(?bool, true), agy_watch.parseParentTranscriptIdle(
+        arena,
+        \\{"step_index":670,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"All done."}
+        ,
+    ));
+    try std.testing.expectEqual(@as(?bool, false), agy_watch.parseParentTranscriptIdle(
+        arena,
+        \\{"step_index":668,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command"}]}
+        ,
+    ));
+    try std.testing.expectEqual(@as(?bool, false), agy_watch.parseParentTranscriptIdle(
+        arena,
+        \\{"step_index":671,"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","content":"task-669 finished"}
+        ,
+    ));
+    try std.testing.expectEqual(@as(?bool, false), agy_watch.parseParentTranscriptIdle(
+        arena,
+        \\{"step_index":669,"source":"MODEL","type":"GENERIC","status":"RUNNING","content":"running"}
+        ,
+    ));
+    try std.testing.expectEqual(@as(?bool, false), agy_watch.parseParentTranscriptIdle(
+        arena,
+        \\{"step_index":672,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"hi"}
+        ,
+    ));
+}
+
+test "isWakeupMessage accepts background tasks and subagents but ignores low-priority system notices" {
+    const gpa = std.testing.allocator;
+    const task_msg = try std.json.parseFromSlice(
+        std.json.Value,
+        gpa,
+        \\{"id":"m1","sender":"sess/task-669","priority":"MESSAGE_PRIORITY_HIGH","content":"done"}
+    ,
+        .{},
+    );
+    defer task_msg.deinit();
+    try std.testing.expect(agy_watch.isWakeupMessage(task_msg.value));
+
+    const sub_msg = try std.json.parseFromSlice(
+        std.json.Value,
+        gpa,
+        \\{"id":"m2","sender":"sub-1","content":"SUB_DONE"}
+    ,
+        .{},
+    );
+    defer sub_msg.deinit();
+    try std.testing.expect(agy_watch.isWakeupMessage(sub_msg.value));
+
+    const sys_notice = try std.json.parseFromSlice(
+        std.json.Value,
+        gpa,
+        \\{"id":"m3","sender":"system","priority":"MESSAGE_PRIORITY_LOW","hideFromUser":true,"content":"restarted"}
+    ,
+        .{},
+    );
+    defer sys_notice.deinit();
+    try std.testing.expect(!agy_watch.isWakeupMessage(sys_notice.value));
+}
+
+test "watcher tracks parent transcript busy state, undelivered messages, and read.json delivery" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const brain = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(brain);
+
+    try tmp.dir.createDirPath(io, "sess-p/.system_generated/logs");
+    try tmp.dir.createDirPath(io, "sess-p/.system_generated/messages/undelivered");
+    // Pre-existing trailing SYSTEM_MESSAGE from an earlier crashed turn must NOT mark this turn busy.
+    const transcript_rel = "sess-p/.system_generated/logs/transcript.jsonl";
+    const prior = "{\"step_index\":1,\"source\":\"SYSTEM\",\"type\":\"SYSTEM_MESSAGE\",\"status\":\"DONE\"}\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = transcript_rel, .data = prior });
+    try tmp.dir.writeFile(io, .{ .sub_path = "sess-p/.system_generated/messages/read.json", .data = "{}" });
+
+    var snap = Snapshot{ .gpa = gpa };
+    defer snap.deinit();
+    var tracker = guest_activity.Tracker.init(gpa, Snapshot.publish, &snap);
+    tracker.io = io;
+    defer tracker.deinit();
+
+    var watcher = try agy_watch.Watcher.init(gpa, io, &tracker, "sess-p", brain, null);
+    defer watcher.deinit();
+    watcher.refresh();
+    try std.testing.expect(!watcher.isParentBusy());
+    try std.testing.expect(!watcher.hasPendingPromptWakeup());
+
+    // Background task completes mid-step: writes message + undelivered marker.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "sess-p/.system_generated/messages/m-669.json",
+        .data =
+        \\{"id":"m-669","sender":"sess-p/task-669","priority":"MESSAGE_PRIORITY_HIGH","content":"ok"}
+        ,
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "sess-p/.system_generated/messages/undelivered/m-669.json", .data = "{}" });
+    watcher.refresh();
+    try std.testing.expect(watcher.isParentBusy());
+    try std.testing.expect(watcher.hasPendingPromptWakeup());
+
+    // agy delivers m-669: removes from undelivered, marks read.json, appends SYSTEM_MESSAGE to transcript.jsonl.
+    try tmp.dir.deleteFile(io, "sess-p/.system_generated/messages/undelivered/m-669.json");
+    try tmp.dir.writeFile(io, .{ .sub_path = "sess-p/.system_generated/messages/read.json", .data = "{\"m-669\":true}" });
+    const step_delivered = prior ++
+        "{\"step_index\":670,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"content\":\"waiting\"}\n" ++
+        "{\"step_index\":671,\"source\":\"SYSTEM\",\"type\":\"SYSTEM_MESSAGE\",\"status\":\"DONE\",\"content\":\"task-669 finished\"}\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = transcript_rel, .data = step_delivered });
+    watcher.clearWakeupSignal();
+    watcher.refresh();
+    try std.testing.expect(watcher.isParentBusy());
+    try std.testing.expect(watcher.hasPendingPromptWakeup());
+
+    // Reactive LLM step completes with a tool-less PLANNER_RESPONSE -> parent is idle again.
+    const step_done = step_delivered ++
+        "{\"step_index\":672,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"content\":\"commit landed\"}\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = transcript_rel, .data = step_done });
+    watcher.refresh();
+    try std.testing.expect(!watcher.isParentBusy());
+    try std.testing.expect(!watcher.hasPendingPromptWakeup());
+}
