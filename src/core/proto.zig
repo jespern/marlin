@@ -245,6 +245,8 @@ pub const WebStatus = struct {
 };
 pub const SkillInfo = struct { name: []const u8, description: []const u8 };
 
+pub const ProjectPermissionAction = enum { show, allow, revoke, clear };
+
 pub const ClientMsg = union(enum) {
     web_status: struct {},
     /// /web enable|disable: start or stop the companion now. Durability is
@@ -360,6 +362,13 @@ pub const ClientMsg = union(enum) {
     /// Switch a session's approval mode: "default" = boundary-crossing tools
     /// ask; "auto" = full access, nothing asks (/permissions full).
     session_set_approvals: struct { sid: u64, approvals: []const u8 },
+    /// Owner-only command surface; never exposed as an agent tool. Saved
+    /// roots apply to subsequent turns in this canonical checkout.
+    project_permissions: struct {
+        sid: u64,
+        action: ProjectPermissionAction = .show,
+        path: []const u8 = "",
+    },
     /// Voice for a client on another machine (`--remote`): the daemon's
     /// machine holds the engine, model, and [voice] config, and transcribes;
     /// the client only records. Each gets a voice_status_result.
@@ -706,6 +715,7 @@ pub const DaemonMsg = union(enum) {
         handover: bool = false,
     },
     session_runtime_result: struct { sid: u64, max_runtime_ms: u64, uses_default: bool },
+    project_permissions_result: struct { sid: u64, project: []const u8, write_roots: []const []const u8 },
     /// tokens 0: the guest compacts on its own schedule.
     session_autocompact_result: struct { sid: u64, tokens: u64, uses_default: bool },
     session_created: struct { sid: u64, request_id: u64 = 0 },

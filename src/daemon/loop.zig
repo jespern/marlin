@@ -16,6 +16,7 @@ const process_io = @import("process_io.zig");
 const context = @import("context.zig");
 const approval = @import("approval.zig");
 const permissions = @import("permissions.zig");
+const project_permissions = @import("project_permissions.zig");
 const sandbox = @import("sandbox.zig");
 const network_policy = @import("network_policy.zig");
 const extensions = @import("extensions.zig");
@@ -109,6 +110,8 @@ pub const RunOpts = struct {
     secrets: []const permissions.Secret = &.{},
     /// Kernel sandbox selected only after its runtime canary passes.
     sandbox_options: sandbox.Options = .{},
+    /// Snapshot of owner-selected roots; never inherited by read-only children.
+    project_permissions: ?project_permissions.Profile = null,
     /// Allow-by-default hostname policy for structured network tools.
     network_policy: ?*const network_policy.Policy = null,
     /// Daemon-owned M5 extension registry (exec, MCP, skills, hooks).
@@ -568,6 +571,29 @@ pub fn runTurn(
     attachments: []const block.MediaRef,
 ) !TurnResult {
     var opts = supplied_opts;
+    var permission_memory = std.heap.ArenaAllocator.init(gpa);
+    defer permission_memory.deinit();
+    const uses_project_permissions = if (guestBackend(opts.endpoint)) |guest|
+        (guest == .claude_code or guest == .codex) and effectiveApprovalMode(opts) == .default
+    else
+        true;
+    if (opts.tool_profile == .full and uses_project_permissions) {
+        if (opts.project_permissions == null and opts.guest_attach == null) {
+            opts.project_permissions = project_permissions.load(permission_memory.allocator(), io, store, opts.cwd) catch |err| switch (err) {
+                error.FileNotFound, error.NotDir => null,
+                else => return err,
+            };
+        }
+        if (opts.project_permissions) |saved| {
+            if (opts.sandbox_options.protected) |protected| {
+                for (saved.write_roots) |root| try project_permissions.validateGrant(root, protected);
+            }
+            opts.sandbox_options.write_roots = saved.write_roots;
+        }
+    } else {
+        opts.project_permissions = null;
+        opts.sandbox_options.write_roots = &.{};
+    }
     // Delegated sessions own the agent loop; no context assembly, provider
     // HTTP, or Marlin tool dispatch happens here.
     if (guestBackend(opts.endpoint)) |guest| {
@@ -1048,6 +1074,11 @@ pub fn runTurn(
                     std.mem.eql(u8, call.name, files_tool.edit_spec_name)))
             {
                 sandboxed = permissions.workspaceWriteAllowed(gpa, io, opts.cwd, call.args_json);
+                if (!sandboxed) if (opts.project_permissions) |saved| {
+                    var memory = std.heap.ArenaAllocator.init(gpa);
+                    defer memory.deinit();
+                    sandboxed = project_permissions.allowsEdit(memory.allocator(), io, saved.write_roots, opts.cwd, call.args_json);
+                };
             }
             const decision: approval.Decision = if (call.spec) |s|
                 if (!toolAllowed(opts, s))
@@ -2209,6 +2240,11 @@ pub fn environmentBlock(gpa: std.mem.Allocator, io: Io, opts: *const RunOpts) ![
         .seatbelt, .landlock => "active (kernel-enforced; workspace shell commands run without approval prompts)",
         .unavailable => "inactive (shell commands may require per-call user approval)",
     };
+    const extra_roots = if (opts.project_permissions) |saved|
+        try std.json.Stringify.valueAlloc(gpa, saved.write_roots, .{})
+    else
+        try gpa.dupe(u8, "[]");
+    defer gpa.free(extra_roots);
 
     var network_owned: ?[]u8 = null;
     defer if (network_owned) |n| gpa.free(n);
@@ -2233,6 +2269,7 @@ pub fn environmentBlock(gpa: std.mem.Allocator, io: Io, opts: *const RunOpts) ![
         \\- Working directory: {s} ({s})
         \\- Platform: {s} ({s}) · Today's date: {d:0>4}-{d:0>2}-{d:0>2}
         \\- Shell sandbox: {s}
+        \\- Owner-granted project write directories: {s}
         \\- Network filtering: {s}
     , .{
         opts.cwd,
@@ -2243,6 +2280,7 @@ pub fn environmentBlock(gpa: std.mem.Allocator, io: Io, opts: *const RunOpts) ![
         month_day.month.numeric(),
         month_day.day_index + 1,
         sandbox_desc,
+        extra_roots,
         network_desc,
     });
 }

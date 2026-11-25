@@ -41,6 +41,20 @@ test {
     std.testing.refAllDecls(codex_turn);
 }
 
+test "one-off permission approvals echo exactly the rendered scope and never persist it" {
+    var memory = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const bytes = try std.json.Stringify.valueAlloc(arena, .{ .fileSystem = .{ .write = [_][]const u8{"/build cache"} }, .network = .{ .enabled = false } }, .{});
+    const requested = try std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{});
+    const granted = try codex_turn.permissionGrant(arena, requested, true);
+    try std.testing.expectEqualStrings("turn", granted.object.get("scope").?.string);
+    try std.testing.expectEqualStrings(bytes, try std.json.Stringify.valueAlloc(arena, granted.object.get("permissions").?, .{}));
+    const refused = try codex_turn.permissionGrant(arena, requested, false);
+    try std.testing.expectEqual(@as(usize, 0), refused.object.get("permissions").?.object.count());
+    try std.testing.expectError(error.BadCodexPermissionRequest, codex_turn.permissionGrant(arena, .null, true));
+}
+
 test "authentication errors never enter Codex automatic continuation" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -140,6 +154,99 @@ test "codex permission modes reach new and resumed threads" {
             defer gpa.free(expected);
             try Io.Dir.cwd().writeFile(io, .{ .sub_path = expected_path, .data = expected });
             const result = try loop.runTurn(gpa, io, &store, opts, "check permissions", &.{});
+            defer gpa.free(result.text);
+            try std.testing.expectEqualStrings("OK", result.text);
+        }
+    }
+}
+
+test "saved project roots select the vendor sandbox on fresh and resumed Codex threads only" {
+    const loop = @import("../loop.zig");
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var temp = try @import("../../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-codex-project-policy");
+    defer temp.deinit();
+    var memory = std.heap.ArenaAllocator.init(gpa);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const script =
+        \\#!/usr/bin/env python3
+        \\import json, sys
+        \\expected = json.load(open("expected.json"))
+        \\for line in sys.stdin:
+        \\    request = json.loads(line)
+        \\    method = request.get("method")
+        \\    params = request.get("params", {})
+        \\    result = None
+        \\    if method == "initialize":
+        \\        assert params["capabilities"]["experimentalApi"] == expected["scoped"]
+        \\        result = {}
+        \\    elif method == "account/read":
+        \\        result = {"account": {"type": "chatgpt"}}
+        \\    elif method in ("thread/start", "thread/resume"):
+        \\        assert method == expected["method"]
+        \\        assert params["approvalPolicy"] == expected["approval"]
+        \\        if expected["scoped"]:
+        \\            assert params["permissions"] == "marlin_project" and params["sandbox"] is None
+        \\            config = params["config"]
+        \\            assert config["default_permissions"] == "marlin_project"
+        \\            policy = config["permissions"]["marlin_project"]
+        \\            assert policy["extends"] == ":workspace" and policy["network"]["enabled"]
+        \\            assert policy["filesystem"] == {expected["cache"]: "write"}
+        \\        else:
+        \\            assert params["permissions"] is None and params["config"] is None
+        \\            assert params["sandbox"] == expected["sandbox"]
+        \\        result = {"thread": {"id": "project-thread"}}
+        \\    elif method == "turn/start":
+        \\        assert params["permissions"] == ("marlin_project" if expected["scoped"] else None)
+        \\        result = {"turn": {"id": "project-turn"}}
+        \\    if result is not None:
+        \\        print(json.dumps({"id": request["id"], "result": result}), flush=True)
+        \\    if method == "turn/start":
+        \\        print(json.dumps({"method": "item/completed", "params": {"item": {"id": "answer", "type": "agentMessage", "text": "OK", "phase": "final_answer"}}}), flush=True)
+        \\        print(json.dumps({"method": "turn/completed", "params": {"turn": {"id": "project-turn", "status": "completed"}}}), flush=True)
+    ;
+    const peer = try std.fs.path.joinZ(arena, &.{ temp.path, "peer" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = peer, .data = script });
+    _ = std.c.chmod(peer, 0o755);
+    const expected_path = try std.fs.path.join(arena, &.{ temp.path, "expected.json" });
+    const cache = try @import("../project_permissions.zig").canonicalPath(arena, io, temp.path, "build cache");
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put(codex.binary_env, peer);
+    try env.put("PATH", "/usr/bin:/bin");
+    var store = try Store.open(gpa, null);
+    defer store.close();
+    const project = try @import("../project_permissions.zig").projectRoot(arena, io, temp.path);
+    for ([_]loop.ToolProfile{ .full, .read_only, .plan }, 1..) |tool_profile, sid| {
+        try store.createSession(sid, 0, temp.path, "codex/default", .auto);
+        for ([_]approval.Mode{ .default, .auto, .default }, 0..) |mode, turn| {
+            const scoped = tool_profile == .full and mode == .default;
+            const expected = try std.json.Stringify.valueAlloc(arena, .{
+                .scoped = scoped,
+                .method = if (turn == 0) "thread/start" else "thread/resume",
+                .approval = if (tool_profile != .full or mode == .auto) "never" else "on-request",
+                .sandbox = if (tool_profile != .full) "read-only" else if (mode == .auto) "danger-full-access" else "workspace-write",
+                .cache = cache,
+            }, .{});
+            try Io.Dir.cwd().writeFile(io, .{ .sub_path = expected_path, .data = expected });
+            // Full access and read-only profiles remain usable even if a
+            // saved project record is corrupt; neither consumes that grant.
+            try store.setProjectPermissions(project, if (scoped)
+                try std.json.Stringify.valueAlloc(arena, .{ .write_roots = [_][]const u8{cache} }, .{})
+            else
+                "invalid fixture record");
+            const result = try loop.runTurn(gpa, io, &store, .{
+                .session_id = sid,
+                .cwd = temp.path,
+                .endpoint = .{ .url = "", .bearer = null, .model = "default", .backend = .{ .guest = .codex } },
+                .cfg = config.defaults(),
+                .tool_environ = &env,
+                .tool_profile = tool_profile,
+                .approval_mode = mode,
+            }, "use the saved project roots", &.{});
             defer gpa.free(result.text);
             try std.testing.expectEqualStrings("OK", result.text);
         }

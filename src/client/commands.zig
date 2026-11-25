@@ -36,7 +36,7 @@ pub const composer_commands = [_]ComposerCommand{
     .{ .name = "/runtime", .usage = " [duration|off|default]", .description = "show or change this session’s guest runtime limit", .accepts_args = true },
     .{ .name = "/autocompact", .usage = " [300k|off|default]", .description = "show or change when this session’s Claude Code compacts its context", .accepts_args = true },
     .{ .name = "/sandbox", .usage = " [on|off]", .description = "toggle the shell sandbox for this session", .accepts_args = true },
-    .{ .name = "/permissions", .usage = " [full|default]", .description = "full access (no prompts) or default approvals", .accepts_args = true },
+    .{ .name = "/permissions", .usage = " [full|default|list|allow <path>|revoke <path>|clear]", .description = "session mode and saved project write roots", .accepts_args = true },
     .{ .name = "/network", .usage = " [on|off|status]", .description = "control managed-tool domain blocking", .accepts_args = true },
     .{ .name = "/plugin", .usage = " [list|marketplace|install|uninstall]", .description = "manage plugins (skills and MCP servers) and marketplaces", .accepts_args = true },
     .{ .name = "/mcp", .usage = " [add|remove|restart|reload|login|logout|token]", .description = "inspect and manage MCP servers; login signs in to a remote one; token lets an assistant outside Marlin in", .accepts_args = true },
@@ -1354,11 +1354,22 @@ pub fn networkCommand(self: *App, arg: []const u8) void {
     self.setNotice("network filter {s} for this session", .{if (target) @as([]const u8, "on") else "off"});
 }
 
-/// /permissions full|default — session-wide approval switch. Full
-/// access means NOTHING asks (the --yolo mode, chosen mid-session);
-/// default restores boundary-crossing prompts. Tracked optimistically:
-/// the daemon rejects mid-turn switches with a visible err notice.
+/// Session mode changes apply immediately; saved project roots apply to
+/// subsequent turns and do not change the session's approval mode.
 pub fn setPermissions(self: *App, arg: []const u8) void {
+    if (std.mem.eql(u8, arg, "list") or std.mem.eql(u8, arg, "clear") or
+        std.mem.startsWith(u8, arg, "allow ") or std.mem.startsWith(u8, arg, "revoke "))
+    {
+        const action: proto.ProjectPermissionAction =
+            if (std.mem.eql(u8, arg, "list")) .show else if (std.mem.eql(u8, arg, "clear")) .clear else if (std.mem.startsWith(u8, arg, "allow ")) .allow else .revoke;
+        const raw_path = if (action == .allow or action == .revoke)
+            std.mem.trim(u8, arg[if (action == .allow) @as(usize, 6) else 7..], " \t")
+        else
+            "";
+        const path = if (raw_path.len >= 2 and (raw_path[0] == '\'' or raw_path[0] == '"') and raw_path[raw_path.len - 1] == raw_path[0]) raw_path[1 .. raw_path.len - 1] else raw_path;
+        self.conn.send(.{ .project_permissions = .{ .sid = self.view.sid, .action = action, .path = path } }) catch return;
+        return;
+    }
     const full = if (std.mem.eql(u8, arg, "full"))
         true
     else if (std.mem.eql(u8, arg, "default"))
@@ -1366,7 +1377,7 @@ pub fn setPermissions(self: *App, arg: []const u8) void {
     else if (arg.len == 0)
         !self.view.permissions_full
     else {
-        self.setNotice("usage: /permissions [full|default]", .{});
+        self.setNotice("usage: /permissions [full|default|list|allow <path>|revoke <path>|clear]", .{});
         return;
     };
     const mode: []const u8 = if (full) "auto" else "default";

@@ -155,6 +155,7 @@ const Check = struct {
     /// steering while parked, and reboot refusal are one state-machine flow.
     approval_reconnect_flow: bool = false,
     session_restore_flow: bool = false,
+    project_permissions_flow: bool = false,
     codex_question_flow: bool = false,
     /// `marlin --remote <host> reboot --then …` through a fake ssh to this
     /// scenario's daemon: the follow-up must reach the remote daemon too.
@@ -414,7 +415,7 @@ fn runScenario(
 
     // 3. Run ordinary CLI scenarios, or the direct multi-connection protocol
     // regression that cannot be expressed as a one-shot headless command.
-    if (sf.check.approval_reconnect_flow or sf.check.pause_flow.len > 0 or sf.check.session_restore_flow or sf.check.codex_question_flow or sf.check.remote_reboot_flow or sf.check.handover_flow.len > 0) {
+    if (sf.check.approval_reconnect_flow or sf.check.pause_flow.len > 0 or sf.check.session_restore_flow or sf.check.project_permissions_flow or sf.check.codex_question_flow or sf.check.remote_reboot_flow or sf.check.handover_flow.len > 0) {
         const started = try process_io.run(gpa, io, .{
             .argv = &.{ marlin_bin, "ls" },
             .environ_map = &env,
@@ -432,6 +433,8 @@ fn runScenario(
             try checkRemoteRebootFlow(gpa, io, &env, state_dir, marlin_bin, &process_groups)
         else if (sf.check.codex_question_flow)
             try checkCodexQuestionFlow(gpa, io, &env, state_dir)
+        else if (sf.check.project_permissions_flow)
+            try checkProjectPermissionsFlow(gpa, io, &env, state_dir, marlin_bin, &process_groups)
         else if (sf.check.session_restore_flow)
             try checkSessionRestoreFlow(gpa, io, &env, state_dir, marlin_bin, &process_groups)
         else if (sf.check.pause_flow.len > 0)
@@ -1227,6 +1230,64 @@ fn assertFullAccess(conn: *ProtocolConn, arena: std.mem.Allocator, sid: u64, exp
         return;
     }
     return error.SessionIdMissing;
+}
+
+fn checkProjectPermissionsFlow(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, cwd: []const u8, exe: []const u8, groups: *std.ArrayList(std.posix.pid_t)) !void {
+    var memory = std.heap.ArenaAllocator.init(gpa);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const checkout = try std.fs.path.join(arena, &.{ cwd, "project" });
+    const other = try std.fs.path.join(arena, &.{ cwd, "project-other" });
+    const cache = try std.fs.path.join(arena, &.{ cwd, "build cache" });
+    try Io.Dir.cwd().createDirPath(io, try std.fs.path.join(arena, &.{ checkout, ".git" }));
+    try Io.Dir.cwd().createDirPath(io, other);
+    try Io.Dir.cwd().createDirPath(io, cache);
+    var conn = try connectProtocol(gpa, io, env);
+    defer conn.deinit();
+    const first = try pauseCreate(conn, arena, checkout, "default");
+    try conn.send(.{ .project_permissions = .{ .sid = first, .action = .allow, .path = cache } });
+    const saved = try recvTagBounded(conn, arena, "project_permissions_result");
+    const canonical_cache = try Io.Dir.realPathFileAbsoluteAlloc(io, cache, arena);
+    const roots = saved.get("write_roots").?.array.items;
+    if (roots.len != 1 or !std.mem.eql(u8, roots[0].string, canonical_cache)) return error.ProjectGrantNotSaved;
+    try assertFullAccess(conn, arena, first, false);
+    // A separate session immediately sees the saved project permission;
+    // a similarly named sibling never inherits it.
+    const second = try pauseCreate(conn, arena, checkout, "default");
+    try conn.send(.{ .project_permissions = .{ .sid = second } });
+    const inherited = try recvTagBounded(conn, arena, "project_permissions_result");
+    if (inherited.get("write_roots").?.array.items.len != 1) return error.ProjectGrantNotInherited;
+    const sibling = try pauseCreate(conn, arena, other, "default");
+    try conn.send(.{ .project_permissions = .{ .sid = sibling } });
+    const isolated = try recvTagBounded(conn, arena, "project_permissions_result");
+    if (isolated.get("write_roots").?.array.items.len != 0) return error.ProjectGrantEscaped;
+    const secret = try std.fs.path.join(arena, &.{ env.get("HOME") orelse return error.NoHome, ".ssh" });
+    try conn.send(.{ .project_permissions = .{ .sid = first, .action = .allow, .path = secret } });
+    const denied = try recvTagBounded(conn, arena, "err");
+    if (!std.mem.eql(u8, stringField(denied, "code") orelse "", "permission_path_refused")) return error.ProtectedProjectGrantAllowed;
+    for (0..2) |restart| {
+        try conn.send(.{ .reboot = .{ .suspend_sessions = true } });
+        _ = try recvTagBounded(conn, arena, "ok");
+        while (true) {
+            _ = recvBounded(conn, arena) catch |err| {
+                if (err != error.EndOfStream and err != error.ReadFailed) return err;
+                break;
+            };
+        }
+        try pauseStartDaemon(gpa, io, env, cwd, exe, groups);
+        const replacement = try connectProtocol(gpa, io, env);
+        conn.deinit();
+        conn = replacement;
+        try conn.send(.{ .project_permissions = .{ .sid = second } });
+        const restored = try recvTagBounded(conn, arena, "project_permissions_result");
+        if (restored.get("write_roots").?.array.items.len != (if (restart == 0) @as(usize, 1) else 0)) return error.ProjectGrantRestoreMismatch;
+        try assertFullAccess(conn, arena, second, false);
+        if (restart == 0) {
+            try conn.send(.{ .project_permissions = .{ .sid = first, .action = .revoke, .path = cache } });
+            const revoked = try recvTagBounded(conn, arena, "project_permissions_result");
+            if (revoked.get("write_roots").?.array.items.len != 0) return error.ProjectGrantNotRevoked;
+        }
+    }
 }
 
 fn checkSessionRestoreFlow(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, cwd: []const u8, exe: []const u8, groups: *std.ArrayList(std.posix.pid_t)) !void {

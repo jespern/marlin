@@ -60,6 +60,7 @@ pub const Options = struct {
     /// parameterized on these roots and the profile does not compile with
     /// an unbound parameter.
     protected: ?ProtectedRoots = null,
+    write_roots: []const []const u8 = &.{},
 };
 
 /// Every path a sandboxed shell receives arrives through this struct so the
@@ -68,6 +69,7 @@ pub const Paths = struct {
     workspace: []const u8,
     temp_root: []const u8,
     protected: ProtectedRoots,
+    write_roots: []const []const u8 = &.{},
 };
 
 /// Parameters avoid interpolating paths into private SBPL syntax. Ordinary
@@ -112,10 +114,18 @@ pub fn seatbeltArgv(
         .{ .name = "PROTECTED_MARLIN", .value = paths.protected.marlin_credentials },
     };
     var argv: std.ArrayList([]const u8) = .empty;
-    try argv.appendSlice(arena, &.{ "/usr/bin/sandbox-exec", "-p", seatbelt_profile });
+    var profile: std.ArrayList(u8) = .empty;
+    try profile.appendSlice(arena, seatbelt_profile);
+    for (paths.write_roots, 0..) |_, index| {
+        try profile.appendSlice(arena, try std.fmt.allocPrint(arena, "\n(allow file-write* (subpath (param \"PROJECT_WRITE_{d}\")))", .{index}));
+    }
+    try argv.appendSlice(arena, &.{ "/usr/bin/sandbox-exec", "-p", profile.items });
     for (defs) |def| {
         try argv.append(arena, "-D");
         try argv.append(arena, try std.fmt.allocPrint(arena, "{s}={s}", .{ def.name, def.value }));
+    }
+    for (paths.write_roots, 0..) |path, index| {
+        try argv.appendSlice(arena, &.{ "-D", try std.fmt.allocPrint(arena, "PROJECT_WRITE_{d}={s}", .{ index, path }) });
     }
     try argv.appendSlice(arena, &.{ "/bin/bash", "-c", shell_command, "--" });
     try argv.appendSlice(arena, extra_args);
@@ -148,6 +158,7 @@ pub fn landlockArgv(
         try argv.append(arena, "--protect");
         try argv.append(arena, root);
     }
+    for (paths.write_roots) |path| try argv.appendSlice(arena, &.{ "--write", path });
     try argv.appendSlice(arena, &.{ "--", "/bin/bash", "-c", shell_command, "--" });
     try argv.appendSlice(arena, extra_args);
     return argv.toOwnedSlice(arena);

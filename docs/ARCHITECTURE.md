@@ -1188,7 +1188,9 @@ explicit note. Rejected: bundling an `rg` sidecar; Marlin remains one binary.
   legacy policy remains per-tool `auto | ask | deny` until capability mode is
   enabled: read-only tools auto, mutating tools ask.
 - Capability mode asks for a typed operation and concrete scope, not a command
-  prefix. Decisions are deny, allow once, or allow for this session. There is
+  prefix. Decisions are deny, allow once, or allow for this session. Owner commands
+  also save canonical project write roots across sessions (PERMISSIONS.md);
+  vendor guests use their supported filesystem sandbox settings. There is
   intentionally no `git *` allowlist: commands sharing a prefix do not share a
   risk boundary.
 - `--yolo` skips legacy convenience prompts; it does not bypass protected

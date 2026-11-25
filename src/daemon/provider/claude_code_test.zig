@@ -166,6 +166,39 @@ test "argv: fresh vs resume, model passthrough, permission mapping" {
     try std.testing.expect(saw_bypass);
 }
 
+test "argv: scoped settings keep the approval bridge and explicit modes separate" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const settings = try @import("../project_permissions.zig").claudeSettings(arena, .{ .write_roots = &.{"/cache with spaces"} }, null);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, settings, .{});
+    try std.testing.expect(parsed.object.get("sandbox").?.object.get("enabled").?.bool);
+    try std.testing.expect(parsed.object.get("sandbox").?.object.get("failIfUnavailable").?.bool);
+    try std.testing.expectEqualStrings("/cache with spaces", parsed.object.get("sandbox").?.object.get("filesystem").?.object.get("allowWrite").?.array.items[0].string);
+    for ([_]claude_code.Permissions{ .accept_edits, .bypass, .plan }) |mode| {
+        const argv = try buildArgv(arena, .{
+            .binary = "claude",
+            .model = "default",
+            .session_uuid = "fixture",
+            .fresh = true,
+            .permissions = mode,
+            .bridge = .{ .marlin_exe = "/opt/marlin", .sid = 42 },
+            .project_settings = settings,
+        });
+        var settings_count: usize = 0;
+        var bridge = false;
+        for (argv, 0..) |arg, i| {
+            if (std.mem.eql(u8, arg, "--settings")) {
+                settings_count += 1;
+                try std.testing.expectEqualStrings(settings, argv[i + 1]);
+            }
+            if (std.mem.eql(u8, arg, "--permission-prompt-tool")) bridge = true;
+        }
+        try std.testing.expectEqual(@as(usize, if (mode == .accept_edits) 1 else 0), settings_count);
+        try std.testing.expectEqual(mode == .accept_edits, bridge);
+    }
+}
+
 test "decode: init, assistant blocks, tool_result shapes, result usage" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

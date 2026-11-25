@@ -2623,6 +2623,12 @@ pub const App = struct {
                 const duration = config.formatDuration(&duration_buf, result.max_runtime_ms) catch return;
                 self.setNotice("guest runtime: {s} ({s}) — measured from invocation start, excluding user waits", .{ duration, if (result.uses_default) @as([]const u8, "default") else "session override" });
             },
+            .project_permissions_result => |result| {
+                if (result.sid != self.view.sid) return;
+                const roots = std.mem.join(self.gpa, ", ", result.write_roots) catch return;
+                defer self.gpa.free(roots);
+                self.setNotice("saved project write roots: {s} — next turn; full access remains separate", .{if (roots.len == 0) "none" else roots});
+            },
             .session_created => |sc| self.handleSessionCreated(sc.sid, sc.request_id),
             .session_list_result => |sl| self.replaceSessionSummaries(sl.sessions),
             .input_history_result => |history| {

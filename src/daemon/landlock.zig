@@ -71,6 +71,8 @@ pub fn run(
         var temp_root: ?[]const u8 = null;
         var protects: std.ArrayList([]const u8) = .empty;
         defer protects.deinit(gpa);
+        var writes: std.ArrayList([]const u8) = .empty;
+        defer writes.deinit(gpa);
         var exec_args: []const [:0]const u8 = &.{};
 
         var i: usize = 0;
@@ -88,6 +90,9 @@ pub fn run(
             } else if (std.mem.eql(u8, arg, "--protect") and i + 1 < args.len) {
                 i += 1;
                 try protects.append(gpa, args[i]);
+            } else if (std.mem.eql(u8, arg, "--write") and i + 1 < args.len) {
+                i += 1;
+                try writes.append(gpa, args[i]);
             } else {
                 std.log.err("landlock_exec: unknown argument '{s}'", .{arg});
                 return exit_setup_failed;
@@ -97,7 +102,7 @@ pub fn run(
         const tmp = temp_root orelse return exit_setup_failed;
         if (exec_args.len == 0) return exit_setup_failed;
 
-        restrictSelf(gpa, io, ws, tmp, protects.items) catch |e| {
+        restrictSelf(gpa, io, ws, tmp, protects.items, writes.items) catch |e| {
             std.log.err("landlock setup failed: {t}", .{e});
             return if (e == error.LandlockUnsupported) exit_unsupported else exit_setup_failed;
         };
@@ -119,6 +124,7 @@ fn restrictSelf(
     workspace: []const u8,
     temp_root: []const u8,
     protects: []const []const u8,
+    write_roots: []const []const u8,
 ) !void {
     if (builtin.os.tag != .linux) return error.LandlockUnsupported;
     const linux = std.os.linux;
@@ -148,6 +154,7 @@ fn restrictSelf(
     // Full rights on the write roots; read+exec on the computed cover.
     try grant(arena, ruleset_fd, workspace, handled);
     try grant(arena, ruleset_fd, temp_root, handled);
+    for (write_roots) |path| try grant(arena, ruleset_fd, path, handled);
     const cover = try coverPlan(arena, io, protects);
     for (cover) |path| {
         // A cover entry that vanished between planning and granting is not

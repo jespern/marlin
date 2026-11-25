@@ -67,6 +67,8 @@ pub const ArgvOpts = struct {
     /// The user's profile section, appended after Marlin's own instructions
     /// on every invocation. Empty = none.
     profile: []const u8 = "",
+    /// Invocation-local filesystem policy. No vendor settings file is edited.
+    project_settings: ?[]const u8 = null,
 };
 
 /// Marlin's standing guest instructions plus the user's profile, if any.
@@ -149,6 +151,9 @@ pub fn buildArgv(arena: std.mem.Allocator, opts: ArgvOpts) ![]const []const u8 {
         },
         .bypass => try argv.append(arena, "--dangerously-skip-permissions"),
         .plan => try argv.appendSlice(arena, &.{ "--permission-mode", "plan" }),
+    }
+    if (opts.permissions == .accept_edits) {
+        if (opts.project_settings) |settings| try argv.appendSlice(arena, &.{ "--settings", settings });
     }
     if (opts.max_turns) |limit| {
         try argv.appendSlice(arena, &.{

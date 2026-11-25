@@ -64,6 +64,7 @@ const recap = @import("recap.zig");
 const recap_limits = @import("../core/recap.zig");
 const approval = @import("approval.zig");
 const permissions = @import("permissions.zig");
+const project_permissions = @import("project_permissions.zig");
 const shell_pty = @import("shell_pty.zig");
 const shell_host = @import("shell_host.zig");
 const shell_env = @import("shell_env.zig");
@@ -840,10 +841,8 @@ pub const Daemon = struct {
         // the protected-path contract, so it must not claim enforcement.
         var protected_roots: ?sandbox.ProtectedRoots = null;
         defer if (protected_roots) |*roots| roots.deinit(gpa);
-        if (sandbox_backend != .unavailable) {
-            protected_roots = sandbox.resolveProtectedRoots(gpa, io, environ) catch null;
-            if (protected_roots == null) sandbox_backend = .unavailable;
-        }
+        protected_roots = sandbox.resolveProtectedRoots(gpa, io, environ) catch null;
+        if (protected_roots == null) sandbox_backend = .unavailable;
         std.log.info("shell sandbox {s}; new sessions {s}", .{
             switch (sandbox_backend) {
                 .seatbelt => @as([]const u8, "verified (seatbelt)"),
@@ -2951,6 +2950,57 @@ pub const Daemon = struct {
                 self.sendTo(client, .{ .ok = .{} });
                 self.broadcastSessionUpsert(sa.sid);
             },
+            .project_permissions => |request| {
+                const session = (try self.getOrLoadSession(request.sid)) orelse {
+                    self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
+                    return;
+                };
+                if (session.kind != .root) {
+                    self.sendTo(client, .{ .err = .{ .code = "read_only", .msg = "project permissions belong to a root session" } });
+                    return;
+                }
+                var memory = std.heap.ArenaAllocator.init(self.gpa);
+                defer memory.deinit();
+                const arena = memory.allocator();
+                const project = project_permissions.projectRoot(arena, self.io, session.cwd) catch {
+                    self.sendTo(client, .{ .err = .{ .code = "cwd_unavailable", .msg = "project directory unavailable" } });
+                    return;
+                };
+                const saved = if (request.action == .show)
+                    (project_permissions.read(arena, &self.store, project) catch {
+                        self.sendTo(client, .{ .err = .{ .code = "permissions_invalid", .msg = "saved project permissions are invalid; clear them before retrying" } });
+                        return;
+                    }) orelse project_permissions.Profile{}
+                else if (request.action == .clear) blk: {
+                    try self.store.setProjectPermissions(project, null);
+                    break :blk project_permissions.Profile{};
+                } else blk: {
+                    const protected = self.protected_roots orelse {
+                        self.sendTo(client, .{ .err = .{ .code = "permissions_unavailable", .msg = "protected credential roots could not be resolved" } });
+                        return;
+                    };
+                    const requested = if (std.mem.eql(u8, request.path, "~") or std.mem.startsWith(u8, request.path, "~/"))
+                        try std.fmt.allocPrint(arena, "{s}{s}", .{ self.environ.get("HOME") orelse "", request.path[1..] })
+                    else
+                        request.path;
+                    const action: project_permissions.Action = switch (request.action) {
+                        .allow => .allow,
+                        .revoke => .revoke,
+                        .clear => .clear,
+                        .show => unreachable,
+                    };
+                    break :blk project_permissions.update(arena, self.io, &self.store, session.cwd, action, requested, protected) catch |err| {
+                        self.sendTo(client, .{ .err = .{ .code = "permission_path_refused", .msg = switch (err) {
+                            error.ProtectedPath => "path includes protected credentials; grant a specific project or cache directory",
+                            error.FileNotFound, error.NotDir => "grant an existing directory; create the intended location first",
+                            error.ProjectPermissionPathChanged => "permission path changed while checking it; retry after inspecting the symlink",
+                            else => "project permissions could not be saved; inspect or clear the existing grants",
+                        } } });
+                        return;
+                    };
+                };
+                self.sendTo(client, .{ .project_permissions_result = .{ .sid = request.sid, .project = project, .write_roots = saved.write_roots } });
+            },
             .session_set_network_filtering => |sn| {
                 const session = (try self.getOrLoadSession(sn.sid)) orelse {
                     self.sendTo(client, .{ .err = .{ .code = "no_session", .msg = "unknown session" } });
@@ -3478,6 +3528,25 @@ pub const Daemon = struct {
                 {
                     self.sendTo(client, .{ .cc_approval_result = .{ .sid = ca.sid, .decision = .granted } });
                     return;
+                }
+                if (std.mem.eql(u8, ca.tool, "Edit") or std.mem.eql(u8, ca.tool, "Write") or std.mem.eql(u8, ca.tool, "MultiEdit") or std.mem.eql(u8, ca.tool, "NotebookEdit")) {
+                    var memory = std.heap.ArenaAllocator.init(self.gpa);
+                    defer memory.deinit();
+                    const arena = memory.allocator();
+                    const args = std.json.parseFromSliceLeaky(struct {
+                        file_path: ?[]const u8 = null,
+                        notebook_path: ?[]const u8 = null,
+                        path: ?[]const u8 = null,
+                    }, arena, ca.args_json, .{ .ignore_unknown_fields = true }) catch null;
+                    const saved = project_permissions.load(arena, self.io, &self.store, session.cwd) catch null;
+                    if (args != null and saved != null) {
+                        if (args.?.file_path orelse args.?.notebook_path orelse args.?.path) |path| {
+                            if (!permissions.isProtectedPath(path) and project_permissions.allowsPath(arena, self.io, saved.?.write_roots, session.cwd, path)) {
+                                self.sendTo(client, .{ .cc_approval_result = .{ .sid = ca.sid, .decision = .granted } });
+                                return;
+                            }
+                        }
+                    }
                 }
                 if (session.cc_pending != null) {
                     // The bridge serializes prompts; a second concurrent
@@ -5247,7 +5316,7 @@ pub const Daemon = struct {
 
         var sandbox_temp: ?[]u8 = null;
         defer if (sandbox_temp) |path| self.gpa.free(path);
-        var sandbox_options = sandbox.Options{};
+        var sandbox_options = sandbox.Options{ .protected = self.protected_roots };
         if (self.sandbox_backend != .unavailable and job.sandbox_enabled) {
             const tmp_root = self.environ.get("TMPDIR") orelse
                 (if (@import("builtin").os.tag == .macos) "/private/tmp" else "/tmp");

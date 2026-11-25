@@ -19,6 +19,7 @@ const process_io = @import("../process_io.zig");
 const context = @import("../context.zig");
 const approval = @import("../approval.zig");
 const permissions = @import("../permissions.zig");
+const project_permissions = @import("../project_permissions.zig");
 const sandbox = @import("../sandbox.zig");
 const provider = @import("../provider/provider.zig");
 const anthropic = @import("../provider/anthropic.zig");
@@ -459,6 +460,10 @@ fn ccInvoke(
         .max_turns = if (opts.auto_continue_round_budget) null else opts.max_rounds,
         .effort = opts.effort,
         .profile = profile.load(arena, io, opts.tool_environ, opts.cwd) orelse "",
+        .project_settings = if (opts.tool_profile == .full and effectiveApprovalMode(opts) == .default)
+            try project_permissions.claudeSettings(arena, opts.project_permissions, opts.sandbox_options.protected)
+        else
+            null,
     });
 
     // A bridged permission prompt can park on a human for a long time;

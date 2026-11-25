@@ -42,27 +42,43 @@ Current progress:
   hatch). Typed protected-read refusals for direct read tools have landed
   (files.zig / search.zig refuse as tool-result data).
 
-Guest sessions (ARCHITECTURE.md, Native vs guest) do **not** run this
-permission matrix. Their official binary has its own tools and permissions.
-The Marlin approval bar parks guest prompts as multiplexer UX — a session
-needs a human — rather than dispatching a Marlin tool. Claude Code uses the
-`cc_approval` bridge and its deliberately coarse `ccAutoAllow` heuristic.
-Codex app-server requests flow directly through the shared gate. Root threads
-use `workspace-write` with `on-request` approvals in default mode; Full
-Permissions (`auto`) uses `danger-full-access` with `never` approvals so Git
-metadata writes are not trapped behind a sandbox that cannot ask for access.
-These settings are applied on both thread start and resume; a running guest
-adopts sandbox changes on its next Marlin turn. Plan/child threads always stay
-read-only with approvals disabled. The Codex subprocess also receives the
-scrubbed tool environment, so daemon-held provider keys cannot become agent
-shell environment. None of these are native `read_file` policy.
+Guest sessions (ARCHITECTURE.md, Native vs guest) use their vendor's own
+sandbox. Marlin passes the policy through supported vendor settings and parks
+requests for additional authority on its approval bar; it does not interpret
+shell text as proof of what a command can write.
+
+- Claude Code root sessions in default mode use its built-in Bash sandbox and
+  auto-allow confined commands. Ordinary external reads remain available;
+  workspace writes, temporary files and saved project write roots are allowed.
+  The existing protected credential roots are denied in both its sandbox and
+  file-tool settings. A Bash prompt that reaches `cc_approval` always asks:
+  this includes an unsandboxed retry, even when its command looks harmless.
+  Without a usable vendor sandbox, default mode retains approvals; a saved
+  project profile requires the sandbox (`failIfUnavailable`). Full access and
+  read-only child/plan sessions keep their separate vendor modes.
+- Codex default root threads use `workspace-write` / `on-request` until the
+  owner saves a project grant. Then Marlin selects an invocation-local named
+  permission profile extending `:workspace`, with only those additional write
+  roots and the protected credential-root denials. Explicit `.git` grants can
+  override its default Git metadata protection. The profile and required
+  `experimentalApi` capability are supplied on fresh and resumed threads.
+  Full access remains `danger-full-access` / `never`; read-only children and
+  plan threads never inherit project grants. One-off permission requests are
+  approved for the current turn only and do not become saved project grants.
+
+These are filesystem scopes, not a policy against every external effect a
+program can cause. Networking stays available as before (Claude uses its own
+proxy with all hosts permitted, local binding and Unix sockets; Codex has
+network access enabled). Managed vendor restrictions still take precedence.
+No vendor settings file or dependency pin is changed.
 
 ## Product contract
 
 Marlin approves capabilities, not command prefixes. Every tool call continues
 through the existing daemon approval gate, but the request describes the
 operation and scope being granted. A grant is either for one operation or the
-current session; there are no durable global grants in M3.5.
+current session. Owner-selected project write roots are durable; there are no
+durable global command-prefix grants.
 
 The initial capability vocabulary is deliberately small:
 
@@ -76,9 +92,9 @@ The initial capability vocabulary is deliberately small:
 | `network.fetch` | allow for the built-in GET tool | one URL/host |
 | `env.secret` | deny | one named environment variable |
 
-`--yolo` may bypass approval prompts, but it must not bypass protected-path,
-secret-environment, or sandbox boundaries. Those require an explicit
-capability escalation even in a yolo session.
+For native sessions, `--yolo` bypasses approval prompts while protected-path,
+secret-environment and sandbox boundaries remain enforced. Guest full access
+uses the vendor's separate bypass mode described above.
 
 Capability permissions are enabled by default (`MARLIN_PERMISSIONS=0` opts
 out until TOML config lands). Default-on is safe ahead of the full exit
@@ -98,6 +114,41 @@ resolves that prompt on the spot (that parked prompt is precisely when full
 access is wanted). The status bar shows a FULL ACCESS warning while active;
 the grant is stored per session and survives tab switches and daemon restarts.
 `/permissions default` revokes it durably. Other sessions retain their own mode.
+
+### Saved project write roots
+
+Use the existing command; paths are resolved on the daemon host, including
+`~` over a remote connection:
+
+```text
+/permissions allow .git
+/permissions allow ~/Library/Caches/go-build
+/permissions allow ../my-project-worktrees
+/permissions list
+/permissions revoke ~/Library/Caches/go-build
+/permissions clear
+```
+
+`allow` requires an existing directory and records its canonical path in the
+owner's store, outside the repository. It grants that directory and its
+contents, not every path mentioned by a shell command. Review the directory:
+a cache shared across projects becomes writable by sessions in this project.
+Credential roots and their ancestors are refused. A later symlink substitution
+invalidates the grant instead of silently changing its target.
+
+Grants apply to new turns and new sessions in the same checkout, survive daemon
+restart, and follow a linked worktree only when the main checkout's own Git
+metadata has a matching backlink. A forged `.git` pointer cannot inherit another
+project's grants. Similarly named sibling projects remain independent. Revocation
+and clear affect subsequent turns; an already running guest keeps the sandbox
+it started with. Native file tools check the declared target before approval;
+Bash uses the verified Seatbelt/Landlock write roots. A native platform without
+a verified sandbox keeps its approval fallback.
+
+Saving grants does not select full access or change the current session's mode.
+If it is already in full access, use `/permissions default` to return to the
+bounded policy. Grants are exposed only as owner commands, never model tools.
+The existing `kv` store holds the record; no schema migration is needed.
 
 `/sandbox on|off` toggles the shell sandbox per session; the config flag only
 seeds each session's default. Off means prompts return AND approved shell

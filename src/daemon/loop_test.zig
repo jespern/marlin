@@ -383,7 +383,7 @@ test "environment block reports cwd, git absence, and inactive regimes" {
     defer temp.deinit();
     const dir = temp.path;
 
-    const opts = RunOpts{
+    var opts = RunOpts{
         .session_id = 1,
         .cwd = dir,
         .endpoint = .{ .url = "http://unused", .bearer = null, .model = "m", .backend = .{ .native = .openai_compatible } },
@@ -397,6 +397,10 @@ test "environment block reports cwd, git absence, and inactive regimes" {
     try std.testing.expect(std.mem.indexOf(u8, env, "not a git repository") != null);
     try std.testing.expect(std.mem.indexOf(u8, env, "Shell sandbox: inactive") != null);
     try std.testing.expect(std.mem.indexOf(u8, env, "Network filtering: off") != null);
+    opts.project_permissions = .{ .write_roots = &.{"/specific/cache with spaces"} };
+    const granted_env = try environmentBlock(gpa, io, &opts);
+    defer gpa.free(granted_env);
+    try std.testing.expect(std.mem.indexOf(u8, granted_env, "Owner-granted project write directories: [\"/specific/cache with spaces\"]") != null);
     // A plausible date, not the epoch: the year has four digits and 20xx.
     try std.testing.expect(std.mem.indexOf(u8, env, "date: 20") != null);
 

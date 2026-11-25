@@ -649,6 +649,31 @@ pub const Store = struct {
         return std.fmt.parseInt(i64, ptr[0..len], 10) catch 0;
     }
 
+    pub fn getProjectPermissions(self: Store, project: []const u8) Error!?[]u8 {
+        const key = try std.fmt.allocPrint(self.gpa, "project_permissions:{s}", .{project});
+        defer self.gpa.free(key);
+        const stmt = try self.prepare("SELECT value FROM kv WHERE key=?");
+        defer finalize(stmt);
+        bindText(stmt, 1, key);
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) return null;
+        if (rc != c.SQLITE_ROW) return error.SqliteStep;
+        return try self.gpa.dupe(u8, columnText(stmt, 0));
+    }
+
+    pub fn setProjectPermissions(self: Store, project: []const u8, value: ?[]const u8) Error!void {
+        const key = try std.fmt.allocPrint(self.gpa, "project_permissions:{s}", .{project});
+        defer self.gpa.free(key);
+        const stmt = if (value != null)
+            try self.prepare("INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+        else
+            try self.prepare("DELETE FROM kv WHERE key=?");
+        defer finalize(stmt);
+        bindText(stmt, 1, key);
+        if (value) |text| bindText(stmt, 2, text);
+        try stepDone(stmt);
+    }
+
     fn kvSetInt(self: Store, key: []const u8, value: i64) Error!void {
         var value_buf: [32]u8 = undefined;
         const value_text = std.fmt.bufPrint(&value_buf, "{d}", .{value}) catch return error.OutOfMemory;

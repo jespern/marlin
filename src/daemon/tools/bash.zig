@@ -74,10 +74,15 @@ pub fn run(
         // A workspace under a protected root cannot receive both its write
         // grant and the read denial; refuse rather than run half-enforced.
         if (protected.contains(real_workspace)) return error.SandboxWorkspaceProtected;
+        for (sandbox_options.write_roots) |root| {
+            const real = try Io.Dir.realPathFileAbsoluteAlloc(io, root, arena);
+            if (!std.mem.eql(u8, root, real)) return error.SandboxWriteRootChanged;
+        }
         const paths = sandbox.Paths{
             .workspace = real_workspace,
             .temp_root = real_temp,
             .protected = protected,
+            .write_roots = sandbox_options.write_roots,
         };
         argv = switch (sandbox_options.backend) {
             .seatbelt => try sandbox.seatbeltArgv(arena, paths, args.command, &.{}),

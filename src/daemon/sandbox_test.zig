@@ -59,3 +59,50 @@ test "Seatbelt canary passes on this macOS installation" {
     const io = threaded.io();
     try std.testing.expectEqual(Backend.seatbelt, verifySeatbelt(gpa, io, null));
 }
+
+test "remembered roots allow a shared cache without permitting a sibling or protected read" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var temp = try @import("../testing/temp_dir.zig").Dir.initFromProcess(gpa, io, "marlin-scoped-sandbox");
+    defer temp.deinit();
+    var memory = std.heap.ArenaAllocator.init(gpa);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const base = try Io.Dir.realPathFileAbsoluteAlloc(io, temp.path, arena);
+    const workspace = try std.fs.path.join(arena, &.{ base, "workspace" });
+    const scratch = try std.fs.path.join(arena, &.{ base, "scratch" });
+    const cache = try std.fs.path.join(arena, &.{ base, "cache" });
+    const outside = try std.fs.path.join(arena, &.{ base, "outside" });
+    const secret = try std.fs.path.join(arena, &.{ base, "secret" });
+    for ([_][]const u8{ workspace, scratch, cache, outside, secret }) |path| try Io.Dir.cwd().createDirPath(io, path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(arena, &.{ secret, "key" }), .data = "synthetic" });
+    const paths: sandbox.Paths = .{
+        .workspace = workspace,
+        .temp_root = scratch,
+        .write_roots = &.{cache},
+        .protected = .{ .ssh = secret, .aws = secret, .gnupg = secret, .marlin_credentials = secret },
+    };
+    const argv = try sandbox.seatbeltArgv(arena, paths, "printf local > \"$1/local\" && printf shared > \"$2/shared\" && if printf bad > \"$3/blocked\" 2>/dev/null; then exit 11; fi; if cat \"$4/key\" 2>/dev/null; then exit 12; fi", &.{ workspace, cache, outside, secret });
+    const result = try std.process.run(gpa, io, .{ .argv = argv });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+    try std.testing.expect(result.term == .exited and result.term.exited == 0);
+    const shared = try Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(arena, &.{ cache, "shared" }), arena, .limited(64));
+    try std.testing.expectEqualStrings("shared", shared);
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(io, try std.fs.path.join(arena, &.{ outside, "blocked" }), .{}));
+    // The turn's snapshot is not permission to follow a replacement symlink
+    // when a later shell invocation constructs its kernel rules.
+    try Io.Dir.cwd().deleteTree(io, cache);
+    const link = try std.process.run(gpa, io, .{ .argv = &.{ "/bin/ln", "-s", outside, cache } });
+    defer gpa.free(link.stdout);
+    defer gpa.free(link.stderr);
+    try std.testing.expectError(error.SandboxWriteRootChanged, @import("tools/bash.zig").run(gpa, io, .{ .command = "true" }, workspace, null, .{
+        .backend = .seatbelt,
+        .temp_root = scratch,
+        .protected = paths.protected,
+        .write_roots = paths.write_roots,
+    }, null));
+}

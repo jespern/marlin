@@ -128,12 +128,10 @@ pub fn realPathInWorkspace(
 /// (`marlin cc_approve`): mirror the native auto-inside posture for prompts a
 /// delegated `claude -p` routes to marlin. Reads and searches are always auto
 /// (native read-only policy). Edits must provably stay inside the real
-/// workspace and off protected paths. Shell commands are approved unless they
-/// mention a path outside the workspace or a protected name. Honest posture:
-/// a token the scan cannot place ASKS, but a shape it does not look for
-/// ALLOWS — this is guest-mux convenience under the wall's rules
-/// (ARCHITECTURE, Native vs guest), not a security boundary, and it must not
-/// grow toward one.
+/// workspace and off protected paths. Claude's sandbox auto-allows confined
+/// Bash calls before they reach this bridge. A Bash prompt therefore asks
+/// for authority the vendor did not already grant; always leave it to the
+/// owner instead of guessing filesystem effects from command text.
 pub fn ccAutoAllow(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -177,17 +175,6 @@ pub fn ccAutoAllow(
         return realPathInWorkspace(gpa, io, cwd, path);
     }
 
-    if (std.mem.eql(u8, tool_name, "Bash")) {
-        const parsed = std.json.parseFromSlice(
-            struct { command: ?[]const u8 = null },
-            gpa,
-            input_json,
-            .{ .ignore_unknown_fields = true },
-        ) catch return false;
-        defer parsed.deinit();
-        const command = parsed.value.command orelse return false;
-        return commandStaysInWorkspace(gpa, cwd, command);
-    }
     return false;
 }
 
@@ -205,67 +192,6 @@ pub fn ccReadOnlyAllow(tool_name: []const u8) bool {
         "WebFetch", "WebSearch", "TodoWrite",
     };
     for (read_only) |name| if (std.mem.eql(u8, tool_name, name)) return true;
-    return false;
-}
-
-/// Lexical scan of a shell command for paths that leave the workspace or
-/// name protected files. Tokens that resolve inside the cwd (or into the
-/// usual scratch locations) pass; `~`, escaping relatives, and any other
-/// absolute path make the command ask instead.
-fn commandStaysInWorkspace(gpa: std.mem.Allocator, cwd: []const u8, command: []const u8) bool {
-    var it = std.mem.tokenizeAny(u8, command, " \t\r\n");
-    while (it.next()) |raw| {
-        const tok = strippedPathToken(raw);
-        if (tok.len == 0) continue;
-        if (isProtectedPath(tok)) return false;
-        if (tok[0] == '~') return false;
-        // A dotted token is never benign: /tmp/../etc/passwd must reach
-        // assessPath (found by the first council review — the shortcut used
-        // to fire before the escape check).
-        if (tok[0] == '/' and benignAbsolutePrefix(tok) and
-            std.mem.indexOf(u8, tok, "..") == null) continue;
-        if (tok[0] == '/' or std.mem.indexOf(u8, tok, "..") != null) {
-            var assessed = assessPath(gpa, cwd, tok) catch return false;
-            defer assessed.deinit(gpa);
-            if (assessed.location != .workspace) return false;
-        }
-    }
-    return true;
-}
-
-/// Strip shell noise so a token's path core is visible to the scan:
-/// surrounding quotes/grouping, redirection prefixes (2>/dev/null, >>out),
-/// and `--flag=/path` values.
-fn strippedPathToken(raw: []const u8) []const u8 {
-    var tok = std.mem.trim(u8, raw, "\"'`();,");
-    var i: usize = 0;
-    while (i < tok.len) : (i += 1) {
-        switch (tok[i]) {
-            '0'...'9', '<', '>', '&' => continue,
-            else => break,
-        }
-    }
-    if (i > 0 and i < tok.len and
-        (std.mem.indexOfScalar(u8, tok[0..i], '<') != null or
-            std.mem.indexOfScalar(u8, tok[0..i], '>') != null))
-    {
-        tok = tok[i..];
-    }
-    if (std.mem.indexOfScalar(u8, tok, '=')) |eq| {
-        const rhs = tok[eq + 1 ..];
-        if (rhs.len > 0 and (rhs[0] == '/' or rhs[0] == '~')) return rhs;
-    }
-    return tok;
-}
-
-/// Scratch locations every build tool touches; referencing them is not
-/// "leaving the workspace" in any sense a human would recognize.
-fn benignAbsolutePrefix(path: []const u8) bool {
-    const prefixes = [_][]const u8{
-        "/dev/", "/tmp/", "/private/tmp/", "/var/folders/", "/private/var/folders/",
-    };
-    if (std.mem.eql(u8, path, "/dev/null") or std.mem.eql(u8, path, "/tmp")) return true;
-    for (prefixes) |p| if (std.mem.startsWith(u8, path, p)) return true;
     return false;
 }
 

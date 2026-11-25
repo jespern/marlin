@@ -187,14 +187,14 @@ test "cc bridge policy: workspace edits allowed on a real tree" {
     try std.testing.expect(ccAutoAllow(gpa, io, ws, "Write", args));
 }
 
-test "cc bridge policy: shell commands inside the root run, escapes ask" {
+test "cc bridge never guesses whether a Bash approval can escape the vendor sandbox" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
     const cwd = "/work/api";
 
-    const allowed = [_][]const u8{
+    const commands = [_][]const u8{
         "zig build test",
         "zig build test 2>/dev/null",
         "git log --oneline -5 | head",
@@ -203,14 +203,6 @@ test "cc bridge policy: shell commands inside the root run, escapes ask" {
         "make -C src all",
         "cat src/../README.md",
         "git commit -m \"fix: paths like a/b in messages\"",
-    };
-    for (allowed) |cmd| {
-        const args = try std.json.Stringify.valueAlloc(gpa, .{ .command = cmd }, .{});
-        defer gpa.free(args);
-        try std.testing.expect(ccAutoAllow(gpa, io, cwd, "Bash", args));
-    }
-
-    const asks = [_][]const u8{
         "rm -rf /Users/example/other-project",
         "cat ~/.ssh/id_ed25519",
         "cat ../sibling/secrets.txt",
@@ -220,8 +212,8 @@ test "cc bridge policy: shell commands inside the root run, escapes ask" {
         "cat /tmp/../etc/passwd", // benign prefix must not mask an escape
         "echo x > /dev/../etc/cron.d/evil",
     };
-    for (asks) |cmd| {
-        const args = try std.json.Stringify.valueAlloc(gpa, .{ .command = cmd }, .{});
+    for (commands) |cmd| {
+        const args = try std.json.Stringify.valueAlloc(gpa, .{ .command = cmd, .dangerouslyDisableSandbox = true }, .{});
         defer gpa.free(args);
         try std.testing.expect(!ccAutoAllow(gpa, io, cwd, "Bash", args));
     }

@@ -301,3 +301,24 @@ question delivery and exact selected/free-text answer round trips, picker replay
 after reconnect, fresh/resumed threads, and default/full-access modes. The fixture
 uses the system Python 3 standard library. Provider tests also cover command-path escaping
 and retain bridge-free account model discovery.
+
+Project-permission coverage: `project_permissions_test.zig` exercises persisted
+roots through a reopened store and new sessions, nested checkouts, verified
+linked-worktree backlinks, forged gitdir pointers, protected ancestors, symlink
+substitution and revocation. Scenario `51_project_permissions` uses the actual
+daemon protocol across two reboots, and checks sibling isolation and protected
+root refusal. The native Seatbelt test proves a declared cache write succeeds
+while a sibling write and protected read fail. Codex fixture peers assert fresh
+and resumed named-profile configuration, the required capability, and exclusion
+from full-access/plan/read-only modes. Claude's argv tests retain its permission
+bridge; its sandbox policy is supplied as invocation-local JSON.
+
+Offline manual evidence on 2026-11-23: installed Codex 0.169.0 accepted the named
+profile over app-server and its real sandbox allowed Git/cache writes while
+blocking a sibling write and a synthetic protected-root read. Claude Code
+2.1.314 ran a synthetic Python script against a loopback-only fake Messages API
+with an isolated HOME and synthetic
+API key: external guide read and declared cache write succeeded; an undeclared
+write and a synthetic protected-root read hidden inside the script failed.
+These probes made no external inference request and used no real account or
+vendor credential.

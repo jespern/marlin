@@ -71,6 +71,11 @@ is unavailable.
   Attach from another terminal or use the optional phone client to answer a
   parked request. Native and guest permissions have different owners; the
   interface reports that distinction.
+  `/permissions allow <directory>` remembers a specific write directory for
+  this project, including new sessions and verified linked worktrees.
+  `/permissions list`, `revoke <directory>` and `clear` inspect or remove those
+  grants. They apply from the next turn; `/permissions full|default` remains a
+  separate session mode. See [Permissions](PERMISSIONS.md#saved-project-write-roots).
 - **Planning and delegation.** Shift+Tab enters Plan mode. Native execution
   plans survive compaction and restart; `task` and `task_batch` create durable,
   attachable children for focused read-only work. Configured review councils

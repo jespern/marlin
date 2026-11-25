@@ -5619,6 +5619,35 @@ test "parked approvals are findable per tree; typing never jumps tabs" {
     try std.testing.expect(!app.view.permissions_full);
 }
 
+test "project permission commands preserve paths and leave full access unchanged" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const cases = [_]struct { input: []const u8, action: proto.ProjectPermissionAction, path: []const u8 }{
+        .{ .input = "allow '/cache with spaces'", .action = .allow, .path = "/cache with spaces" },
+        .{ .input = "revoke /a's cache", .action = .revoke, .path = "/a's cache" },
+        .{ .input = "list", .action = .show, .path = "" },
+        .{ .input = "clear", .action = .clear, .path = "" },
+    };
+    for (cases) |case| {
+        var output: Io.Writer.Allocating = .init(gpa);
+        defer output.deinit();
+        var conn: attach.Conn = undefined;
+        conn.gpa = gpa;
+        conn.writer = &output.writer;
+        var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = 42, .permissions_full = true, .editor = Editor.init(gpa) } };
+        defer app.deinit();
+        app.setPermissions(case.input);
+        const msg = try proto.decode(proto.ClientMsg, arena.allocator(), std.mem.trimEnd(u8, output.written(), "\n"));
+        try std.testing.expectEqual(@as(u64, 42), msg.project_permissions.sid);
+        try std.testing.expectEqual(case.action, msg.project_permissions.action);
+        try std.testing.expectEqualStrings(case.path, msg.project_permissions.path);
+        try std.testing.expect(app.view.permissions_full);
+    }
+}
+
 test "review prompt expansion names the council, roster, and question" {
     const gpa = std.testing.allocator;
     var council = OwnedCouncil{ .name = try gpa.dupe(u8, "core") };

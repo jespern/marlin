@@ -27,6 +27,25 @@ test {
     std.testing.refAllDecls(proto);
 }
 
+test "project permission requests and replies preserve their exact wire representation" {
+    var memory = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    for ([_]proto.ProjectPermissionAction{ .show, .allow, .revoke, .clear }) |action| {
+        const request: ClientMsg = .{ .project_permissions = .{ .sid = 9, .action = action, .path = "/build cache" } };
+        const line = try encode(arena, request);
+        const decoded = try decode(ClientMsg, arena, line);
+        try std.testing.expectEqual(action, decoded.project_permissions.action);
+        try std.testing.expectEqualStrings("/build cache", decoded.project_permissions.path);
+        try std.testing.expectEqualStrings(line, try encode(arena, decoded));
+    }
+    const reply: DaemonMsg = .{ .project_permissions_result = .{ .sid = 9, .project = "/work/app", .write_roots = &.{ "/work/app/.git", "/build cache" } } };
+    const line = try encode(arena, reply);
+    const decoded = try decode(DaemonMsg, arena, line);
+    try std.testing.expectEqualStrings("/build cache", decoded.project_permissions_result.write_roots[1]);
+    try std.testing.expectEqualStrings(line, try encode(arena, decoded));
+}
+
 test "round trip: client messages" {
     const gpa = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(gpa);

@@ -29,6 +29,7 @@ const build_options = @import("build_options");
 // steer handling, and approval resolution; guests borrow exactly these.
 const loop = @import("../loop.zig");
 const profile = @import("../profile.zig");
+const project_permissions = @import("../project_permissions.zig");
 const Appender = loop.Appender;
 const RunOpts = loop.RunOpts;
 const TurnResult = loop.TurnResult;
@@ -502,11 +503,25 @@ fn codexApprovalPolicy(opts: RunOpts) []const u8 {
     return if (effectiveApprovalMode(opts) == .auto) "never" else "on-request";
 }
 
-fn codexSandbox(opts: RunOpts) []const u8 {
+fn codexPermissions(opts: RunOpts) ?[]const u8 {
+    if (opts.tool_profile != .full or effectiveApprovalMode(opts) == .auto or opts.project_permissions == null) return null;
+    return project_permissions.codex_profile_name;
+}
+
+pub fn permissionGrant(arena: std.mem.Allocator, requested: std.json.Value, approved: bool) !std.json.Value {
+    if (requested != .object) return error.BadCodexPermissionRequest;
+    var result: std.json.ObjectMap = .empty;
+    try result.put(arena, "permissions", if (approved) requested else .{ .object = .empty });
+    try result.put(arena, "scope", .{ .string = "turn" });
+    return .{ .object = result };
+}
+
+fn codexSandbox(opts: RunOpts) ?[]const u8 {
     // Full Permissions must lift both approval and filesystem restrictions:
     // workspace-write protects .git even when approvals are set to never.
     // Child/reviewer profiles stay read-only regardless of the session mode.
     if (opts.tool_profile != .full) return "read-only";
+    if (codexPermissions(opts) != null) return null;
     return if (effectiveApprovalMode(opts) == .auto) "danger-full-access" else "workspace-write";
 }
 
@@ -541,6 +556,7 @@ fn codexSendTurnStart(
         .effort = opts.effort.providerValue(),
         .approvalPolicy = codexApprovalPolicy(opts),
         .approvalsReviewer = "user",
+        .permissions = codexPermissions(opts),
     });
     const response = try codexWaitResponse(arena, reader, request_id);
     if (codexRpcError(arena, response)) |message| {
@@ -665,6 +681,10 @@ pub fn runCodexTurn(
         profile.load(arena, io, opts.tool_environ, opts.cwd) orelse "",
     );
     const argv = try codex.buildArgvWithBridge(arena, opts.tool_environ, otel_overrides, bridge);
+    const project_config: ?std.json.Value = if (codexPermissions(opts) != null)
+        try project_permissions.codexConfig(arena, opts.project_permissions.?, opts.sandbox_options.protected)
+    else
+        null;
     var guest_environ: ?std.process.Environ.Map = if (opts.tool_environ) |source|
         try permissions.toolEnvironment(gpa, source)
     else
@@ -785,11 +805,10 @@ pub fn runCodexTurn(
     var detached = false;
     var detach_offset: u64 = 0;
 
-    try codexRequest(arena, writer, "initialize", 1, trace, .{ .clientInfo = .{
-        .name = "marlin",
-        .title = "Marlin",
-        .version = build_options.version,
-    } });
+    try codexRequest(arena, writer, "initialize", 1, trace, .{
+        .clientInfo = .{ .name = "marlin", .title = "Marlin", .version = build_options.version },
+        .capabilities = .{ .experimentalApi = codexPermissions(opts) != null },
+    });
     const initialized = try markServerExit(&server_exited, codexWaitResponse(arena, reader, 1));
     if (codexRpcError(arena, initialized)) |message| {
         setDelegateError(message);
@@ -827,6 +846,8 @@ pub fn runCodexTurn(
             .approvalPolicy = codexApprovalPolicy(opts),
             .approvalsReviewer = "user",
             .sandbox = codexSandbox(opts),
+            .permissions = codexPermissions(opts),
+            .config = project_config,
         });
         const resumed = try markServerExit(&server_exited, codexWaitResponse(arena, reader, next_request_id));
         next_request_id += 1;
@@ -863,6 +884,8 @@ pub fn runCodexTurn(
             .approvalPolicy = codexApprovalPolicy(opts),
             .approvalsReviewer = "user",
             .sandbox = codexSandbox(opts),
+            .permissions = codexPermissions(opts),
+            .config = project_config,
             .ephemeral = false,
         });
         const started = try markServerExit(&server_exited, codexWaitResponse(arena, reader, next_request_id));
@@ -952,16 +975,26 @@ pub fn runCodexTurn(
             .request => |request| if (!replaying) {
                 const is_command = std.mem.eql(u8, request.method, "item/commandExecution/requestApproval");
                 const is_file = std.mem.eql(u8, request.method, "item/fileChange/requestApproval");
-                if (is_command or is_file) {
+                const is_permissions = std.mem.eql(u8, request.method, "item/permissions/requestApproval");
+                const request_id = try std.json.parseFromSliceLeaky(std.json.Value, line_arena, request.id_json, .{});
+                if (is_permissions) {
+                    const requested = codex.field(request.params, "permissions") orelse return error.BadCodexPermissionRequest;
+                    const args = try std.json.Stringify.valueAlloc(line_arena, .{
+                        .permissions = requested,
+                        .scope = "turn",
+                        .reason = codex.strField(request.params, "reason"),
+                    }, .{});
+                    const call_id = codex.strField(request.params, "itemId") orelse request.id_json;
+                    const verdict = try resolveGuestApproval(gpa, io, opts, ap, call_id, "Permissions", args);
+                    try codexWriteValue(arena, writer, .{ .id = request_id, .result = try permissionGrant(line_arena, requested, verdict == .approved) });
+                } else if (is_command or is_file) {
                     const args = try codex.stringify(line_arena, request.params);
                     const call_id = codex.strField(request.params, "itemId") orelse request.id_json;
                     const tool = if (is_command) "Bash" else "Edit";
                     const verdict = try resolveGuestApproval(gpa, io, opts, ap, call_id, tool, args);
-                    const response = try std.fmt.allocPrint(line_arena, "{{\"id\":{s},\"result\":{{\"decision\":\"{s}\"}}}}", .{ request.id_json, if (verdict == .approved) "accept" else "decline" });
-                    try codexWriteLine(writer, response);
+                    try codexWriteValue(arena, writer, .{ .id = request_id, .result = .{ .decision = if (verdict == .approved) "accept" else "decline" } });
                 } else {
-                    const response = try std.fmt.allocPrint(line_arena, "{{\"id\":{s},\"error\":{{\"code\":-32601,\"message\":\"unsupported app-server request\"}}}}", .{request.id_json});
-                    try codexWriteLine(writer, response);
+                    try codexWriteValue(arena, writer, .{ .id = request_id, .@"error" = .{ .code = -32601, .message = "unsupported app-server request" } });
                 }
             },
             .notification => |notification| {
