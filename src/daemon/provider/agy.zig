@@ -6,9 +6,12 @@
 //! session config options, tool calls as Marlin tools, diffs, permission
 //! options, usage.
 const std = @import("std");
+const Io = std.Io;
 const codex = @import("codex.zig");
 const Effort = @import("../../core/effort.zig").Effort;
 const files = @import("../tools/files.zig");
+const process_io = @import("../process_io.zig");
+const build_options = @import("build_options");
 
 pub const binary_env = "MARLIN_AGY_BIN";
 pub const default_binary = "agy";
@@ -289,4 +292,120 @@ pub fn stopNote(stop_reason: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, stop_reason, "max_turn_requests")) return "Antigravity stopped: the turn reached its limit of model requests";
     if (std.mem.eql(u8, stop_reason, "refusal")) return "Antigravity stopped: the model refused to continue";
     return null;
+}
+
+fn probeModelLines(
+    arena: std.mem.Allocator,
+    writer: *Io.Writer,
+    reader: *Io.Reader,
+    environ: *const std.process.Environ.Map,
+    watcher: *codex.CatalogWatcher,
+) ![]const u8 {
+    try codex.writeJsonLine(arena, writer, .{
+        .jsonrpc = "2.0",
+        .id = 1,
+        .method = "initialize",
+        .params = .{
+            .protocolVersion = protocol_version,
+            .clientCapabilities = .{
+                .fs = .{ .readTextFile = false, .writeTextFile = false },
+                .terminal = false,
+            },
+            .clientInfo = .{ .name = "marlin", .title = "Marlin", .version = build_options.version },
+        },
+    });
+    const init_resp = codex.waitResponse(arena, reader, 1) catch |err| {
+        if (watcher.timed_out.load(.acquire)) return error.AgyCatalogTimeout;
+        return err;
+    };
+    if (init_resp.err != null) return error.AgyCatalogRpc;
+
+    const raw_tmp = environ.get("TMPDIR") orelse "/tmp";
+    const probe_cwd = std.mem.trimEnd(u8, raw_tmp, "/");
+    try codex.writeJsonLine(arena, writer, .{
+        .jsonrpc = "2.0",
+        .id = 2,
+        .method = "session/new",
+        .params = .{
+            .cwd = if (probe_cwd.len > 0) probe_cwd else "/tmp",
+            .mcpServers = &[_]McpServer{},
+        },
+    });
+    const new_resp = codex.waitResponse(arena, reader, 2) catch |err| {
+        if (watcher.timed_out.load(.acquire)) return error.AgyCatalogTimeout;
+        return err;
+    };
+    if (new_resp.err != null) return error.AgyCatalogRpc;
+    const result = new_resp.result orelse return error.BadAgyCatalog;
+    const saved = try modelList(arena, field(result, "configOptions"));
+    if (strField(result, "sessionId")) |sid| {
+        codex.writeJsonLine(arena, writer, .{
+            .jsonrpc = "2.0",
+            .id = 3,
+            .method = "session/close",
+            .params = .{ .sessionId = sid },
+        }) catch {};
+        _ = codex.waitResponse(arena, reader, 3) catch {};
+    }
+    return saved;
+}
+
+/// Probe `agy acp` without sending a prompt (`initialize` → `session/new` →
+/// `session/close`) so concrete `agy/*` models appear in the picker before the
+/// first Antigravity turn. Costs no tokens.
+pub fn fetchModels(
+    gpa: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    cancel: ?*const std.atomic.Value(bool),
+) ![]codex.CatalogModel {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const argv = [_][]const u8{ binaryPath(environ), "acp" };
+    var child = try std.process.spawn(io, .{
+        .argv = &argv,
+        .environ_map = environ,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .pgid = 0,
+    });
+    var watcher = codex.CatalogWatcher{ .io = io, .cancel = cancel, .group = child.id.? };
+    const watcher_thread = std.Thread.spawn(.{}, codex.CatalogWatcher.run, .{&watcher}) catch |err| {
+        process_io.terminateProcessTree(&child, io, 100);
+        return err;
+    };
+    var drain = codex.StderrDrain{ .io = io, .file = child.stderr.? };
+    const drain_thread = std.Thread.spawn(.{}, codex.StderrDrain.run, .{&drain}) catch |err| {
+        watcher.done.store(true, .release);
+        watcher_thread.join();
+        process_io.terminateProcessTree(&child, io, 100);
+        return err;
+    };
+    defer {
+        watcher.done.store(true, .release);
+        watcher_thread.join();
+        process_io.terminateProcessGroup(io, child.id.?, 0);
+        drain_thread.join();
+        _ = child.wait(io) catch {};
+    }
+
+    var writer_buffer: [16 * 1024]u8 = undefined;
+    var writer_file = child.stdin.?.writer(io, &writer_buffer);
+    const line_buffer = try gpa.alloc(u8, 4 * 1024 * 1024);
+    defer gpa.free(line_buffer);
+    var reader_file = child.stdout.?.reader(io, line_buffer);
+
+    const saved = try probeModelLines(arena, &writer_file.interface, &reader_file.interface, environ, &watcher);
+    if (saved.len == 0) return error.BadAgyCatalog;
+    var ids: std.ArrayList([]const u8) = .empty;
+    try appendModelIds(arena, &ids, saved);
+    var out: std.ArrayList(codex.CatalogModel) = .empty;
+    errdefer {
+        for (out.items) |m| gpa.free(m.id);
+        out.deinit(gpa);
+    }
+    for (ids.items) |id| try out.append(gpa, .{ .id = try gpa.dupe(u8, id) });
+    return out.toOwnedSlice(gpa);
 }

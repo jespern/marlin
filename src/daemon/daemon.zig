@@ -1810,6 +1810,7 @@ pub const Daemon = struct {
                 self.catalog.clearRetainingCapacity();
                 for (cr.models) |m| self.catalog.append(self.gpa, m) catch self.gpa.free(m.id);
                 self.gpa.free(cr.models);
+                self.persistAgyModelsFromCatalog();
                 self.catalog_fetched_at = nowMs(self.io);
                 self.catalog_fetching = false;
                 if (self.lookupClient(cr.client_id)) |client| {
@@ -7088,7 +7089,29 @@ pub const Daemon = struct {
     fn appendAgyIds(self: *Daemon, arena: std.mem.Allocator, list: *std.ArrayList([]const u8)) !void {
         const saved = (self.store.kvGetText(agy.models_key) catch null) orelse return;
         defer self.gpa.free(saved);
-        try agy.appendModelIds(arena, list, saved);
+        var cached: std.ArrayList([]const u8) = .empty;
+        try agy.appendModelIds(arena, &cached, saved);
+        for (cached.items) |id| {
+            var in_catalog = false;
+            for (self.catalog.items) |m| if (std.mem.eql(u8, m.id, id)) {
+                in_catalog = true;
+                break;
+            };
+            if (!in_catalog) try guest_models.appendUnique(arena, list, id);
+        }
+    }
+
+    fn persistAgyModelsFromCatalog(self: *Daemon) void {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.gpa);
+        for (self.catalog.items) |m| {
+            if (!std.mem.startsWith(u8, m.id, agy.prefix)) continue;
+            const slug = m.id[agy.prefix.len..];
+            if (slug.len == 0 or std.mem.eql(u8, slug, "default")) continue;
+            if (out.items.len > 0) out.append(self.gpa, '\n') catch return;
+            out.appendSlice(self.gpa, slug) catch return;
+        }
+        if (out.items.len > 0) self.store.kvSetText(agy.models_key, out.items) catch {};
     }
 
     fn museAvailable(self: *Daemon) bool {
@@ -7175,6 +7198,30 @@ pub const Daemon = struct {
                 break :blk null;
             };
             if (codex_models) |models| {
+                defer self.gpa.free(models);
+                var transferred: usize = 0;
+                errdefer for (models[transferred..]) |model| self.gpa.free(model.id);
+                for (models) |model| {
+                    try out.append(self.gpa, .{ .id = model.id });
+                    transferred += 1;
+                }
+                any_source = true;
+            }
+        }
+
+        if (self.agyAvailable()) {
+            var child_environ = try permissions.toolEnvironment(self.gpa, self.environ);
+            defer child_environ.deinit();
+            const agy_models = agy.fetchModels(
+                self.gpa,
+                self.io,
+                &child_environ,
+                &self.catalog_cancel,
+            ) catch |err| blk: {
+                last_err = err;
+                break :blk null;
+            };
+            if (agy_models) |models| {
                 defer self.gpa.free(models);
                 var transferred: usize = 0;
                 errdefer for (models[transferred..]) |model| self.gpa.free(model.id);

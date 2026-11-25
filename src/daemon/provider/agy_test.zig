@@ -162,3 +162,52 @@ test "usage counts cached input, and unusual stops are worth a note" {
     try std.testing.expectEqual(@as(?[]const u8, null), agy.stopNote("end_turn"));
     try std.testing.expect(agy.stopNote("refusal") != null);
 }
+
+test "fetchModels probes agy acp with session/new and closes it" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+
+    const script =
+        \\#!/bin/sh
+        \\set -eu
+        \\IFS= read -r _
+        \\printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
+        \\IFS= read -r _
+        \\printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"probe-1","configOptions":[{"id":"model","type":"select","currentValue":"gemini-4-neon","options":[{"value":"gemini-4-neon","name":"Gemini 4 Neon"},{"value":"gemini-4-argon","name":"Gemini 4 Argon"}]}]}}'
+        \\IFS= read -r close_req
+        \\case "$close_req" in *'"session/close"'*'"probe-1"'*) ;; *) exit 9 ;; esac
+        \\printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'
+        \\printf 'closed' > "$TMPDIR/closed"
+    ;
+    const script_path = try std.fs.path.joinZ(gpa, &.{ root, "fake-agy-catalog" });
+    defer gpa.free(script_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = script_path, .data = script });
+    _ = std.c.chmod(script_path, 0o755);
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    try env.put(agy.binary_env, script_path);
+    try env.put("TMPDIR", root);
+    try env.put("PATH", "/usr/bin:/bin");
+
+    const models = try agy.fetchModels(gpa, io, &env, null);
+    defer {
+        for (models) |m| gpa.free(m.id);
+        gpa.free(models);
+    }
+    try std.testing.expectEqual(@as(usize, 2), models.len);
+    try std.testing.expectEqualStrings("agy/gemini-4-neon", models[0].id);
+    try std.testing.expectEqualStrings("agy/gemini-4-argon", models[1].id);
+    const closed_path = try std.fs.path.join(gpa, &.{ root, "closed" });
+    defer gpa.free(closed_path);
+    const marker = try std.Io.Dir.cwd().readFileAlloc(io, closed_path, gpa, .limited(32));
+    defer gpa.free(marker);
+    try std.testing.expectEqualStrings("closed", marker);
+}

@@ -141,21 +141,21 @@ pub const CatalogModel = struct {
     id: []u8,
 };
 
-fn writeJsonLine(arena: std.mem.Allocator, writer: *Io.Writer, value: anytype) !void {
+pub fn writeJsonLine(arena: std.mem.Allocator, writer: *Io.Writer, value: anytype) !void {
     const encoded = try std.json.Stringify.valueAlloc(arena, value, .{});
     try writer.writeAll(encoded);
     try writer.writeByte('\n');
     try writer.flush();
 }
 
-const CatalogWatcher = struct {
+pub const CatalogWatcher = struct {
     io: Io,
     cancel: ?*const std.atomic.Value(bool),
     group: std.posix.pid_t,
     done: std.atomic.Value(bool) = .init(false),
     timed_out: std.atomic.Value(bool) = .init(false),
 
-    fn run(watcher: *CatalogWatcher) void {
+    pub fn run(watcher: *CatalogWatcher) void {
         const deadline = Io.Timestamp.now(watcher.io, .awake).nanoseconds + 10 * std.time.ns_per_s;
         while (!watcher.done.load(.acquire)) {
             const cancelled = if (watcher.cancel) |flag| flag.load(.acquire) else false;
@@ -169,11 +169,11 @@ const CatalogWatcher = struct {
     }
 };
 
-const StderrDrain = struct {
+pub const StderrDrain = struct {
     io: Io,
     file: Io.File,
 
-    fn run(drain: *StderrDrain) void {
+    pub fn run(drain: *StderrDrain) void {
         var buffer: [4096]u8 = undefined;
         var reader = drain.file.reader(drain.io, &buffer);
         while (true) {
@@ -183,7 +183,7 @@ const StderrDrain = struct {
     }
 };
 
-fn waitResponse(arena: std.mem.Allocator, reader: *Io.Reader, request_id: i64) !Response {
+pub fn waitResponse(arena: std.mem.Allocator, reader: *Io.Reader, request_id: i64) !Response {
     while (true) {
         const line = reader.takeDelimiterInclusive('\n') catch return error.CodexAppServerExited;
         const inbound = decodeLine(arena, line) catch continue;
