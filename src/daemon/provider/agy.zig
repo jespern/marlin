@@ -244,14 +244,23 @@ pub fn appendDiff(arena: std.mem.Allocator, out: *std.ArrayList(u8), path: []con
         }
         return;
     };
-    try out.print(arena, "--- {s}\n+++ {s}\n", .{ path, path });
-    if (std.mem.eql(u8, old, new_text)) return;
+    if (std.mem.eql(u8, old, new_text)) {
+        try out.print(arena, "--- {s}\n+++ {s}\n", .{ path, path });
+        return;
+    }
     var prefix_len: usize = 0;
     while (prefix_len < old.len and prefix_len < new_text.len and old[prefix_len] == new_text[prefix_len]) prefix_len += 1;
     var suffix_len: usize = 0;
     while (suffix_len < old.len - prefix_len and suffix_len < new_text.len - prefix_len and
         old[old.len - 1 - suffix_len] == new_text[new_text.len - 1 - suffix_len]) suffix_len += 1;
-    const hunk = try files.unifiedDiff(arena, old, prefix_len, old.len - prefix_len - suffix_len, new_text[prefix_len .. new_text.len - suffix_len]);
+    const hunk = files.unifiedDiff(arena, old, prefix_len, old.len - prefix_len - suffix_len, new_text[prefix_len .. new_text.len - suffix_len]) catch |err| switch (err) {
+        error.DiffTooBig => {
+            try out.print(arena, "edited {s} (change too large for an inline diff)\n", .{path});
+            return;
+        },
+        else => return err,
+    };
+    try out.print(arena, "--- {s}\n+++ {s}\n", .{ path, path });
     try out.appendSlice(arena, hunk);
     if (!std.mem.endsWith(u8, out.items, "\n")) try out.append(arena, '\n');
 }

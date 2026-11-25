@@ -101,6 +101,17 @@ test "a finished edit shows as a unified diff, a new file as all additions" {
         \\{"sessionUpdate":"tool_call_update","toolCallId":"call_4","status":"completed","kind":"edit","content":[{"type":"diff","path":"/w/note.txt","newText":"neon"}]}
     );
     try std.testing.expectEqualStrings("--- /dev/null\n+++ /w/note.txt\n@@ -0,0 +1,1 @@\n+neon\n", try agy.toolBody(arena, created));
+
+    // A hunk over unifiedDiff's 80-line cap falls back to a note instead of aborting the turn.
+    var old_big: std.ArrayList(u8) = .empty;
+    var new_big: std.ArrayList(u8) = .empty;
+    for (0..50) |idx| {
+        try old_big.print(arena, "old line {d}\n", .{idx});
+        try new_big.print(arena, "new line {d}\n", .{idx});
+    }
+    var out: std.ArrayList(u8) = .empty;
+    try agy.appendDiff(arena, &out, "/w/huge.zig", old_big.items, new_big.items);
+    try std.testing.expectEqualStrings("edited /w/huge.zig (change too large for an inline diff)\n", out.items);
 }
 
 test "a finished command shows its text, or its raw output when it has none" {
