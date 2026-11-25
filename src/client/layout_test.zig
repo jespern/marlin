@@ -2384,3 +2384,22 @@ test "a guest's live session tool says what it does and which session, not its M
     try std.testing.expectEqualStrings("Waiting on", (try layout.marlinActivityLabel(arena, .{ .id = "x", .kind = .tool, .name = "mcp__marlin__wait_for_session", .detail = "wait for it" }, &.{}, &sessions)).?);
     try std.testing.expect(try layout.marlinActivityLabel(arena, .{ .id = "x", .kind = .tool, .name = "Bash", .detail = "ls" }, &.{}, &sessions) == null);
 }
+
+test "recap notes render inline Markdown instead of raw backticks" {
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const blocks = [_]RenderBlock{
+        .{ .kind = .user_msg, .turn_id = 1, .text = @constCast("hi"), .label = @constCast("") },
+        .{
+            .kind = .system_note,
+            .turn_id = 1,
+            .label = @constCast("Recap"),
+            .text = @constCast("Exposed MCP `task` and `task_batch` for `/review`."),
+        },
+    };
+    const text = try sessionToolTranscriptText(arena, gpa, &blocks, &.{}, &.{});
+    try std.testing.expect(std.mem.indexOf(u8, text, "Exposed MCP task and task_batch for /review.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "`task`") == null);
+}

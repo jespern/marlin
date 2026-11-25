@@ -2537,7 +2537,11 @@ pub fn layoutBlockRange(
                     try flushRanSummary(alloc, lines, &pending_ran, pending_timestamp);
                     try blankLine(alloc, lines);
                     try wrapPrefixed(alloc, lines, "  ", rb.label, Palette.note, w);
-                    try wrapPrefixed(alloc, lines, "  ", rb.text, Palette.note, w);
+                    const recap_width = markdown.markdownMeasure(w);
+                    var recap_lines = std.mem.splitScalar(u8, rb.text, '\n');
+                    while (recap_lines.next()) |recap_line| {
+                        try markdown.appendMarkdownLine(alloc, lines, recap_line, "  ", "  ", Palette.note, recap_width, 2);
+                    }
                 } else if (std.mem.eql(u8, rb.label, "mcp")) {
                     // Login notes carry a sign-in URL: never clip it.
                     try flushRanSummary(alloc, lines, &pending_ran, pending_timestamp);
