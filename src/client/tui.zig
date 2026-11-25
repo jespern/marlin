@@ -459,6 +459,18 @@ const TabHit = struct {
 /// later without changing hit testing or the renderer's layout contract.
 pub const TabMouseAction = enum { activate, context_menu };
 
+/// Click target for the status bar's `ctx %` gauge (first click arms
+/// `compact?`, second click compacts — matching the web companion).
+pub const CtxHit = struct {
+    row: usize,
+    start_col: usize,
+    end_col: usize,
+
+    pub fn contains(self: CtxHit, row: usize, col: usize) bool {
+        return row == self.row and col >= self.start_col and col < self.end_col;
+    }
+};
+
 pub const TabLayoutItem = struct {
     sid: u64,
     index: usize,
@@ -675,6 +687,12 @@ pub const App = struct {
     /// Click targets from the most recently rendered tab strip. The entries
     /// contain no behavior, leaving room for button-specific actions later.
     tab_hits: std.ArrayList(TabHit) = .empty,
+    /// Click target for the status bar's `ctx %` segment from the latest frame.
+    ctx_hit: ?CtxHit = null,
+    /// Session currently armed for click-to-compact (`compact?` in the status
+    /// bar) and the wall-clock ms when the arm expires (0 = disarmed).
+    compact_armed_sid: u64 = 0,
+    compact_armed_deadline_ms: std.atomic.Value(i64) = .init(0),
     /// Last OSC 2 title sent, avoiding redundant terminal writes between
     /// state changes and animation frames.
     terminal_title: std.ArrayList(u8) = .empty,
@@ -961,6 +979,53 @@ pub const App = struct {
         if (deadline == 0 or nowWallMs(self.io) < deadline) return;
         self.notice_deadline_ms.store(0, .release);
         self.notice.clearRetainingCapacity();
+    }
+
+    /// How long a first click on `ctx %` stays armed as `compact?` (matches webui).
+    pub const compact_arm_ttl_ms: i64 = 4_000;
+
+    pub fn isCompactArmed(self: *const App) bool {
+        return self.compact_armed_sid != 0 and
+            self.compact_armed_sid == self.view.sid and
+            self.compact_armed_deadline_ms.load(.acquire) != 0 and
+            self.view.state != .running and
+            self.view.state != .awaiting_approval;
+    }
+
+    pub fn disarmCompact(self: *App) void {
+        self.compact_armed_sid = 0;
+        self.compact_armed_deadline_ms.store(0, .release);
+    }
+
+    pub fn expireCompactArm(self: *App) void {
+        const deadline = self.compact_armed_deadline_ms.load(.acquire);
+        if (deadline == 0 or nowWallMs(self.io) < deadline) return;
+        self.disarmCompact();
+    }
+
+    pub fn ctxHitAtMouse(self: *const App, m: vaxis.Mouse) bool {
+        if (self.image_view_len > 0 or self.top_view != null or self.web_view) return false;
+        if (m.row < 0 or m.col < 0) return false;
+        const hit = self.ctx_hit orelse return false;
+        return hit.contains(@intCast(m.row), @intCast(m.col));
+    }
+
+    /// Handles a left-click on the status bar's `ctx %` gauge: first click
+    /// arms `compact?` for 4s, second click sends `session_compact`.
+    pub fn clickContextCompact(self: *App) void {
+        if (self.view.state == .running or self.view.state == .awaiting_approval) {
+            self.disarmCompact();
+            self.setNotice("cannot compact mid-turn", .{});
+            return;
+        }
+        if (self.isCompactArmed()) {
+            self.disarmCompact();
+            self.conn.send(.{ .session_compact = .{ .sid = self.view.sid, .instructions = "" } }) catch return;
+            self.setNotice("compacting…", .{});
+            return;
+        }
+        self.compact_armed_sid = self.view.sid;
+        self.compact_armed_deadline_ms.store(nowWallMs(self.io) + compact_arm_ttl_ms, .release);
     }
 
     pub fn clearHistoryBackfill(self: *App) void {
@@ -1482,6 +1547,7 @@ pub const App = struct {
 
     pub fn switchSession(self: *App, sid: u64, touch_recent: bool) !void {
         if (sid == self.view.sid) return;
+        self.disarmCompact();
         try self.focusSession(sid, touch_recent);
         if (self.view.last_seq == 0) {
             self.view.history_complete = false;
@@ -6274,7 +6340,7 @@ pub fn dispatchEvent(
             if (app.screensaver_active) return;
             if (shell_tab.mouse(app, m)) return;
             app.hover_mouse = if (m.type == .motion and m.button == .none) m else null;
-            vx.setMouseShape(if (linkUriAtMouse(vx.window(), m) != null or (app.image_view_len == 0 and app.imageAtMouse(m) != null)) .pointer else .default);
+            vx.setMouseShape(if (linkUriAtMouse(vx.window(), m) != null or (app.image_view_len == 0 and app.imageAtMouse(m) != null) or app.ctxHitAtMouse(m)) .pointer else .default);
             if (linkAtMouse(vx.window(), m, app.link_super_held)) |uri| {
                 openExternalLink(app, uri);
                 return;
@@ -6305,6 +6371,7 @@ pub fn dispatchEvent(
             app.voiceTick();
             app.tickUiAnimation();
             app.expireNotice();
+            app.expireCompactArm();
         },
         .winsize => |ws| {
             app.hover_mouse = null;
@@ -6390,8 +6457,10 @@ fn animationThread(app: *App, loop: *vaxis.Loop(Event)) void {
             }
             // Pending deadlines need one.
             const notice_deadline = app.notice_deadline_ms.load(.acquire);
+            const compact_deadline = app.compact_armed_deadline_ms.load(.acquire);
             const saver_deadline = app.screensaver_deadline_ms.load(.acquire);
             if ((notice_deadline != 0 and now >= notice_deadline) or
+                (compact_deadline != 0 and now >= compact_deadline) or
                 (saver_deadline != 0 and now >= saver_deadline))
                 loop.postEvent(.tick) catch return;
         }

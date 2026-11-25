@@ -780,6 +780,7 @@ pub fn draw(app: *App, vx: *vaxis.Vaxis, arena: std.mem.Allocator) !void {
     const win = vx.window();
     win.clear();
     app.tab_hits.clearRetainingCapacity();
+    app.ctx_hit = null;
     app.image_rows.clearRetainingCapacity();
     const h = win.height;
     const w = win.width;
@@ -1338,7 +1339,19 @@ fn drawStatusBar(app: *App, win: vaxis.Window, arena: std.mem.Allocator, h: u16,
     if (agent_segments and ctx_txt.len > 0) {
         status_segments[status_n] = .{ .text = " · ", .style = Palette.status_sep };
         status_n += 1;
-        status_segments[status_n] = .{ .text = ctx_txt, .style = ctx_style };
+        const ctx_clickable = !(guest and app.view.context_limit == 0);
+        const armed = ctx_clickable and app.isCompactArmed();
+        const shown_ctx_txt = if (armed) "compact?" else ctx_txt;
+        var ctx_start_col: usize = 0;
+        for (status_segments[0..status_n]) |seg| ctx_start_col += displayWidth(seg.text);
+        const ctx_end_col = @min(@as(usize, w), ctx_start_col + displayWidth(shown_ctx_txt));
+        if (ctx_clickable and ctx_start_col < w and ctx_end_col > ctx_start_col) {
+            app.ctx_hit = .{ .row = h - 1, .start_col = ctx_start_col, .end_col = ctx_end_col };
+        }
+        const ctx_hovered = if (app.hover_mouse) |hm| app.ctxHitAtMouse(hm) else false;
+        var drawn_ctx_style = if (armed) Palette.status_context_ask else ctx_style;
+        if (!armed and ctx_hovered) drawn_ctx_style.ul_style = .single;
+        status_segments[status_n] = .{ .text = shown_ctx_txt, .style = drawn_ctx_style };
         status_n += 1;
     }
     if (agent_segments) if (try statusGuestProcess(arena, app.view.model.items, app.view.guest_pid)) |process_txt| {

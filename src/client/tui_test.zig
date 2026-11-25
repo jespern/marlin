@@ -7980,3 +7980,96 @@ test "a --remote client names the host running another build, and a matching rec
     app.checkDaemonBuild(null);
     try std.testing.expect(!app.build_mismatch);
 }
+
+test "clicking status bar ctx % arms compact? and a second click sends session_compact" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    var vx_out: std.Io.Writer.Allocating = .init(gpa);
+    defer vx_out.deinit();
+    var vx = try vaxis.init(threaded.io(), gpa, &environ, .{});
+    defer vx.deinit(gpa, &vx_out.writer);
+    try vx.resize(gpa, &vx_out.writer, .{ .rows = 12, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+
+    var wire_out: std.Io.Writer.Allocating = .init(gpa);
+    defer wire_out.deinit();
+    var conn: attach.Conn = undefined;
+    conn.gpa = gpa;
+    conn.writer = &wire_out.writer;
+    conn.sandbox_available = false;
+    conn.network_filtering = false;
+    conn.network_configured = false;
+
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = &conn, .view = .{ .sid = 7, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+    app.setModelStr("openrouter/anthropic/claude-sonnet-4");
+    app.setCwdStr("/work/marlin");
+    app.view.context_used = 42_000;
+    app.view.context_limit = 100_000;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    try draw(&app, &vx, arena_state.allocator());
+
+    const hit = app.ctx_hit orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 11), hit.row);
+    var drawn: std.ArrayList(u8) = .empty;
+    defer drawn.deinit(gpa);
+    for (hit.start_col..hit.end_col) |c| {
+        try drawn.appendSlice(gpa, vx.window().readCell(@intCast(c), @intCast(hit.row)).?.char.grapheme);
+    }
+    try std.testing.expectEqualStrings("ctx 42%", drawn.items);
+
+    // First click arms compact? without sending yet; redraw shows yellow underlined "compact?".
+    handleMouse(&app, .{ .row = @intCast(hit.row), .col = @intCast(hit.start_col), .button = .left, .mods = .{}, .type = .press });
+    try std.testing.expect(app.isCompactArmed());
+    try std.testing.expectEqual(@as(usize, 0), wire_out.written().len);
+
+    _ = arena_state.reset(.retain_capacity);
+    try draw(&app, &vx, arena_state.allocator());
+    const armed_hit = app.ctx_hit orelse return error.TestExpectedEqual;
+    drawn.clearRetainingCapacity();
+    for (armed_hit.start_col..armed_hit.end_col) |c| {
+        const cell = vx.window().readCell(@intCast(c), @intCast(armed_hit.row)).?;
+        try std.testing.expectEqual(vaxis.Cell.Style.Underline.single, cell.style.ul_style);
+        try drawn.appendSlice(gpa, cell.char.grapheme);
+    }
+    try std.testing.expectEqualStrings("compact?", drawn.items);
+
+    // Clicking outside disarms without sending.
+    handleMouse(&app, .{ .row = 3, .col = 2, .button = .left, .mods = .{}, .type = .press });
+    try std.testing.expect(!app.isCompactArmed());
+    try std.testing.expectEqual(@as(usize, 0), wire_out.written().len);
+
+    // Arm again and click a second time -> sends session_compact and sets notice.
+    handleMouse(&app, .{ .row = @intCast(hit.row), .col = @intCast(hit.start_col), .button = .left, .mods = .{}, .type = .press });
+    try std.testing.expect(app.isCompactArmed());
+    handleMouse(&app, .{ .row = @intCast(hit.row), .col = @intCast(hit.start_col), .button = .left, .mods = .{}, .type = .press });
+    try std.testing.expect(!app.isCompactArmed());
+    try std.testing.expect(std.mem.indexOf(u8, wire_out.written(), "\"session_compact\"") != null);
+    try std.testing.expectEqualStrings("compacting…", app.notice.items);
+
+    // Mid-turn click refuses to arm and shows notice.
+    app.view.state = .running;
+    handleMouse(&app, .{ .row = @intCast(hit.row), .col = @intCast(hit.start_col), .button = .left, .mods = .{}, .type = .press });
+    try std.testing.expect(!app.isCompactArmed());
+    try std.testing.expectEqualStrings("cannot compact mid-turn", app.notice.items);
+
+    // Expiry disarms cleanly once deadline passes.
+    app.view.state = .idle;
+    handleMouse(&app, .{ .row = @intCast(hit.row), .col = @intCast(hit.start_col), .button = .left, .mods = .{}, .type = .press });
+    try std.testing.expect(app.isCompactArmed());
+    app.compact_armed_deadline_ms.store(1, .release);
+    app.expireCompactArm();
+    try std.testing.expect(!app.isCompactArmed());
+
+    // Guest "ctx n/a" (context_limit == 0) is not clickable.
+    app.setModelStr("agy/default");
+    app.view.context_used = 0;
+    app.view.context_limit = 0;
+    _ = arena_state.reset(.retain_capacity);
+    try draw(&app, &vx, arena_state.allocator());
+    try std.testing.expectEqual(@as(?tui.CtxHit, null), app.ctx_hit);
+}

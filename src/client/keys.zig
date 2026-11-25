@@ -872,6 +872,7 @@ pub fn handleMouse(app: *App, m: vaxis.Mouse) void {
 
     const terminal_row: usize = if (m.row < 0) 0 else @intCast(m.row);
     if (terminal_row < app.tabBarRows()) {
+        if (m.type == .press and m.button == .left) app.disarmCompact();
         const col: usize = if (m.col < 0) 0 else @intCast(m.col);
         if (app.tabAtColumn(col)) |sid| {
             if (tabMouseAction(m)) |action| switch (action) {
@@ -894,6 +895,14 @@ pub fn handleMouse(app: *App, m: vaxis.Mouse) void {
         // Preserve the global wheel contract even when the pointer happens
         // to be over the strip; other non-click events belong to no view.
         if (m.button != .wheel_up and m.button != .wheel_down) return;
+    }
+
+    if (m.type == .press and m.button == .left and !m.mods.ctrl and !m.mods.shift) {
+        if (app.ctxHitAtMouse(m)) {
+            app.clickContextCompact();
+            return;
+        }
+        app.disarmCompact();
     }
 
     switch (m.button) {
