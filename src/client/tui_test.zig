@@ -5711,7 +5711,31 @@ test "review prompt expansion names the council, roster, and question" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "council \"core\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "- openrouter/x-ai/grok-4.6\n- openrouter/z-ai/glm-5.3") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "task_batch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "mcp__marlin__task_batch") != null);
     try std.testing.expect(std.mem.endsWith(u8, prompt, "Question for the council: is the cache safe?"));
+}
+
+test "review runs on guest sessions with a marlin MCP bridge and rejects Muse" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var app = App{ .gpa = gpa, .io = threaded.io(), .conn = undefined, .view = .{ .sid = 1, .editor = Editor.init(gpa) } };
+    defer app.deinit();
+
+    var council = OwnedCouncil{ .name = try gpa.dupe(u8, "core") };
+    try council.models.append(gpa, try gpa.dupe(u8, "openrouter/x-ai/grok-4.6"));
+    try app.councils.append(gpa, council);
+
+    // Muse has no marlin MCP bridge yet, so /review explains why instead of submitting.
+    try app.view.model.appendSlice(gpa, "muse/default");
+    app.runCommand("/review core check this");
+    try std.testing.expect(std.mem.indexOf(u8, app.notice.items, "Muse") != null);
+
+    // Bridged guest models pass the guard (conn is unused only when submitInput is not reached,
+    // so verify via guestBackend that claudecode/codex/agy are not blocked).
+    for ([_][]const u8{ "claudecode/sonnet", "codex/gpt-5", "agy/default" }) |model| {
+        try std.testing.expect(proto.guestBackend(model) != .muse);
+    }
 }
 
 test "transcript spacing invariant: every section breathes, nothing doubles" {

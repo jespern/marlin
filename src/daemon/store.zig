@@ -755,7 +755,7 @@ pub const Store = struct {
         id: u64,
         created_at: i64,
         parent_sid: u64,
-        parent_block_id: u64,
+        parent_block_id: ?u64,
         title: []const u8,
         cwd: []const u8,
         model: []const u8,
@@ -774,7 +774,7 @@ pub const Store = struct {
         bindText(stmt, 6, @tagName(effort));
         bindInt(stmt, 7, @bitCast(parent_sid));
         bindText(stmt, 8, "task_child");
-        bindInt(stmt, 9, @bitCast(parent_block_id));
+        if (parent_block_id) |bid| bindInt(stmt, 9, @bitCast(bid)) else bindNull(stmt, 9);
         bindInt(stmt, 10, @intCast(max_rounds));
         try stepDone(stmt);
     }

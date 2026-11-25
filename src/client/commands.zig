@@ -419,12 +419,14 @@ pub fn buildReviewPrompt(gpa: std.mem.Allocator, council: *const OwnedCouncil, q
         \\roster. If the skill is unavailable: write ONE self-contained review
         \\prompt (paths the read-only reviewers can open; paste diff hunks for
         \\anything uncommitted; require verdict, findings with file:line, and
-        \\confidence), fan it out with task_batch calls of at most eight tasks
-        \\each — one task per reviewer, identical prompt, the model ids above,
-        \\and task for a final one-reviewer remainder, max_rounds 12 — then
-        \\consolidate: agreements and disagreements
-        \\attributed by model, false
-        \\positives, and your recommendation. Report reviewers that fail.
+        \\confidence), fan it out with Marlin's task_batch tool
+        \\(mcp__marlin__task_batch on the marlin MCP server when running as a
+        \\guest) in calls of at most eight tasks each — one task per reviewer,
+        \\identical prompt, the model ids above, and Marlin's task tool
+        \\(mcp__marlin__task) for a final one-reviewer remainder, max_rounds
+        \\12 — then consolidate: agreements and disagreements attributed by
+        \\model, false positives, and your recommendation. Report reviewers
+        \\that fail.
         \\
         \\Question for the council:
     );
@@ -748,8 +750,8 @@ pub fn runCommand(self: *App, cmd: []const u8) void {
                 self.setNotice("unknown council '{s}' — /council lists them", .{name});
             return;
         };
-        if (proto.isGuestModel(self.view.model.items)) {
-            self.setNotice("councils need a native session (guest sessions have no marlin tools)", .{});
+        if (proto.guestBackend(self.view.model.items) == .muse) {
+            self.setNotice("councils are not available in Muse sessions yet (no marlin MCP bridge)", .{});
             return;
         }
         const expanded = buildReviewPrompt(self.gpa, council, question) catch {

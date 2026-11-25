@@ -44,7 +44,7 @@ pub const Permissions = enum { accept_edits, bypass, plan };
 /// Wiring for the marlin permission bridge: instead of headless auto-deny,
 /// Claude Code's permission prompts route over MCP to
 /// `<marlin_exe> cc_approve --sid <sid>`, which asks the daemon.
-pub const Bridge = struct { marlin_exe: []const u8, sid: u64 };
+pub const Bridge = struct { marlin_exe: []const u8, sid: u64, allow_tasks: bool = true };
 
 pub const ArgvOpts = struct {
     binary: []const u8,
@@ -122,11 +122,16 @@ pub fn buildArgv(arena: std.mem.Allocator, opts: ArgvOpts) ![]const []const u8 {
     // multiple-choice picker — wanted in EVERY permission mode, bypass
     // included. The system-prompt note is what makes the model reach for it.
     if (opts.bridge) |bridge| {
+        const sid_arg = try std.fmt.allocPrint(arena, "{d}", .{bridge.sid});
+        const bridge_args: []const []const u8 = if (bridge.allow_tasks)
+            &.{ "cc_approve", "--sid", sid_arg }
+        else
+            &.{ "cc_approve", "--sid", sid_arg, "--no-tasks" };
         const mcp_config = try std.json.Stringify.valueAlloc(arena, .{
             .mcpServers = .{ .marlin = .{
                 .type = "stdio",
                 .command = bridge.marlin_exe,
-                .args = .{ "cc_approve", "--sid", try std.fmt.allocPrint(arena, "{d}", .{bridge.sid}) },
+                .args = bridge_args,
                 .timeout = bridge_tool_timeout_ms,
             } },
         }, .{});

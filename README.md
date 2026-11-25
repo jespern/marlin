@@ -87,7 +87,7 @@ permissions. What Marlin adds is everything around them:
 | Tools and context | the vendor's | Marlin's tools, MCP servers, skills, and plugins |
 | Permissions | the vendor's, with approvals bridged into Marlin | Marlin's approvals and shell sandbox |
 | Context management | the vendor's, with `/compact` and a gauge | output caps, pruning, and compaction |
-| Delegation | the vendor's subagents, shown in the work tree | durable child tasks and multi-model review councils |
+| Delegation | the vendor's subagents, plus Marlin child tasks and review councils via MCP | durable child tasks and multi-model review councils |
 
 Both kinds share the same sessions, transcript, search, steering, shells,
 and clients. Switching a session between them hands the context over; see

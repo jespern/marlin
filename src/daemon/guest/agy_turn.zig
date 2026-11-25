@@ -586,7 +586,10 @@ pub fn runAgyTurn(
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const bridge: ?agy.Bridge = if (opts.marlin_exe) |exe| .{ .marlin_exe = exe, .sid = opts.session_id } else null;
+    const bridge: ?agy.Bridge = if (opts.marlin_exe) |exe|
+        .{ .marlin_exe = exe, .sid = opts.session_id, .allow_tasks = opts.tool_profile != .read_only }
+    else
+        null;
     const instructions = try claude_code.systemPromptAppend(
         arena,
         if (bridge != null) guest_auth.interactive_instructions else guest_auth.progress_instructions,

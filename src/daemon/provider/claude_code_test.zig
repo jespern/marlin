@@ -164,6 +164,18 @@ test "argv: fresh vs resume, model passthrough, permission mapping" {
     }
     try std.testing.expect(saw_mcp);
     try std.testing.expect(saw_bypass);
+
+    // Child bridges suppress task/task_batch so nested tasks stay off.
+    const child = try buildArgv(arena, .{
+        .binary = "claude",
+        .model = "default",
+        .session_uuid = "u-u-i-d",
+        .fresh = true,
+        .permissions = .accept_edits,
+        .bridge = .{ .marlin_exe = "/opt/marlin", .sid = 43, .allow_tasks = false },
+        .max_turns = 8,
+    });
+    try std.testing.expect(std.mem.indexOf(u8, child[13], "\"--sid\",\"43\",\"--no-tasks\"") != null);
 }
 
 test "argv: scoped settings keep the approval bridge and explicit modes separate" {

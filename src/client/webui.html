@@ -1248,7 +1248,9 @@ function toolDisplayName(name) {
   if (n === 'write' || name === 'write_file') return 'Write';
   const names = {edit: 'Edit', bash: 'Bash', grep: 'Grep', glob: 'Glob', fetch: 'Fetch', webfetch: 'Fetch', websearch: 'Search', task: 'Task'};
   if (names[n]) return names[n];
-  if (name === 'task_batch') return 'Tasks';
+  const bare = (name || '').replace(/^mcp__marlin__|^MCP marlin\//, '');
+  if (bare === 'task') return 'Task';
+  if (bare === 'task_batch') return 'Tasks';
   if (name === 'plan_update') return 'Plan';
   return name;
 }

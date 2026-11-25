@@ -140,8 +140,8 @@ pub fn ccAutoAllow(
     input_json: []const u8,
 ) bool {
     const read_only = [_][]const u8{
-        "Read",                          "Glob",                    "Grep",                  "LS",                        "NotebookRead",
-        "WebFetch",                      "WebSearch",               "Task",                  "ExitPlanMode",              "TodoWrite",
+        "Read",                          "Glob",                    "Grep",                    "LS",                        "NotebookRead",
+        "WebFetch",                      "WebSearch",               "Task",                    "ExitPlanMode",              "TodoWrite",
         // marlin's own bridge picker: the call IS a question to the user,
         // so approving it first would just ask twice.
         "mcp__marlin__ask_user",
@@ -149,8 +149,11 @@ pub fn ccAutoAllow(
                 "mcp__marlin__show_image",
         // Other sessions (tools/sessions.zig): never gated, by choice; the
         // hop and per-turn limits bound them.
-        "mcp__marlin__sessions", "mcp__marlin__read_session", "mcp__marlin__message_session",
+        "mcp__marlin__sessions",   "mcp__marlin__read_session", "mcp__marlin__message_session",
         "mcp__marlin__wait_for_session",
+        // Durable read-only child sessions (tools/task.zig): children are
+        // read-only by construction, matching native sessions' auto-allow.
+        "mcp__marlin__task",       "mcp__marlin__task_batch",
     };
     for (read_only) |name| if (std.mem.eql(u8, tool_name, name)) return true;
 

@@ -36,6 +36,17 @@ pub const BatchArgs = struct {
 
 pub const max_batch_tasks: usize = 8;
 
+pub const Spec = struct { name: []const u8, description: []const u8, schema: []const u8 };
+
+pub const specs = [_]Spec{
+    .{ .name = spec_name, .description = spec_description, .schema = spec_schema },
+    .{ .name = batch_spec_name, .description = batch_spec_description, .schema = batch_spec_schema },
+};
+
+pub fn isTool(name: []const u8) bool {
+    return std.mem.eql(u8, name, spec_name) or std.mem.eql(u8, name, batch_spec_name);
+}
+
 pub const QualifyError = error{ InvalidModel, NoParentGateway, OutOfMemory };
 
 /// Models emitted by provider APIs often omit Marlin's outer registry

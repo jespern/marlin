@@ -2014,6 +2014,10 @@ test "Marlin's own tools say what they do and name the session or image, under e
     for ([_][]const u8{ "wait_for_session", "mcp__marlin__wait_for_session", "MCP marlin/wait_for_session" }) |name|
         try std.testing.expectEqual(layout.MarlinTool.wait, layout.marlinTool(name).?);
     try std.testing.expect(layout.marlinTool("mcp__other__wait_for_session") == null);
+    for ([_][]const u8{ "task", "mcp__marlin__task", "MCP marlin/task" }) |name|
+        try std.testing.expectEqualStrings("Task", layout.toolDisplayName(name));
+    for ([_][]const u8{ "task_batch", "mcp__marlin__task_batch", "MCP marlin/task_batch" }) |name|
+        try std.testing.expectEqualStrings("Tasks", layout.toolDisplayName(name));
 
     const session_handle = @import("../core/session_handle.zig");
     const jev = session_handle.full(42);

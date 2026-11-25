@@ -1,4 +1,23 @@
 {
-  "steps": [],
+  "steps": [
+    {
+      "expect_contains": ["guest council prompt", "\"name\":\"read_file\""],
+      "expect_not_contains": ["\"name\":\"task\"", "\"name\":\"task_batch\"", "\"name\":\"bash\""],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"guest council verdict one\"}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":16,\"completion_tokens\":5}}",
+        "[DONE]"
+      ]
+    },
+    {
+      "expect_contains": ["guest council prompt", "\"name\":\"read_file\""],
+      "expect_not_contains": ["\"name\":\"task\"", "\"name\":\"task_batch\"", "\"name\":\"bash\""],
+      "sse": [
+        "{\"choices\":[{\"delta\":{\"content\":\"guest council verdict two\"}}]}",
+        "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":16,\"completion_tokens\":5}}",
+        "[DONE]"
+      ]
+    }
+  ],
   "check": { "argv": [], "codex_question_flow": true }
 }

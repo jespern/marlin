@@ -674,7 +674,10 @@ pub fn runCodexTurn(
         otelOverrides(opts.otel_guest, codex.configNamesCollector(gpa, io, environ))
     else
         otelOverrides(opts.otel_guest, false);
-    const bridge: ?codex.Bridge = if (opts.marlin_exe) |exe| .{ .marlin_exe = exe, .sid = opts.session_id } else null;
+    const bridge: ?codex.Bridge = if (opts.marlin_exe) |exe|
+        .{ .marlin_exe = exe, .sid = opts.session_id, .allow_tasks = opts.tool_profile != .read_only }
+    else
+        null;
     const instructions = try claude_code.systemPromptAppend(
         arena,
         if (bridge != null) guest_auth.interactive_instructions else guest_auth.progress_instructions,

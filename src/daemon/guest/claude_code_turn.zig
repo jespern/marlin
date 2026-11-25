@@ -438,7 +438,7 @@ fn ccInvoke(
     // ask_user picker tool. Permission ROUTING stays mode-dependent in
     // buildArgv.
     const bridge: ?claude_code.Bridge = if (opts.marlin_exe != null)
-        .{ .marlin_exe = opts.marlin_exe.?, .sid = opts.session_id }
+        .{ .marlin_exe = opts.marlin_exe.?, .sid = opts.session_id, .allow_tasks = !read_only_child }
     else
         null;
     const argv = try claude_code.buildArgv(arena, .{

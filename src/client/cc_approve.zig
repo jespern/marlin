@@ -23,6 +23,7 @@ const proto = @import("../core/proto.zig");
 const attach = @import("attach.zig");
 const sessions_tool = @import("../daemon/tools/sessions.zig");
 const show_image = @import("../daemon/tools/show_image.zig");
+const task_tool = @import("../daemon/tools/task.zig");
 
 /// One verdict, with the daemon's optional policy message (copied into a
 /// fixed buffer: the wire arena dies before the reply is composed).
@@ -80,6 +81,9 @@ pub const Decider = struct {
     /// Offer `approve`, Claude Code's permission prompt tool. Guests that ask
     /// for permission over their own protocol (`--no-approve`) never call it.
     approve: bool = true,
+    /// Offer `task` and `task_batch` for spawning durable read-only child
+    /// sessions. Child sessions pass `--no-tasks` so nested tasks stay off.
+    tasks: bool = true,
 };
 
 pub const AgentToolResult = struct { text: []u8, ok: bool };
@@ -93,17 +97,20 @@ pub fn run(
 ) !u8 {
     var sid: ?u64 = null;
     var approve = true;
+    var tasks = true;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--no-approve")) {
             approve = false;
+        } else if (std.mem.eql(u8, args[i], "--no-tasks")) {
+            tasks = false;
         } else if (std.mem.eql(u8, args[i], "--sid") and i + 1 < args.len) {
             i += 1;
             sid = std.fmt.parseInt(u64, args[i], 10) catch null;
         }
     }
     const session_id = sid orelse {
-        std.log.err("usage: marlin cc_approve --sid <sid> [--no-approve] (internal)", .{});
+        std.log.err("usage: marlin cc_approve --sid <sid> [--no-approve] [--no-tasks] (internal)", .{});
         return 2;
     };
 
@@ -121,6 +128,7 @@ pub fn run(
         .agent_tool = DaemonDecider.agentTool,
         .load_image = DaemonDecider.loadImage,
         .approve = approve,
+        .tasks = tasks,
     };
 
     var in_buf: [64 * 1024]u8 = undefined;
@@ -185,12 +193,23 @@ const DaemonDecider = struct {
         comptime tag: std.meta.Tag(proto.DaemonMsg),
         request: proto.ClientMsg,
     ) !@FieldType(proto.DaemonMsg, @tagName(tag)) {
+        return self.callWithRetry(arena, tag, request, true);
+    }
+
+    fn callWithRetry(
+        self: *DaemonDecider,
+        arena: std.mem.Allocator,
+        comptime tag: std.meta.Tag(proto.DaemonMsg),
+        request: proto.ClientMsg,
+        retry_after_send: bool,
+    ) !@FieldType(proto.DaemonMsg, @tagName(tag)) {
         const started = nowMs(self.io);
         var delay_ms: i64 = 100;
         while (true) {
-            if (self.callOnce(arena, tag, request)) |result| return result else |err| switch (err) {
-                error.OutOfMemory, error.DaemonError => return err,
-                // Refused while restarting, or the connection ended.
+            if (self.callOnce(arena, tag, request, retry_after_send)) |result| return result else |err| switch (err) {
+                error.OutOfMemory, error.DaemonError, error.DaemonDisconnected => return err,
+                // Refused while restarting, or the connection ended before
+                // a non-idempotent request was sent.
                 else => {
                     if (nowMs(self.io) - started > restart_retry_ms) return err;
                     self.io.sleep(.fromMilliseconds(delay_ms), .awake) catch return err;
@@ -205,12 +224,16 @@ const DaemonDecider = struct {
         arena: std.mem.Allocator,
         comptime tag: std.meta.Tag(proto.DaemonMsg),
         request: proto.ClientMsg,
+        retry_after_send: bool,
     ) !@FieldType(proto.DaemonMsg, @tagName(tag)) {
         const conn = try attach.connect(self.gpa, self.io, self.environ, self.self_exe);
         defer conn.deinit();
         try conn.send(request);
         while (true) {
-            const msg = try conn.recv(arena);
+            const msg = conn.recv(arena) catch |err| {
+                if (!retry_after_send) return error.DaemonDisconnected;
+                return err;
+            };
             if (msg == tag) return @field(msg, @tagName(tag));
             if (msg == .err) {
                 if (std.mem.eql(u8, msg.err.code, "restarting")) return error.DaemonRestarting;
@@ -233,12 +256,18 @@ const DaemonDecider = struct {
         return self.forwardAgentTool(gpa, name, args_json) catch null;
     }
 
-    /// The connection lives as long as the call: wait_for_session answers
-    /// only when the other session's turn ends.
+    /// The connection lives as long as the call: wait_for_session and task /
+    /// task_batch answer only when the target turn(s) end. Never retry task
+    /// tools after the request is sent so a crash cannot double-spawn children.
     fn forwardAgentTool(self: *DaemonDecider, gpa: std.mem.Allocator, name: []const u8, args_json: []const u8) !AgentToolResult {
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
-        const result = try self.call(arena_state.allocator(), .agent_tool_result, .{ .agent_tool = .{ .request_id = 1, .sid = self.sid, .name = name, .args_json = args_json } });
+        const result = try self.callWithRetry(
+            arena_state.allocator(),
+            .agent_tool_result,
+            .{ .agent_tool = .{ .request_id = 1, .sid = self.sid, .name = name, .args_json = args_json } },
+            !task_tool.isTool(name),
+        );
         return .{ .text = try gpa.dupe(u8, result.output), .ok = result.status == .ok };
     }
 
@@ -288,7 +317,7 @@ pub fn handleLine(gpa: std.mem.Allocator, line: []const u8, decider: Decider) ?[
     }
     if (std.mem.eql(u8, rpc.method, "ping")) return rpcResult(gpa, id, "{}");
     if (std.mem.eql(u8, rpc.method, "tools/list")) {
-        if (decider.agent_tool != null) return toolsWithSessions(gpa, id, decider.approve);
+        if (decider.agent_tool != null) return toolsWithSessions(gpa, id, decider.approve, decider.tasks);
         return rpcResult(gpa, id, base_tools_json);
     }
     if (std.mem.eql(u8, rpc.method, "tools/call")) {
@@ -312,7 +341,7 @@ fn handleToolCall(gpa: std.mem.Allocator, id: std.json.Value, params: ?std.json.
         return handleAskUser(gpa, id, p, decider);
     if (std.mem.eql(u8, name.string, show_image.spec_name))
         return handleShowImage(gpa, id, p, decider);
-    if (sessions_tool.isTool(name.string))
+    if (sessions_tool.isTool(name.string) or (decider.tasks and task_tool.isTool(name.string)))
         return handleAgentTool(gpa, id, name.string, p, decider);
     if (!std.mem.eql(u8, name.string, "approve") or !decider.approve)
         return rpcError(gpa, id, -32602, "unknown tool");
@@ -398,9 +427,10 @@ fn handleAskUser(gpa: std.mem.Allocator, id: std.json.Value, p: std.json.Value, 
     return rpcResult(gpa, id, result);
 }
 
-/// tools/list with the tools for other sessions after approve and ask_user,
-/// from the same specs the native agent gets.
-fn toolsWithSessions(gpa: std.mem.Allocator, id: std.json.Value, approve: bool) ?[]u8 {
+/// tools/list with the tools for other sessions (and task/task_batch for root
+/// sessions) after approve and ask_user, from the same specs the native agent
+/// gets.
+fn toolsWithSessions(gpa: std.mem.Allocator, id: std.json.Value, approve: bool, include_tasks: bool) ?[]u8 {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -416,6 +446,13 @@ fn toolsWithSessions(gpa: std.mem.Allocator, id: std.json.Value, approve: bool) 
         .description = spec.description,
         .inputSchema = std.json.parseFromSliceLeaky(std.json.Value, arena, spec.schema, .{}) catch return null,
     }) catch return null;
+    if (include_tasks) {
+        for (task_tool.specs) |spec| tools.append(arena, .{
+            .name = spec.name,
+            .description = spec.description,
+            .inputSchema = std.json.parseFromSliceLeaky(std.json.Value, arena, spec.schema, .{}) catch return null,
+        }) catch return null;
+    }
     const result = std.json.Stringify.valueAlloc(arena, .{ .tools = tools.items }, .{}) catch return null;
     return rpcResult(gpa, id, result);
 }
