@@ -1255,7 +1255,7 @@ pub const Daemon = struct {
         // following its session into a shell the phone opened would shrink
         // the phone's screen); typing does, in shell_input.
         if (!follow_size and host.viewers.items.len == 1) self.resizeShell(host, geometry);
-        self.sendTo(client, .{ .shell_opened = .{ .shell_id = host.id, .request_id = request_id } });
+        self.sendTo(client, .{ .shell_opened = .{ .shell_id = host.id, .request_id = request_id, .command = host.ran } });
         try self.sendShellSnapshot(client, host);
         self.broadcastShellList();
     }

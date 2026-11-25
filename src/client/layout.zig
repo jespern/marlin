@@ -1153,6 +1153,84 @@ fn marlinToolRun(
     }, .last = last };
 }
 
+const RepeatedToolRun = struct {
+    calls: [3]usize = .{ 0, 0, 0 },
+    counts: [3]usize = .{ 0, 0, 0 },
+    period: usize = 0,
+    last: usize = 0,
+};
+
+fn isFoldableRepeatCall(blocks: []const RenderBlock, call_idx: usize) bool {
+    const rb = blocks[call_idx];
+    if (rb.kind != .tool_call) return false;
+    if (isAskUserTool(rb.label) or marlinTool(rb.label) != null) return false;
+    if (pairedToolResult(blocks, call_idx)) |res| {
+        if (res.status != .ok) return false;
+        if (hasFreshImage(blocks, res)) return false;
+        if (isFileEditTool(rb.label) and isDiffOutput(res.text)) return false;
+    }
+    return true;
+}
+
+/// Group consecutive repeated tool calls (`A, A, A` → `A · ×3`) and short
+/// alternating cycles (`A, B, A, B, A` → `A · ×3`, `B · ×2`) as they arrive.
+/// Failures, authored diffs, images, prose, and turn boundaries break the run.
+fn repeatedToolRun(
+    arena: std.mem.Allocator,
+    blocks: []const RenderBlock,
+    start: usize,
+    end: usize,
+    cwd: []const u8,
+) !?RepeatedToolRun {
+    if (!isFoldableRepeatCall(blocks, start)) return null;
+    const turn_id = blocks[start].turn_id;
+    const Entry = struct { call_idx: usize, last_block: usize, name: []const u8, arg: []const u8 };
+    var seq: std.ArrayList(Entry) = .empty;
+    var i = start;
+    while (i < end) : (i += 1) {
+        const b = blocks[i];
+        if (b.turn_id != turn_id) break;
+        switch (b.kind) {
+            .tool_call => {
+                if (!isFoldableRepeatCall(blocks, i)) break;
+                const res = pairedToolResult(blocks, i);
+                const name = toolDisplayNameFor(arena, b.label, b.text);
+                const arg = (try completedToolDisplayArg(arena, b, res, cwd)) orelse "";
+                try seq.append(arena, .{ .call_idx = i, .last_block = i, .name = name, .arg = arg });
+            },
+            .tool_result => {
+                const call = pairedToolCallIndex(blocks, i) orelse break;
+                if (call < start) break;
+                var in_seq = false;
+                for (seq.items) |entry| if (entry.call_idx == call) {
+                    in_seq = true;
+                    break;
+                };
+                if (!in_seq) break;
+                seq.items[seq.items.len - 1].last_block = i;
+            },
+            else => break,
+        }
+    }
+    for ([_]usize{ 1, 2, 3 }) |period| {
+        if (seq.items.len < period * 2) continue;
+        var matched: usize = period;
+        while (matched < seq.items.len) : (matched += 1) {
+            const a = seq.items[matched];
+            const b = seq.items[matched % period];
+            if (!std.mem.eql(u8, a.name, b.name) or !std.mem.eql(u8, a.arg, b.arg)) break;
+        }
+        if (matched < period * 2) continue;
+        var run = RepeatedToolRun{ .period = period, .last = seq.items[matched - 1].last_block };
+        for (0..period) |pos| {
+            run.calls[pos] = seq.items[pos].call_idx;
+            run.counts[pos] = matched / period + @intFromBool(pos < (matched % period));
+        }
+        return run;
+    }
+    return null;
+}
+
 /// A live activity row for one of Marlin's own tools, said as what it does
 /// ("Waiting on chat · cbf5d5c5"), else null. The call's block carries its
 /// arguments; without one (marlin top, a subagent's call) the activity's
@@ -1417,12 +1495,13 @@ pub fn appendToolCallLine(
                 try diffCountSpans(alloc, note_text, head.len + hi_capped.len),
         });
     } else {
+        const bare_head = if (note_text.len > 0) std.mem.trimEnd(u8, head, " ") else head;
         try lines.append(alloc, .{
-            .text = head,
+            .text = bare_head,
             .style = Palette.tool,
             .text2 = note_text,
             .style2 = Palette.collapse_hint,
-            .syntax = try diffCountSpans(alloc, note_text, head.len),
+            .syntax = try diffCountSpans(alloc, note_text, bare_head.len),
         });
     }
 }
@@ -2399,6 +2478,16 @@ pub fn layoutBlockRange(
                         block_idx = run.last;
                         continue;
                     }
+                    if (try repeatedToolRun(alloc, transcript.blocks, block_idx, end, transcript.cwd)) |run| {
+                        for (0..run.period) |pos| {
+                            const call_rb = transcript.blocks[run.calls[pos]];
+                            const call_res = pairedToolResult(transcript.blocks, run.calls[pos]);
+                            const count_note = try std.fmt.allocPrint(alloc, "×{d}", .{run.counts[pos]});
+                            try appendCallLine(alloc, lines, call_rb, transcript.cwd, transcript.sessions, w, count_note, call_res);
+                        }
+                        block_idx = run.last;
+                        continue;
+                    }
                 }
                 const note = if (result != null and result.?.status == .ok and isFileEditTool(rb.label))
                     try diffSummaryNote(alloc, result.?.text)
@@ -2494,7 +2583,7 @@ pub fn shellExitLabel(gpa: std.mem.Allocator, st: block.ShellTranscript) ![]u8 {
         return gpa.dupe(u8, "ended when Marlin stopped");
     }
     if (st.signal) |s| return std.fmt.allocPrint(gpa, "ended by signal {d}", .{s});
-    if (st.exit_code) |code| if (code != 0) return std.fmt.allocPrint(gpa, "exited {d}", .{code});
+    if (st.exit_code) |code| return std.fmt.allocPrint(gpa, "exited {d}", .{code});
     return gpa.dupe(u8, "exited");
 }
 
@@ -2509,6 +2598,9 @@ fn appendShellTranscript(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), 
         .text3 = try std.fmt.allocPrint(alloc, " · {s}", .{status}),
         .style3 = Palette.collapse_hint,
     });
+    const gutter: usize = if (ran.len > 0 and w > 2) 2 else 0;
+    const prefix: []const u8 = if (gutter > 0) "  " else "";
+    const content_w = @max(w -| gutter, 1);
     if (styled.len > 0) {
         const rows = try shell_styled.rows(alloc, styled);
         const skip = rows.len -| shell_transcript_display_lines;
@@ -2521,20 +2613,26 @@ fn appendShellTranscript(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), 
         for (rows[skip..]) |row| {
             var start: usize = 0;
             while (true) {
-                const end = hardCellBreak(row.text, start, @max(w, 1));
+                const end = hardCellBreak(row.text, start, content_w);
+                const chunk = row.text[start..end];
+                const line_text = if (gutter > 0 and chunk.len > 0)
+                    try std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, chunk })
+                else
+                    chunk;
+                const pad: usize = if (gutter > 0 and chunk.len > 0) gutter else 0;
                 var spans: std.ArrayList(SyntaxSpan) = .empty;
                 for (row.syntax) |span| {
                     if (span.end <= start or span.start >= end) continue;
                     var style = span.style;
                     style.dim = true;
-                    try spans.append(alloc, .{ .start = @max(span.start, start) - start, .end = @min(span.end, end) - start, .style = style });
+                    try spans.append(alloc, .{ .start = pad + @max(span.start, start) - start, .end = pad + @min(span.end, end) - start, .style = style });
                 }
                 try lines.append(alloc, .{
-                    .text = row.text[start..end],
+                    .text = line_text,
                     .style = ended_shell_style,
                     .syntax = spans.items,
-                    .links = try linksForChunk(alloc, row.links, start, end, 0),
-                    .copy = .{ .join = if (start == 0) .newline else .direct },
+                    .links = try linksForChunk(alloc, row.links, start, end, pad),
+                    .copy = .{ .join = if (start == 0) .newline else .direct, .content_col = if (pad > 0) @intCast(pad) else null },
                 });
                 if (end <= start or end >= row.text.len) break;
                 start = end;
@@ -2555,8 +2653,13 @@ fn appendShellTranscript(alloc: std.mem.Allocator, lines: *std.ArrayList(Line), 
     var index: usize = 0;
     while (it.next()) |row| : (index += 1) {
         if (index < skip) continue;
-        const clipped = row[0..hardCellBreak(row, 0, w)];
-        try lines.append(alloc, .{ .text = clipped, .style = ended_shell_style, .copy = .{ .join = .newline } });
+        const clipped = row[0..hardCellBreak(row, 0, content_w)];
+        const line_text = if (gutter > 0 and clipped.len > 0)
+            try std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, clipped })
+        else
+            clipped;
+        const pad: ?u16 = if (gutter > 0 and clipped.len > 0) @intCast(gutter) else null;
+        try lines.append(alloc, .{ .text = line_text, .style = ended_shell_style, .copy = .{ .join = .newline, .content_col = pad } });
     }
 }
 
@@ -2868,7 +2971,10 @@ pub fn layoutLines(
         try wrapPrefixed(arena, &lines, "  ", "1-9 picks · or type your own answer and press Enter", Palette.tool_out, w);
     }
     try resolveLineLinks(arena, lines.items);
-    try lines.appendSlice(arena, transcript.extra_lines);
+    if (transcript.extra_lines.len > 0) {
+        try blankLine(arena, &lines);
+        try lines.appendSlice(arena, transcript.extra_lines);
+    }
     return lines;
 }
 

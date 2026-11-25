@@ -10,6 +10,8 @@ pub const ShellState = struct {
     request_id: u64 = 0,
     /// Null until the daemon confirms the shell.
     shell_id: ?u64 = null,
+    /// The one command `!! <command>` is running; empty for an interactive `!!`.
+    command: []u8 = &.{},
     /// Null until the first snapshot arrives.
     emulator: ?*shell_term.Emulator = null,
     /// False while the connection is down, until reattached.
@@ -39,9 +41,17 @@ pub const ShellState = struct {
         return self;
     }
 
+    pub fn setCommand(self: *ShellState, command: []const u8) void {
+        if (std.mem.eql(u8, self.command, command)) return;
+        if (self.command.len > 0) self.gpa.free(self.command);
+        self.command = if (command.len > 0) self.gpa.dupe(u8, command) catch &.{} else &.{};
+        self.lines_generation = std.math.maxInt(u64);
+    }
+
     pub fn destroy(self: *ShellState) void {
         const gpa = self.gpa;
         if (self.emulator) |emulator| emulator.destroy();
+        if (self.command.len > 0) gpa.free(self.command);
         self.pending.deinit(gpa);
         self.lines_arena.deinit();
         gpa.destroy(self);

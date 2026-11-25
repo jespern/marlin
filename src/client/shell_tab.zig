@@ -109,10 +109,17 @@ const Grid = struct { cols: u16, rows: u16, cell_width: u16, cell_height: u16 };
 /// Rows below a shell: a blank row, then the status line.
 pub const bottom_rows: u16 = 2;
 
+/// Left gutter for an inline `!! <command>` so its live rows align under its
+/// `  $ <command>` header and match the finished shell transcript.
+fn gutterCols(state: *const ShellState) u16 {
+    return if (state.command.len > 0) 2 else 0;
+}
+
 /// The transcript area: everything but the tab bar and `bottom_rows`.
-fn gridSize(app: *const App) Grid {
+fn gridSize(app: *const App, gutter: u16) Grid {
+    const raw_cols: u16 = @intCast(std.math.clamp(app.term_cols, 1, std.math.maxInt(u16)));
     return .{
-        .cols = @intCast(std.math.clamp(app.term_cols, 1, std.math.maxInt(u16))),
+        .cols = @max(raw_cols -| gutter, 1),
         .rows = @max(app.term_rows -| @as(u16, @intCast(app.tabBarRows())) -| bottom_rows, 1),
         .cell_width = @intCast(@min(app.cell_px_w, std.math.maxInt(u16))),
         .cell_height = @intCast(@min(app.cell_px_h, std.math.maxInt(u16))),
@@ -142,8 +149,9 @@ pub fn open(app: *App, command: []const u8) void {
         return;
     }
     const state = ShellState.create(app.gpa) catch return;
+    state.setCommand(command);
     state.request_id = nextRequestId(app);
-    const grid = gridSize(app);
+    const grid = gridSize(app, gutterCols(state));
     app.conn.send(.{ .shell_open = .{
         .request_id = state.request_id,
         .sid = app.view.sid,
@@ -204,7 +212,7 @@ pub fn themeChanged(app: *App) void {
 
 fn sendAttach(app: *App, state: *ShellState) void {
     const id = state.shell_id orelse return;
-    const grid = gridSize(app);
+    const grid = gridSize(app, gutterCols(state));
     app.conn.send(.{ .shell_attach = .{
         .request_id = state.request_id,
         .shell_id = id,
@@ -423,7 +431,9 @@ pub fn mouse(app: *App, m: vaxis.Mouse) bool {
     const screen_top: i32 = if (full_screen) 0 else @as(i32, @intCast(app.view.last_total_lines -| state.screen_rows_shown)) - @as(i32, @intCast(app.view.last_first_visible));
     const top: i32 = @as(i32, @intCast(app.tabBarRows())) + screen_top;
     const row = @as(i32, m.row) - top;
-    if (row < 0 or row >= emulator.terminal.rows or m.col < 0) return true;
+    const gutter: i32 = if (full_screen) 0 else @intCast(gutterCols(state));
+    const col = @as(i32, m.col) - gutter;
+    if (row < 0 or row >= emulator.terminal.rows or col < 0) return true;
     if (!emulator.tracksMouse()) {
         // Full-screen programs without mouse reports (less, man) scroll
         // with the arrow keys, as terminals' alternate-scroll mode does.
@@ -439,10 +449,10 @@ pub fn mouse(app: *App, m: vaxis.Mouse) bool {
         sendInput(app, state, presses.written());
         return true;
     }
-    const grid = gridSize(app);
+    const grid = gridSize(app, gutterCols(state));
     var out: std.Io.Writer.Allocating = .init(app.gpa);
     defer out.deinit();
-    emulator.encodeMouse(&out.writer, m, @intCast(m.col), @intCast(row), grid.cell_width, grid.cell_height) catch return true;
+    emulator.encodeMouse(&out.writer, m, @intCast(col), @intCast(row), grid.cell_width, grid.cell_height) catch return true;
     sendInput(app, state, out.written());
     return true;
 }
@@ -451,12 +461,14 @@ pub fn mouse(app: *App, m: vaxis.Mouse) bool {
 /// it changed.
 pub fn fit(app: *App, cols: u16, rows: u16) void {
     const state = live(app) orelse return;
-    state.emulator.?.resize(cols, rows) catch {};
-    if (cols == state.sent_cols and rows == state.sent_rows) return;
+    const gutter = if (showingFullScreen(app)) 0 else gutterCols(state);
+    const fit_cols = @max(cols -| gutter, 1);
+    state.emulator.?.resize(fit_cols, rows) catch {};
+    if (fit_cols == state.sent_cols and rows == state.sent_rows) return;
     const id = state.shell_id orelse return;
-    const grid = gridSize(app);
-    app.conn.send(.{ .shell_resize = .{ .shell_id = id, .cols = cols, .rows = rows, .cell_width = grid.cell_width, .cell_height = grid.cell_height } }) catch return;
-    state.sent_cols = cols;
+    const grid = gridSize(app, gutter);
+    app.conn.send(.{ .shell_resize = .{ .shell_id = id, .cols = fit_cols, .rows = rows, .cell_width = grid.cell_width, .cell_height = grid.cell_height } }) catch return;
+    state.sent_cols = fit_cols;
     state.sent_rows = rows;
 }
 
@@ -478,20 +490,34 @@ pub fn transcriptLines(state: *ShellState, width: usize) ![]const Line {
     }
     std.mem.reverse(vt.Pin, pins.items);
 
-    const all = try arena.alloc(Line, pins.items.len);
+    const gutter: u16 = if (state.command.len > 0 and width > 2) 2 else 0;
+    const has_header = state.command.len > 0;
+    const header_count: usize = if (has_header) 1 else 0;
+    const all = try arena.alloc(Line, header_count + pins.items.len);
+    if (has_header) {
+        all[0] = .{
+            .text = "  $ ",
+            .style = render.Palette.shell_command,
+            .text2 = state.command,
+            .style2 = render.Palette.shell_command,
+            .text3 = " · running",
+            .style3 = render.Palette.collapse_hint,
+        };
+    }
     var wrapped = false;
-    for (pins.items, all) |pin, *line| {
-        line.* = try rowLine(arena, pin, wrapped);
+    for (pins.items, all[header_count..]) |pin, *line| {
+        line.* = try rowLine(arena, pin, wrapped, gutter);
         wrapped = pin.rowAndCell().row.wrap;
     }
     // Leave out the screen's empty rows below the cursor and the last text.
-    const screen_start = all.len -| emulator.terminal.rows;
-    var shown = @min(all.len, screen_start + screen.cursor.y + 1);
-    for (all[shown..], shown..) |line, i| if (line.text.len > 0) {
+    const term_rows = all[header_count..];
+    const screen_start = term_rows.len -| emulator.terminal.rows;
+    var shown = @min(term_rows.len, screen_start + screen.cursor.y + 1);
+    for (term_rows[shown..], shown..) |line, i| if (line.text.len > gutter) {
         shown = i + 1;
     };
-    const lines = all[0..shown];
-    render.resolveLineLinks(arena, lines) catch {};
+    const lines = all[0 .. header_count + shown];
+    render.resolveLineLinks(arena, lines[header_count..]) catch {};
     state.lines = lines;
     state.pins = pins.items[0..shown];
     state.screen_rows_shown = shown - screen_start;
@@ -500,10 +526,11 @@ pub fn transcriptLines(state: *ShellState, width: usize) ![]const Line {
     return lines;
 }
 
-fn rowLine(arena: std.mem.Allocator, pin: vt.Pin, continues: bool) !Line {
+fn rowLine(arena: std.mem.Allocator, pin: vt.Pin, continues: bool, gutter: u16) !Line {
     var text: std.ArrayList(u8) = .empty;
     var spans: std.ArrayList(SyntaxSpan) = .empty;
     var links: std.ArrayList(render.LinkSpan) = .empty;
+    if (gutter > 0) try text.appendSlice(arena, "  ");
     const page = pin.node.page();
     var keep: usize = 0; // bytes worth keeping: text, or styled blanks
     var buf: [4]u8 = undefined;
@@ -551,7 +578,10 @@ fn rowLine(arena: std.mem.Allocator, pin: vt.Pin, continues: bool) !Line {
         .style = .{},
         .syntax = spans.items,
         .links = links.items,
-        .copy = .{ .join = if (continues) .direct else .newline },
+        .copy = .{
+            .join = if (continues) .direct else .newline,
+            .content_col = if (gutter > 0) gutter else null,
+        },
     };
 }
 
@@ -573,8 +603,10 @@ pub fn placeCursor(app: *App, win: vaxis.Window, top_rows: u16, view_h: u16, tot
     const abs = total_lines -| state.screen_rows_shown + cursor.y;
     if (abs < app.view.last_first_visible) return win.hideCursor();
     const row = abs - app.view.last_first_visible;
-    if (row >= view_h or cursor.x >= win.width) return win.hideCursor();
-    win.showCursor(@intCast(cursor.x), @intCast(top_rows + row));
+    const gutter: u16 = if (state.command.len > 0 and win.width > 2) 2 else 0;
+    const col = cursor.x + gutter;
+    if (row >= view_h or col >= win.width) return win.hideCursor();
+    win.showCursor(@intCast(col), @intCast(top_rows + row));
 }
 
 pub fn opened(app: *App, msg: anytype) void {
@@ -583,6 +615,7 @@ pub fn opened(app: *App, msg: anytype) void {
         if (state.request_id != msg.request_id) continue;
         if (state.shell_id) |id| if (id != msg.shell_id) continue;
         state.shell_id = msg.shell_id;
+        if (msg.command) |cmd| state.setCommand(cmd);
         state.attached = true;
         if (state.pending.items.len > 0) {
             sendInput(app, state, state.pending.items);
@@ -679,8 +712,9 @@ pub fn imageWants(app: *App, arena: std.mem.Allocator) ![]const shell_images.Wan
     const screen = if (full_screen) t.screens.active else t.screens.get(.primary) orelse t.screens.active;
     const top: isize = @intCast(app.tabBarRows());
     const view_h: isize = @intCast(app.view.last_view_h);
-    // Transcript index of the shell's first row (it ends the transcript).
-    const shell_first: isize = @intCast(app.view.last_total_lines -| state.lines.len);
+    // Transcript index of the shell's first terminal row (pins end the transcript).
+    const shell_first: isize = @intCast(app.view.last_total_lines -| state.pins.len);
+    const gutter: u16 = if (full_screen or app.term_cols <= 2) 0 else gutterCols(state);
     const first_visible: isize = @intCast(app.view.last_first_visible);
 
     var wants: std.ArrayList(shell_images.Want) = .empty;
@@ -726,7 +760,7 @@ pub fn imageWants(app: *App, arena: std.mem.Allocator) ![]const shell_images.Wan
             .image = .{ .shell = image },
             .key = .{ .owner = @intFromPtr(emulator), .image_id = image.id, .data = @intFromPtr(data.ptr), .len = data.len },
             .placement = ((id_bits.id & 0x3fffffff) | (@as(u32, @backingInt(id_bits.tag)) << 30)) + 1,
-            .col = @intCast(@min(pin.x, std.math.maxInt(u16))),
+            .col = @intCast(@min(@as(usize, pin.x) + gutter, std.math.maxInt(u16))),
             .row = @intCast(top + visible_start),
             .cols = @intCast(@min(grid.cols, std.math.maxInt(u16))),
             .rows = @intCast(shown_rows),

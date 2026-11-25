@@ -593,6 +593,25 @@ test "a new shell starts in place: the empty screen below its prompt is not show
     try std.testing.expectEqual(@as(usize, 2), state.screen_rows_shown);
 }
 
+test "a running `!! <command>` shows its $ header and indents live output" {
+    var h: Harness = undefined;
+    h.init(true);
+    defer h.deinit();
+    h.app.runCommand("!! make install");
+    const open_msg = (try h.sent())[0].shell_open;
+    try std.testing.expectEqualStrings("make install", open_msg.command.?);
+    try h.daemonOpens(open_msg.request_id, 5, "zig build\r\n");
+
+    const state = h.app.view.shell.?;
+    const lines = try shell_tab.transcriptLines(state, 80);
+    try std.testing.expect(lines.len >= 2);
+    try std.testing.expectEqualStrings("  $ ", lines[0].text);
+    try std.testing.expectEqualStrings("make install", lines[0].text2);
+    try std.testing.expectEqualStrings(" · running", lines[0].text3);
+    try std.testing.expectEqualStrings("  zig build", lines[1].text);
+    try std.testing.expectEqual(@as(?u16, 2), lines[1].copy.content_col);
+}
+
 test "a live shell's OSC 8 links are links on its rows; found URLs join them" {
     var h: Harness = undefined;
     h.init(true);

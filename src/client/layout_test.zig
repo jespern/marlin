@@ -1490,6 +1490,10 @@ test "a finished `!! <command>` names its command in the header" {
     };
     try std.testing.expectEqualStrings("make test", header.?.text2);
     try std.testing.expectEqualStrings(" · exited 2", header.?.text3);
+    // Inline `!! <command>` output is indented to align beneath its `$ ` header.
+    const body = lines[lines.len - 1];
+    try std.testing.expectEqualStrings("  ok", body.text);
+    try std.testing.expectEqual(@as(?u16, 2), body.copy.content_col);
 }
 
 test "a finished shell keeps its colors and wraps long rows" {
@@ -1751,6 +1755,86 @@ test "a shell lost with Marlin says so, and what was running" {
     const exited = try layout.shellExitLabel(gpa, .{ .text = "", .exit_code = 2 });
     defer gpa.free(exited);
     try std.testing.expectEqualStrings("exited 2", exited);
+    const ok = try layout.shellExitLabel(gpa, .{ .text = "", .exit_code = 0 });
+    defer gpa.free(ok);
+    try std.testing.expectEqualStrings("exited 0", ok);
+    const unknown = try layout.shellExitLabel(gpa, .{ .text = "" });
+    defer gpa.free(unknown);
+    try std.testing.expectEqualStrings("exited", unknown);
+}
+
+test "guest transcript groups consecutive and alternating repeated tool calls with ×N" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var blocks: std.ArrayList(RenderBlock) = .empty;
+    defer blocks.deinit(gpa);
+    // 3 full (Bash sleep 9, manage_task) cycles + 1 trailing Bash sleep 9, then a failure.
+    const ids = [_][]const u8{ "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8" };
+    for (0..3) |cycle| {
+        const b_id = ids[cycle * 2];
+        const m_id = ids[cycle * 2 + 1];
+        try blocks.append(gpa, .{ .kind = .tool_call, .turn_id = 1, .call_id = @constCast(b_id), .label = @constCast("Bash"), .text = @constCast("{\"command\":\"sleep 9\"}") });
+        try blocks.append(gpa, .{ .kind = .tool_result, .turn_id = 1, .call_id = @constCast(b_id), .label = @constCast(""), .status = .ok, .text = @constCast("") });
+        try blocks.append(gpa, .{ .kind = .tool_call, .turn_id = 1, .call_id = @constCast(m_id), .label = @constCast("manage_task"), .text = @constCast("{}") });
+        try blocks.append(gpa, .{ .kind = .tool_result, .turn_id = 1, .call_id = @constCast(m_id), .label = @constCast(""), .status = .ok, .text = @constCast("RUNNING") });
+    }
+    try blocks.append(gpa, .{ .kind = .tool_call, .turn_id = 1, .call_id = @constCast(ids[6]), .label = @constCast("Bash"), .text = @constCast("{\"command\":\"sleep 9\"}") });
+    try blocks.append(gpa, .{ .kind = .tool_result, .turn_id = 1, .call_id = @constCast(ids[6]), .label = @constCast(""), .status = .ok, .text = @constCast("") });
+    // A failing call must stay visible on its own row rather than folding.
+    try blocks.append(gpa, .{ .kind = .tool_call, .turn_id = 1, .call_id = @constCast(ids[7]), .label = @constCast("Bash"), .text = @constCast("{\"command\":\"sleep 9\"}") });
+    try blocks.append(gpa, .{ .kind = .tool_result, .turn_id = 1, .call_id = @constCast(ids[7]), .label = @constCast(""), .status = .err, .text = @constCast("killed") });
+
+    var cache = LayoutCache{};
+    defer cache.reset(gpa);
+    var tail = TailLayoutCache{};
+    defer tail.reset(gpa);
+    var stream = StreamLayoutCache{};
+    defer stream.reset(gpa);
+    var transcript = Transcript{
+        .io = threaded.io(),
+        .blocks = blocks.items,
+        .show_tool_transcript = false,
+        .guest = true,
+        .state = .running,
+        .layout_epoch = 0,
+        .delta = "",
+        .reasoning_delta = "",
+        .spinner_frame = 0,
+        .turn_started_ms = 0,
+        .call_started_ms = 0,
+        .stream_bytes = 0,
+        .stream_quiet_ms = 0,
+        .stream_status_at_ms = 0,
+        .approval = null,
+        .layout_cache = &cache,
+        .tail_layout_cache = &tail,
+        .stream_layout_cache = &stream,
+    };
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const lines = (try layoutLines(arena_state.allocator(), gpa, &transcript, 80)).items;
+    var bash_grouped = false;
+    var task_grouped = false;
+    var saw_err = false;
+    for (lines) |line| {
+        if (std.mem.eql(u8, line.text2, "sleep 9") and std.mem.eql(u8, line.text3, " · ×4")) bash_grouped = true;
+        if (std.mem.eql(u8, line.text, "  ⚙ manage_task") and std.mem.eql(u8, line.text2, " · ×3")) task_grouped = true;
+        if (std.mem.indexOf(u8, line.text, "killed") != null or std.mem.indexOf(u8, line.text2, "killed") != null) saw_err = true;
+    }
+    try std.testing.expect(bash_grouped);
+    try std.testing.expect(task_grouped);
+    try std.testing.expect(saw_err);
+
+    // Expanding the full transcript (Ctrl+T) shows every call individually.
+    transcript.show_tool_transcript = true;
+    transcript.layout_epoch += 1;
+    const expanded = (try layoutLines(arena_state.allocator(), gpa, &transcript, 80)).items;
+    var sleep_rows: usize = 0;
+    for (expanded) |line| if (std.mem.eql(u8, line.text2, "sleep 9")) {
+        sleep_rows += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 5), sleep_rows);
 }
 
 fn questionTranscriptText(arena: std.mem.Allocator, blocks: []const RenderBlock, guest: bool) ![]const u8 {

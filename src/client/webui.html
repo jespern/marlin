@@ -2340,7 +2340,7 @@ function escHtml(s) { return s.replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt
 function shellExitLabel(v) {
   if (v.lost) return v.command ? 'ended when Marlin stopped · ' + v.command + ' was running' : 'ended when Marlin stopped';
   if (v.signal != null) return 'ended by signal ' + v.signal;
-  if (v.exit_code != null && v.exit_code !== 0) return 'exited ' + v.exit_code;
+  if (v.exit_code != null) return 'exited ' + v.exit_code;
   return 'exited';
 }
 const shellTranscriptLines = 2000; // layout.zig shell_transcript_display_lines

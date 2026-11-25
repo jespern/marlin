@@ -878,7 +878,7 @@ pub const DaemonMsg = union(enum) {
     /// (currently input). Defaults preserve compatibility in both directions.
     ok: struct { request_id: u64 = 0 },
     err: struct { code: []const u8, msg: []const u8, request_id: u64 = 0 },
-    shell_opened: struct { shell_id: u64, request_id: u64 = 0 },
+    shell_opened: struct { shell_id: u64, request_id: u64 = 0, command: ?[]const u8 = null },
     /// The shell's whole terminal state (libghostty-vt snapshot format):
     /// replaces anything the client held. Live shell_output follows it.
     shell_snapshot: struct { shell_id: u64, data_base64: []const u8 },
