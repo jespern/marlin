@@ -89,6 +89,61 @@ test "assistant Markdown renders absolute local file links as labels" {
     try std.testing.expectEqual(@as(usize, 0), invalid_file_scheme.links.len);
 }
 
+test "assistant Markdown parses links, inline code, and nested emphasis inside bold and link labels" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Regression: file:// links and inline code inside **...** were emitted raw.
+    const bullet = try inlineMarkdown(
+        arena,
+        "**Permissions, `/review`, and UI ([permissions.zig](file:///Users/jespern/Work/marlin/src/daemon/permissions.zig), [commands.zig](file:///Users/jespern/Work/marlin/src/client/commands.zig)):** Auto-allowed mcp__marlin__task.",
+    );
+    try std.testing.expectEqualStrings(
+        "Permissions, /review, and UI (permissions.zig, commands.zig): Auto-allowed mcp__marlin__task.",
+        bullet.text,
+    );
+    try std.testing.expectEqual(@as(usize, 2), bullet.links.len);
+    try std.testing.expectEqualStrings("permissions.zig", bullet.text[bullet.links[0].start..bullet.links[0].end]);
+    try std.testing.expectEqualStrings("file:///Users/jespern/Work/marlin/src/daemon/permissions.zig", bullet.links[0].uri);
+    try std.testing.expectEqualStrings("commands.zig", bullet.text[bullet.links[1].start..bullet.links[1].end]);
+    try std.testing.expectEqualStrings("file:///Users/jespern/Work/marlin/src/client/commands.zig", bullet.links[1].uri);
+
+    const code_pos = std.mem.indexOf(u8, bullet.text, "/review").?;
+    const code_style = render.syntaxForBytes(bullet.styles, code_pos, code_pos + 1).?;
+    try std.testing.expect(code_style.bold);
+    try std.testing.expect(vaxis.Color.eql(code_style.bg, Palette.md_inline_code_bg));
+
+    const perm_pos = std.mem.indexOf(u8, bullet.text, "permissions.zig").?;
+    const perm_style = render.syntaxForBytes(bullet.styles, perm_pos, perm_pos + 1).?;
+    try std.testing.expect(perm_style.bold);
+
+    // Intra-word __ (mcp__marlin__task) stays literal and unstyled.
+    const ident_pos = std.mem.indexOf(u8, bullet.text, "mcp__marlin__task").?;
+    try std.testing.expect(render.syntaxForBytes(bullet.styles, ident_pos, ident_pos + 1) == null);
+
+    // Nested emphasis, formatted link labels, multi-backtick code spans, and balanced URL parens.
+    const nested = try inlineMarkdown(
+        arena,
+        "***both*** *it **bi** end* [`file.zig`](file:///tmp/a__b.zig) [Wiki](https://en.wikipedia.org/wiki/Bar_(baz)) **code `a**b` ok** ``tick ` inside``",
+    );
+    try std.testing.expectEqualStrings(
+        "both it bi end file.zig Wiki code a**b ok tick ` inside",
+        nested.text,
+    );
+    try std.testing.expectEqual(@as(usize, 2), nested.links.len);
+    try std.testing.expectEqualStrings("file:///tmp/a__b.zig", nested.links[0].uri);
+    try std.testing.expectEqualStrings("https://en.wikipedia.org/wiki/Bar_(baz)", nested.links[1].uri);
+    const both_style = render.syntaxForBytes(nested.styles, 0, 1).?;
+    try std.testing.expect(both_style.bold and both_style.italic);
+    const bi_pos = std.mem.indexOf(u8, nested.text, "bi").?;
+    const bi_style = render.syntaxForBytes(nested.styles, bi_pos, bi_pos + 1).?;
+    try std.testing.expect(bi_style.bold and bi_style.italic);
+    const label_code_pos = std.mem.indexOf(u8, nested.text, "file.zig").?;
+    const label_code_style = render.syntaxForBytes(nested.styles, label_code_pos, label_code_pos + 1).?;
+    try std.testing.expect(vaxis.Color.eql(label_code_style.bg, Palette.md_inline_code_bg));
+}
+
 test "assistant Markdown renders bounded tables with header surfaces and inline styles" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

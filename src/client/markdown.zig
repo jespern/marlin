@@ -35,7 +35,15 @@ pub fn appendInlineStyle(
     end: usize,
     style: vaxis.Style,
 ) !void {
-    if (start < end) try styles.append(arena, .{ .start = start, .end = end, .style = style });
+    if (start >= end) return;
+    if (styles.items.len > 0) {
+        const last = &styles.items[styles.items.len - 1];
+        if (last.end == start and std.meta.eql(last.style, style)) {
+            last.end = end;
+            return;
+        }
+    }
+    try styles.append(arena, .{ .start = start, .end = end, .style = style });
 }
 
 fn isUriSafeByte(byte: u8) bool {
@@ -115,73 +123,283 @@ fn linkUri(arena: std.mem.Allocator, raw_target: []const u8) !?[]const u8 {
     return localFileUri(arena, raw_target);
 }
 
-/// Small, deliberately conservative inline Markdown pass. It removes the
-/// punctuation users do not want to read in a terminal while retaining
-/// emphasis, inline-code styling, and safe HTTP(S)/absolute-file link metadata.
-pub fn inlineMarkdown(arena: std.mem.Allocator, source: []const u8) !InlineMarkdown {
-    var out: std.ArrayList(u8) = .empty;
-    var styles: std.ArrayList(SyntaxSpan) = .empty;
-    var links: std.ArrayList(LinkSpan) = .empty;
+const CodeSpan = struct { content: []const u8, next: usize };
+const ParsedLink = struct { label: []const u8, target: []const u8, next: usize };
+
+fn hasInlineStyle(style: vaxis.Style) bool {
+    return !std.meta.eql(style, vaxis.Style{});
+}
+
+fn matchCodeSpan(source: []const u8, start: usize) ?CodeSpan {
+    if (start >= source.len or source[start] != '`') return null;
+    var ticks: usize = 0;
+    while (start + ticks < source.len and source[start + ticks] == '`') : (ticks += 1) {}
+    var j = start + ticks;
+    while (j < source.len) {
+        if (source[j] == '`') {
+            var close_ticks: usize = 0;
+            while (j + close_ticks < source.len and source[j + close_ticks] == '`') : (close_ticks += 1) {}
+            if (close_ticks == ticks) {
+                var content = source[start + ticks .. j];
+                if (content.len >= 2 and content[0] == ' ' and content[content.len - 1] == ' ') {
+                    var non_space = false;
+                    for (content) |byte| if (byte != ' ') {
+                        non_space = true;
+                        break;
+                    };
+                    if (non_space) content = content[1 .. content.len - 1];
+                }
+                return .{ .content = content, .next = j + ticks };
+            }
+            j += close_ticks;
+            continue;
+        }
+        j += 1;
+    }
+    return null;
+}
+
+fn parseMarkdownLink(source: []const u8, start: usize) ?ParsedLink {
+    if (start >= source.len or source[start] != '[') return null;
+    var j = start + 1;
+    var brackets: usize = 0;
+    const label_end: usize = blk: {
+        while (j < source.len) {
+            if (source[j] == '\n') return null;
+            if (source[j] == '\\' and j + 1 < source.len) {
+                j += 2;
+                continue;
+            }
+            if (source[j] == '`') {
+                if (matchCodeSpan(source, j)) |span| {
+                    j = span.next;
+                    continue;
+                }
+                while (j < source.len and source[j] == '`') : (j += 1) {}
+                continue;
+            }
+            if (source[j] == '[') {
+                brackets += 1;
+                j += 1;
+                continue;
+            }
+            if (source[j] == ']') {
+                if (brackets > 0) {
+                    brackets -= 1;
+                    j += 1;
+                    continue;
+                }
+                if (j + 1 < source.len and source[j + 1] == '(') break :blk j;
+                return null;
+            }
+            j += 1;
+        }
+        return null;
+    };
+
+    const uri_start = label_end + 2;
+    var k = uri_start;
+    while (k < source.len and (source[k] == ' ' or source[k] == '\t')) : (k += 1) {}
+    const uri_end: usize = blk: {
+        if (k < source.len and source[k] == '<') {
+            k += 1;
+            while (k < source.len and source[k] != '>' and source[k] != '\n') : (k += 1) {}
+            if (k >= source.len or source[k] != '>') return null;
+            k += 1;
+            while (k < source.len and (source[k] == ' ' or source[k] == '\t')) : (k += 1) {}
+            if (k >= source.len or source[k] != ')') return null;
+            break :blk k;
+        }
+        var parens: usize = 0;
+        k = uri_start;
+        while (k < source.len) {
+            if (source[k] == '\n') return null;
+            if (source[k] == '\\' and k + 1 < source.len) {
+                k += 2;
+                continue;
+            }
+            if (source[k] == '(') {
+                parens += 1;
+                k += 1;
+                continue;
+            }
+            if (source[k] == ')') {
+                if (parens == 0) break :blk k;
+                parens -= 1;
+                k += 1;
+                continue;
+            }
+            k += 1;
+        }
+        return null;
+    };
+    return .{
+        .label = source[start + 1 .. label_end],
+        .target = source[uri_start..uri_end],
+        .next = uri_end + 1,
+    };
+}
+
+fn isUnderscoreWordChar(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or byte == '_';
+}
+
+fn findClosingDelimiter(source: []const u8, start: usize, delim: []const u8, word_bounded: bool) ?usize {
+    if (start >= source.len or source[start] == ' ' or source[start] == '\t') return null;
+    var j = start;
+    while (j < source.len) {
+        if (source[j] == '\\' and j + 1 < source.len) {
+            j += 2;
+            continue;
+        }
+        if (source[j] == '`') {
+            if (matchCodeSpan(source, j)) |span| {
+                j = span.next;
+                continue;
+            }
+            while (j < source.len and source[j] == '`') : (j += 1) {}
+            continue;
+        }
+        if (source[j] == '[') {
+            if (parseMarkdownLink(source, j)) |link| {
+                j = link.next;
+                continue;
+            }
+        }
+        if (delim.len == 1 and source[j] == delim[0] and
+            j + 1 < source.len and source[j + 1] == delim[0])
+        {
+            if (findClosingDelimiter(source, j + 2, source[j .. j + 2], word_bounded)) |inner| {
+                j = inner + 2;
+                continue;
+            }
+        }
+        if (j > start and std.mem.startsWith(u8, source[j..], delim) and
+            source[j - 1] != ' ' and source[j - 1] != '\t')
+        {
+            const valid_end = !word_bounded or
+                (j + delim.len == source.len or !isUnderscoreWordChar(source[j + delim.len]));
+            if (valid_end) return j;
+        }
+        j += 1;
+    }
+    return null;
+}
+
+fn inlineMarkdownInto(
+    arena: std.mem.Allocator,
+    source: []const u8,
+    inherited: vaxis.Style,
+    out: *std.ArrayList(u8),
+    styles: *std.ArrayList(SyntaxSpan),
+    links: *std.ArrayList(LinkSpan),
+    depth: u8,
+) anyerror!void {
+    if (depth >= 8) {
+        const start = out.items.len;
+        try out.appendSlice(arena, source);
+        if (hasInlineStyle(inherited)) try appendInlineStyle(arena, styles, start, out.items.len, inherited);
+        return;
+    }
+
+    var run_start = out.items.len;
     var i: usize = 0;
     while (i < source.len) {
-        if (std.mem.startsWith(u8, source[i..], "**") or std.mem.startsWith(u8, source[i..], "__")) {
-            const delimiter = source[i .. i + 2];
-            if (std.mem.indexOfPos(u8, source, i + 2, delimiter)) |close| {
+        if (source[i] == '`') {
+            if (matchCodeSpan(source, i)) |span| {
+                if (hasInlineStyle(inherited)) try appendInlineStyle(arena, styles, run_start, out.items.len, inherited);
                 const start = out.items.len;
-                try out.appendSlice(arena, source[i + 2 .. close]);
-                try appendInlineStyle(arena, &styles, start, out.items.len, .{ .bold = true });
-                i = close + 2;
+                try out.appendSlice(arena, span.content);
+                var code_style = inherited;
+                code_style.fg = Palette.md_code.fg;
+                code_style.bg = Palette.md_code.bg;
+                try appendInlineStyle(arena, styles, start, out.items.len, code_style);
+                i = span.next;
+                run_start = out.items.len;
                 continue;
             }
-        }
-        if (std.mem.startsWith(u8, source[i..], "~~")) {
-            if (std.mem.indexOfPos(u8, source, i + 2, "~~")) |close| {
-                const start = out.items.len;
-                try out.appendSlice(arena, source[i + 2 .. close]);
-                try appendInlineStyle(arena, &styles, start, out.items.len, .{ .strikethrough = true });
-                i = close + 2;
-                continue;
+            while (i < source.len and source[i] == '`') : (i += 1) {
+                try out.append(arena, '`');
             }
+            continue;
         }
-        if (source[i] == '*' or source[i] == '_') {
-            if (std.mem.indexOfScalarPos(u8, source, i + 1, source[i])) |close| {
-                const valid_underscore = source[i] != '_' or
-                    ((i == 0 or !std.ascii.isAlphanumeric(source[i - 1])) and
-                        (close + 1 == source.len or !std.ascii.isAlphanumeric(source[close + 1])));
-                if (close > i + 1 and valid_underscore) {
+        if (source[i] == '[') {
+            if (parseMarkdownLink(source, i)) |parsed| {
+                if (try linkUri(arena, parsed.target)) |uri| {
+                    if (hasInlineStyle(inherited)) try appendInlineStyle(arena, styles, run_start, out.items.len, inherited);
                     const start = out.items.len;
-                    try out.appendSlice(arena, source[i + 1 .. close]);
-                    try appendInlineStyle(arena, &styles, start, out.items.len, .{ .italic = true });
-                    i = close + 1;
+                    try inlineMarkdownInto(arena, parsed.label, inherited, out, styles, links, depth + 1);
+                    if (start < out.items.len) {
+                        try links.append(arena, .{ .start = start, .end = out.items.len, .uri = uri });
+                    }
+                    i = parsed.next;
+                    run_start = out.items.len;
                     continue;
                 }
             }
         }
-        if (source[i] == '`') {
-            if (std.mem.indexOfScalarPos(u8, source, i + 1, '`')) |close| {
-                const start = out.items.len;
-                try out.appendSlice(arena, source[i + 1 .. close]);
-                try appendInlineStyle(arena, &styles, start, out.items.len, Palette.md_code);
-                i = close + 1;
+        if (std.mem.startsWith(u8, source[i..], "***") or std.mem.startsWith(u8, source[i..], "___")) {
+            const delim = source[i .. i + 3];
+            const word_bounded = delim[0] == '_';
+            const valid_start = !word_bounded or i == 0 or !isUnderscoreWordChar(source[i - 1]);
+            if (valid_start) {
+                if (findClosingDelimiter(source, i + 3, delim, word_bounded)) |close| {
+                    if (hasInlineStyle(inherited)) try appendInlineStyle(arena, styles, run_start, out.items.len, inherited);
+                    var next_style = inherited;
+                    next_style.bold = true;
+                    next_style.italic = true;
+                    try inlineMarkdownInto(arena, source[i + 3 .. close], next_style, out, styles, links, depth + 1);
+                    i = close + 3;
+                    run_start = out.items.len;
+                    continue;
+                }
+            }
+        }
+        if (std.mem.startsWith(u8, source[i..], "**") or std.mem.startsWith(u8, source[i..], "__")) {
+            const delim = source[i .. i + 2];
+            const word_bounded = delim[0] == '_';
+            const valid_start = !word_bounded or i == 0 or !isUnderscoreWordChar(source[i - 1]);
+            if (valid_start) {
+                if (findClosingDelimiter(source, i + 2, delim, word_bounded)) |close| {
+                    if (hasInlineStyle(inherited)) try appendInlineStyle(arena, styles, run_start, out.items.len, inherited);
+                    var next_style = inherited;
+                    next_style.bold = true;
+                    try inlineMarkdownInto(arena, source[i + 2 .. close], next_style, out, styles, links, depth + 1);
+                    i = close + 2;
+                    run_start = out.items.len;
+                    continue;
+                }
+            }
+        }
+        if (std.mem.startsWith(u8, source[i..], "~~")) {
+            if (findClosingDelimiter(source, i + 2, "~~", false)) |close| {
+                if (hasInlineStyle(inherited)) try appendInlineStyle(arena, styles, run_start, out.items.len, inherited);
+                var next_style = inherited;
+                next_style.strikethrough = true;
+                try inlineMarkdownInto(arena, source[i + 2 .. close], next_style, out, styles, links, depth + 1);
+                i = close + 2;
+                run_start = out.items.len;
                 continue;
             }
         }
-        if (source[i] == '[') {
-            if (std.mem.indexOfPos(u8, source, i + 1, "](")) |label_end| {
-                const uri_start = label_end + 2;
-                if (std.mem.indexOfScalarPos(u8, source, uri_start, ')')) |uri_end| {
-                    if (try linkUri(arena, source[uri_start..uri_end])) |uri| {
-                        const start = out.items.len;
-                        try out.appendSlice(arena, source[i + 1 .. label_end]);
-                        try links.append(arena, .{ .start = start, .end = out.items.len, .uri = uri });
-                        i = uri_end + 1;
-                        continue;
-                    }
+        if (source[i] == '*' or source[i] == '_') {
+            const delim = source[i .. i + 1];
+            const word_bounded = delim[0] == '_';
+            const valid_start = !word_bounded or i == 0 or !isUnderscoreWordChar(source[i - 1]);
+            if (valid_start) {
+                if (findClosingDelimiter(source, i + 1, delim, word_bounded)) |close| {
+                    if (hasInlineStyle(inherited)) try appendInlineStyle(arena, styles, run_start, out.items.len, inherited);
+                    var next_style = inherited;
+                    next_style.italic = true;
+                    try inlineMarkdownInto(arena, source[i + 1 .. close], next_style, out, styles, links, depth + 1);
+                    i = close + 1;
+                    run_start = out.items.len;
+                    continue;
                 }
             }
         }
         if (source[i] == '\\' and i + 1 < source.len and
-            std.mem.indexOfScalar(u8, "\\`*_~[]", source[i + 1]) != null)
+            std.mem.indexOfScalar(u8, "\\`*_~[]()", source[i + 1]) != null)
         {
             try out.append(arena, source[i + 1]);
             i += 2;
@@ -190,6 +408,17 @@ pub fn inlineMarkdown(arena: std.mem.Allocator, source: []const u8) !InlineMarkd
         try out.append(arena, source[i]);
         i += 1;
     }
+    if (hasInlineStyle(inherited)) try appendInlineStyle(arena, styles, run_start, out.items.len, inherited);
+}
+
+/// Small, deliberately conservative inline Markdown pass. It removes the
+/// punctuation users do not want to read in a terminal while retaining
+/// nested emphasis, inline-code styling, and safe HTTP(S)/file link metadata.
+pub fn inlineMarkdown(arena: std.mem.Allocator, source: []const u8) !InlineMarkdown {
+    var out: std.ArrayList(u8) = .empty;
+    var styles: std.ArrayList(SyntaxSpan) = .empty;
+    var links: std.ArrayList(LinkSpan) = .empty;
+    try inlineMarkdownInto(arena, source, .{}, &out, &styles, &links, 0);
 
     // Plain URLs remain clickable after the Markdown punctuation is removed.
     const plain_links = try findLinkSpans(arena, out.items);
