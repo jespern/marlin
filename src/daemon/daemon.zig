@@ -1478,12 +1478,16 @@ pub const Daemon = struct {
                 },
                 else => break,
             };
-            self.events.push(self.io, .{ .client_msg = .{ .client_id = client.id, .msg_line = line } }) catch {
+            // Ahead of queued agent and shell output: a keystroke (Ctrl+C
+            // under a flood) must not wait for the backlog. Safe to reorder:
+            // nothing a client sent can depend on an event not yet handled.
+            // Its own messages, and its departure, stay in order.
+            self.events.pushPriority(self.io, .{ .client_msg = .{ .client_id = client.id, .msg_line = line } }) catch {
                 self.gpa.free(line);
                 break;
             };
         }
-        self.events.push(self.io, .{ .client_gone = .{ .client_id = client.id } }) catch {};
+        self.events.pushPriority(self.io, .{ .client_gone = .{ .client_id = client.id } }) catch {};
     }
 
     /// Writer thread: one per client. Outbox lines → socket.

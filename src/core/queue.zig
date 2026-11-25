@@ -11,10 +11,38 @@ pub fn Mpsc(comptime T: type) type {
     return struct {
         const Self = @This();
 
+        /// One FIFO; `head` skips popped items until the backing list is
+        /// cleared or compacted.
+        const Lane = struct {
+            items: std.ArrayList(T) = .empty,
+            head: usize = 0,
+
+            fn empty(lane: *const Lane) bool {
+                return lane.head == lane.items.items.len;
+            }
+
+            fn pop(lane: *Lane) T {
+                const item = lane.items.items[lane.head];
+                lane.head += 1;
+                if (lane.head == lane.items.items.len) {
+                    lane.items.clearRetainingCapacity();
+                    lane.head = 0;
+                } else if (lane.head >= 1024 and lane.head * 2 >= lane.items.items.len) {
+                    const remaining = lane.items.items.len - lane.head;
+                    std.mem.copyForwards(T, lane.items.items[0..remaining], lane.items.items[lane.head..]);
+                    lane.items.shrinkRetainingCapacity(remaining);
+                    lane.head = 0;
+                }
+                return item;
+            }
+        };
+
         mutex: Io.Mutex = .init,
         cond: Io.Condition = .init,
-        items: std.ArrayList(T) = .empty,
-        head: usize = 0,
+        lane: Lane = .{},
+        /// Popped before `lane`: work a person is waiting on (their keys)
+        /// must not queue behind a backlog. FIFO among itself.
+        priority: Lane = .{},
         closed: bool = false,
         gpa: std.mem.Allocator,
 
@@ -23,15 +51,26 @@ pub fn Mpsc(comptime T: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            self.items.deinit(self.gpa);
+            self.lane.items.deinit(self.gpa);
+            self.priority.items.deinit(self.gpa);
         }
 
         /// Push from any thread. Returns error.Closed after close().
         pub fn push(self: *Self, io: Io, item: T) !void {
+            return self.pushTo(io, &self.lane, item);
+        }
+
+        /// Push ahead of everything queued by `push`, after earlier
+        /// priority items.
+        pub fn pushPriority(self: *Self, io: Io, item: T) !void {
+            return self.pushTo(io, &self.priority, item);
+        }
+
+        fn pushTo(self: *Self, io: Io, lane: *Lane, item: T) !void {
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
             if (self.closed) return error.Closed;
-            try self.items.append(self.gpa, item);
+            try lane.items.append(self.gpa, item);
             self.cond.signal(io);
         }
 
@@ -39,7 +78,7 @@ pub fn Mpsc(comptime T: type) type {
         pub fn pop(self: *Self, io: Io) ?T {
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
-            while (self.head == self.items.items.len) {
+            while (self.isEmpty()) {
                 if (self.closed) return null;
                 self.cond.waitUncancelable(io, &self.mutex);
             }
@@ -50,23 +89,16 @@ pub fn Mpsc(comptime T: type) type {
         pub fn tryPop(self: *Self, io: Io) ?T {
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
-            if (self.head == self.items.items.len) return null;
+            if (self.isEmpty()) return null;
             return self.popLocked();
         }
 
+        fn isEmpty(self: *const Self) bool {
+            return self.lane.empty() and self.priority.empty();
+        }
+
         fn popLocked(self: *Self) T {
-            const item = self.items.items[self.head];
-            self.head += 1;
-            if (self.head == self.items.items.len) {
-                self.items.clearRetainingCapacity();
-                self.head = 0;
-            } else if (self.head >= 1024 and self.head * 2 >= self.items.items.len) {
-                const remaining = self.items.items.len - self.head;
-                std.mem.copyForwards(T, self.items.items[0..remaining], self.items.items[self.head..]);
-                self.items.shrinkRetainingCapacity(remaining);
-                self.head = 0;
-            }
-            return item;
+            return if (!self.priority.empty()) self.priority.pop() else self.lane.pop();
         }
 
         /// Wake all waiters; subsequent pushes fail, pops drain then null.
@@ -78,5 +110,3 @@ pub fn Mpsc(comptime T: type) type {
         }
     };
 }
-
-// ---------------------------------------------------------------- tests --

@@ -85,6 +85,7 @@ test {
     _ = @import("core/png_test.zig");
     _ = @import("client/shell_term_test.zig");
     _ = @import("client/shell_tab_test.zig");
+    _ = @import("client/daemon_lines_test.zig");
     _ = @import("client/shell_styled_test.zig");
     _ = @import("client/screenshot_test.zig");
     _ = @import("client/mic_test.zig");

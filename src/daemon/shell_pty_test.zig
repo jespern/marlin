@@ -258,3 +258,45 @@ test "the foreground command is what the shell runs, and nothing at its prompt" 
     } else return error.NoForegroundCommand;
     try std.testing.expectEqualStrings("sleep 30", command);
 }
+
+test "Ctrl+C interrupts the shell's foreground command" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var environ = try shEnviron();
+    defer environ.deinit();
+    var recorder: Recorder = .{ .io = io };
+    defer recorder.deinit();
+
+    const shell = try spawnSh(io, &environ, "sleep 30", &recorder, 80, 24);
+    defer shell.destroy();
+    try io.sleep(.fromMilliseconds(200), .awake);
+    try shell.write("\x03");
+    try recorder.wait("");
+    try std.testing.expectEqual(@as(?i32, 2), recorder.status.?.signal);
+}
+
+test "Ctrl+C interrupts a command in an interactive job-control shell" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var environ = try shEnviron();
+    defer environ.deinit();
+    var recorder: Recorder = .{ .io = io };
+    defer recorder.deinit();
+
+    const shell = try Shell.spawn(std.testing.allocator, io, 1, .{
+        .path = "/bin/sh",
+        .argv = &.{ "sh", "-i" },
+        .cwd = "/",
+        .environ = &environ,
+        .size = .{ .cols = 80, .rows = 24, .width_px = 720, .height_px = 432 },
+    }, recorder.sink());
+    defer shell.destroy();
+    try shell.write("sleep 30\r");
+    try io.sleep(.fromMilliseconds(500), .awake);
+    try shell.write("\x03");
+    try shell.write("echo after-$((6*7))\r");
+    try recorder.wait("after-42");
+    try std.testing.expect(recorder.snapshotFor("after-42").contains);
+}

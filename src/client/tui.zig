@@ -64,6 +64,8 @@ const media = @import("media.zig");
 const render = @import("render.zig");
 const top_view = @import("top.zig");
 const shell_tab = @import("shell_tab.zig");
+const daemon_lines = @import("daemon_lines.zig");
+const DaemonLines = daemon_lines.DaemonLines;
 const screenshot = @import("screenshot.zig");
 const log_gate = @import("../core/log_gate.zig");
 const shell_images = @import("shell_images.zig");
@@ -144,10 +146,9 @@ pub const Event = union(enum) {
     /// ordinary key presses; they are collected into one `paste`.
     paste_start,
     paste_end,
-    /// One raw NDJSON line from the daemon (gpa-owned; handler frees).
-    daemon_line: []u8,
-    /// Stable error name from the reader thread (for example EndOfStream).
-    daemon_gone: []const u8,
+    /// The daemon sent lines (or its reader stopped): they wait in
+    /// DaemonLines, which the main loop pumps with keys first.
+    daemon_ready,
     /// Reconnect worker verdict: a fresh handshaked Conn to adopt, or null
     /// when every attempt failed and the TUI should quit like before.
     reconnected: ?*attach.Conn,
@@ -6003,20 +6004,22 @@ pub const draw = drawing.draw;
 pub const drawTimestampOverlay = drawing.drawTimestampOverlay;
 pub const drawUiAnimation = drawing.drawUiAnimation;
 
-/// Reader thread: daemon socket lines → vaxis event queue.
-fn readerThread(gpa: std.mem.Allocator, conn: *attach.Conn, loop: *vaxis.Loop(Event)) void {
+/// Reader thread: daemon socket lines → DaemonLines, waking the main loop.
+fn readerThread(gpa: std.mem.Allocator, conn: *attach.Conn, loop: *vaxis.Loop(Event), lines: *DaemonLines) void {
     var disconnect_reason: []const u8 = "reader stopped";
     while (true) {
         const owned = conn.readLine() catch |err| {
             disconnect_reason = @errorName(err);
             break;
         };
-        loop.postEvent(.{ .daemon_line = owned }) catch {
+        const wake = lines.push(conn.io, .{ .line = owned }) catch {
             gpa.free(owned);
             return;
         };
+        if (wake) loop.postEvent(.daemon_ready) catch return;
     }
-    loop.postEvent(.{ .daemon_gone = disconnect_reason }) catch {};
+    const wake = lines.push(conn.io, .{ .gone = disconnect_reason }) catch return;
+    if (wake) loop.postEvent(.daemon_ready) catch {};
 }
 
 /// Transport death is recoverable, not fatal: the daemon resyncs STATE on
@@ -6083,7 +6086,7 @@ const ReconnectJob = struct {
 /// the last applied block — the same continuation a tab switch uses, so the
 /// transcript and scroll position survive untouched. Returns false when the
 /// TUI cannot be made whole (caller quits with the old semantics).
-fn adoptReconnectedConn(app: *App, loop: *vaxis.Loop(Event), rt: *std.Thread, new_conn: *attach.Conn) bool {
+fn adoptReconnectedConn(app: *App, loop: *vaxis.Loop(Event), lines: *DaemonLines, rt: *std.Thread, new_conn: *attach.Conn) bool {
     // Restore subscriptions before publishing the transport to App. A failed
     // replay request then leaves the dead connection as the sole owner and the
     // fresh connection can be destroyed without a reader thread racing it.
@@ -6137,8 +6140,8 @@ fn adoptReconnectedConn(app: *App, loop: *vaxis.Loop(Event), rt: *std.Thread, ne
 
     // Start the replacement reader against its explicit Conn before swapping
     // App ownership. If spawn fails, the deferred exit join still owns the old
-    // thread handle; otherwise its daemon_gone post means this join is immediate.
-    const new_rt = std.Thread.spawn(.{}, readerThread, .{ app.gpa, new_conn, loop }) catch {
+    // thread handle; otherwise its end (queued after its last line) means this join is immediate.
+    const new_rt = std.Thread.spawn(.{}, readerThread, .{ app.gpa, new_conn, loop, lines }) catch {
         new_conn.deinit();
         return false;
     };
@@ -6213,7 +6216,7 @@ fn selfExeMtimeMs(gpa: std.mem.Allocator, io: Io) ?i64 {
 }
 
 /// Transport verdicts are collected per frame and acted on once, below the
-/// event switch: daemon_gone can surface in the drain loop too, and
+/// event switch: the reader's end can surface in the drain loop too, and
 /// starting/adopting a reconnect must happen exactly once per frame.
 pub const TransportVerdicts = struct {
     conn_lost: ?[]const u8 = null,
@@ -6398,11 +6401,8 @@ pub fn dispatchEvent(
             };
             pasteText(app, gpa, text);
         },
-        .daemon_line => |line| app.handleDaemonLine(line),
-        .daemon_gone => |reason| {
-            shell_tab.connectionLost(app);
-            verdicts.conn_lost = reason;
-        },
+        // The main loop pumps DaemonLines itself (pumpDaemonLines).
+        .daemon_ready => {},
         .reconnected => |maybe| {
             shell_tab.connectionLost(app);
             // A clip or setup on the old connection will never be answered.
@@ -6415,6 +6415,61 @@ pub fn dispatchEvent(
             verdicts.reconnect = maybe;
         },
     }
+}
+
+/// One thing the daemon reader queued.
+fn handleDaemonItem(app: *App, item: daemon_lines.Item, verdicts: *TransportVerdicts) void {
+    switch (item) {
+        .line => |line| app.handleDaemonLine(line),
+        .gone => |reason| {
+            shell_tab.connectionLost(app);
+            verdicts.conn_lost = reason;
+        },
+    }
+}
+
+/// How long the main loop handles daemon lines before drawing a frame:
+/// a burst (a replay) still costs one frame, and a flood still draws ten a
+/// second.
+const daemon_pump_budget_ns: i96 = 100 * std.time.ns_per_ms;
+
+/// Handle what the daemon sent, and before each line every other event
+/// waiting (keys first): Ctrl+C must not queue behind a flood of output.
+fn pumpDaemonLines(
+    app: *App,
+    vx: *vaxis.Vaxis,
+    tty: *vaxis.Tty,
+    gpa: std.mem.Allocator,
+    loop: *vaxis.Loop(Event),
+    lines: *DaemonLines,
+    verdicts: *TransportVerdicts,
+) !void {
+    const Ctx = struct {
+        app: *App,
+        vx: *vaxis.Vaxis,
+        tty: *vaxis.Tty,
+        gpa: std.mem.Allocator,
+        loop: *vaxis.Loop(Event),
+        verdicts: *TransportVerdicts,
+
+        pub fn others(ctx: *@This()) !void {
+            while (try ctx.loop.tryEvent()) |queued| {
+                if (queued == .daemon_ready) continue;
+                try dispatchEvent(ctx.app, ctx.vx, ctx.tty, ctx.gpa, queued, ctx.verdicts);
+            }
+        }
+
+        pub fn stop(ctx: *@This()) bool {
+            return ctx.app.should_quit;
+        }
+
+        pub fn item(ctx: *@This(), it: daemon_lines.Item) !void {
+            handleDaemonItem(ctx.app, it, ctx.verdicts);
+        }
+    };
+    var ctx: Ctx = .{ .app = app, .vx = vx, .tty = tty, .gpa = gpa, .loop = loop, .verdicts = verdicts };
+    const deadline: Io.Timestamp = .{ .nanoseconds = Io.Timestamp.now(app.io, .awake).nanoseconds + daemon_pump_budget_ns };
+    if (try daemon_lines.pump(lines, app.io, &ctx, deadline)) try loop.postEvent(.daemon_ready);
 }
 
 fn animationThread(app: *App, loop: *vaxis.Loop(Event)) void {
@@ -6740,13 +6795,17 @@ pub fn run(
         }
 
         // -- daemon reader thread --
-        var rt = try std.Thread.spawn(.{}, readerThread, .{ app.gpa, app.conn, &loop });
+        var lines: DaemonLines = .{};
+        var rt = try std.Thread.spawn(.{}, readerThread, .{ app.gpa, app.conn, &loop, &lines });
         // Joined at exit: we shutdown() the socket which EOFs the reader —
         // closing the fd under a live read is a BADF panic on the Threaded Io.
         // Both defers read their CURRENT values: reconnection replaces the
         // conn and respawns the reader mid-session.
         defer app.conn.deinit();
+        defer while (lines.pop(io)) |item| if (item == .line) gpa.free(item.line);
         defer rt.join();
+        // A reader blocked on a full queue would never see the shutdown.
+        defer lines.close(io);
         defer app.conn.shutdown();
         conn_owned = false;
         var reconnect_job: ReconnectJob = undefined;
@@ -6793,18 +6852,11 @@ pub fn run(
         while (!app.should_quit) {
             const event = try loop.nextEvent();
             // Transport verdicts are collected here and handled once below
-            // the switch: daemon_gone can surface in the drain loop too, and
+            // the switch: the reader's end can surface in the drain loop too, and
             // starting/adopting a reconnect must happen exactly once a frame.
             var verdicts = TransportVerdicts{};
             switch (event) {
-                .daemon_line => |line| {
-                    app.handleDaemonLine(line);
-                    // Drain any additional queued events before redrawing so a
-                    // burst of deltas costs one frame, not one frame each.
-                    while (try loop.tryEvent()) |queued| {
-                        try dispatchEvent(&app, &vx, &tty, gpa, queued, &verdicts);
-                    }
-                },
+                .daemon_ready => try pumpDaemonLines(&app, &vx, &tty, gpa, &loop, &lines, &verdicts),
                 else => {
                     try dispatchEvent(&app, &vx, &tty, gpa, event, &verdicts);
                     // A bracketed paste arrives as one key event per
@@ -6843,7 +6895,7 @@ pub fn run(
                     reconnect_thread = null;
                 }
                 const restored = if (maybe_conn) |new_conn|
-                    adoptReconnectedConn(&app, &loop, &rt, new_conn)
+                    adoptReconnectedConn(&app, &loop, &lines, &rt, new_conn)
                 else
                     false;
                 if (!restored and maybe_conn != null and app.remote_transport and !app.should_quit) {
@@ -6971,7 +7023,6 @@ pub fn run(
         }
         while (loop.tryEvent() catch null) |ev| switch (ev) {
             .reconnected => |maybe| if (maybe) |c| c.deinit(),
-            .daemon_line => |l| gpa.free(l),
             .paste => |t| gpa.free(@constCast(t)),
             else => {},
         };

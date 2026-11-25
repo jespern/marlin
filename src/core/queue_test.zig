@@ -66,6 +66,23 @@ test "large backlog drains in FIFO order without shifting each pop" {
 
     for (0..20_000) |i| try q.push(io, @intCast(i));
     for (0..20_000) |i| try std.testing.expectEqual(@as(?u32, @intCast(i)), q.pop(io));
-    try std.testing.expectEqual(@as(usize, 0), q.head);
-    try std.testing.expectEqual(@as(usize, 0), q.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), q.lane.head);
+    try std.testing.expectEqual(@as(usize, 0), q.lane.items.items.len);
+}
+
+test "priority items pop before the backlog, each lane in its own order" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var q = Mpsc(u32).init(std.testing.allocator);
+    defer q.deinit();
+
+    for (0..3) |i| try q.push(io, @intCast(i));
+    try q.pushPriority(io, 100);
+    try q.pushPriority(io, 101);
+    try q.push(io, 3);
+    q.close(io);
+    for ([_]u32{ 100, 101, 0, 1, 2, 3 }) |want| try std.testing.expectEqual(@as(?u32, want), q.pop(io));
+    try std.testing.expectEqual(@as(?u32, null), q.pop(io));
+    try std.testing.expectError(error.Closed, q.pushPriority(io, 7));
 }

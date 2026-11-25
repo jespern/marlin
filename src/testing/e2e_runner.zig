@@ -164,6 +164,9 @@ const Check = struct {
     /// a client that never returns holds the old daemon until
     /// [reboot] handover_wait) or "abort" (the successor fails to start).
     handover_flow: []const u8 = "",
+    /// Ctrl+C under an output flood: how long until the shell answers
+    /// again, and how much output still arrives after the interrupt.
+    shell_interrupt_flow: bool = false,
     pause_flow: []const u8 = "",
     /// Fetch a stored full tool-output blob over the daemon protocol and
     /// require at least this many decoded bytes (exercises large replies).
@@ -415,7 +418,7 @@ fn runScenario(
 
     // 3. Run ordinary CLI scenarios, or the direct multi-connection protocol
     // regression that cannot be expressed as a one-shot headless command.
-    if (sf.check.approval_reconnect_flow or sf.check.pause_flow.len > 0 or sf.check.session_restore_flow or sf.check.project_permissions_flow or sf.check.codex_question_flow or sf.check.remote_reboot_flow or sf.check.handover_flow.len > 0) {
+    if (sf.check.approval_reconnect_flow or sf.check.pause_flow.len > 0 or sf.check.session_restore_flow or sf.check.project_permissions_flow or sf.check.codex_question_flow or sf.check.remote_reboot_flow or sf.check.handover_flow.len > 0 or sf.check.shell_interrupt_flow) {
         const started = try process_io.run(gpa, io, .{
             .argv = &.{ marlin_bin, "ls" },
             .environ_map = &env,
@@ -427,7 +430,9 @@ fn runScenario(
         defer started.deinit(gpa);
         if (started.process_group_id) |group_id| try process_groups.append(gpa, group_id);
         if (started.term != .exited or started.term.exited != 0) return error.DaemonStartFailed;
-        if (sf.check.handover_flow.len > 0)
+        if (sf.check.shell_interrupt_flow)
+            try checkShellInterruptFlow(gpa, io, &env, state_dir)
+        else if (sf.check.handover_flow.len > 0)
             try checkHandoverFlow(gpa, io, &env, state_dir, sf.check.handover_flow)
         else if (sf.check.remote_reboot_flow)
             try checkRemoteRebootFlow(gpa, io, &env, state_dir, marlin_bin, &process_groups)
@@ -1433,6 +1438,67 @@ fn shellRoundTrip(conn: *ProtocolConn, arena: std.mem.Allocator, shell_id: u64, 
         try decoder.decode(bytes, encoded);
         try seen.appendSlice(arena, bytes);
         try conn.send(.{ .shell_ack = .{ .shell_id = shell_id, .bytes = bytes.len } });
+    }
+}
+
+/// Flood a shell, press Ctrl+C, and type a command: the command must
+/// answer promptly, and little of the flood may follow the interrupt.
+fn checkShellInterruptFlow(gpa: std.mem.Allocator, io: Io, env: *const std.process.Environ.Map, cwd: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const conn = try connectProtocol(gpa, io, env);
+    defer conn.deinit();
+    try conn.send(.{ .session_create = .{ .cwd = cwd, .model = "local/testing" } });
+    const sid = uintField(try recvTagBounded(conn, arena, "session_created"), "sid") orelse return error.SessionIdMissing;
+    try conn.send(.{ .shell_open = .{ .sid = sid, .cols = 200, .rows = 50 } });
+    const shell_id = uintField(try recvTagBounded(conn, arena, "shell_opened"), "shell_id") orelse return error.ShellIdMissing;
+    try shellRoundTrip(conn, arena, shell_id, "echo ready-$((40+2))\r", "ready-42");
+
+    const encoder = std.base64.standard.Encoder;
+    const decoder = std.base64.standard.Decoder;
+    var typed: [256]u8 = undefined;
+    try conn.send(.{ .shell_input = .{ .shell_id = shell_id, .data_base64 = encoder.encode(&typed, "yes '05:25:38.337916  read              F=9    B=0xfa                                                  0.000001   sudo.72343672'\r") } });
+
+    // A client slower than the program, as a TUI on a loaded machine is
+    // (about 3 MB/s): it falls behind and is resynced with snapshots.
+    const consumer_us_per_kib: u64 = 300;
+    var interrupted_at: ?Io.Timestamp = null;
+    var live_after: usize = 0;
+    var snapshots_after: usize = 0;
+    var tail: [32]u8 = @splat(0);
+    while (true) {
+        var line_arena = std.heap.ArenaAllocator.init(gpa);
+        defer line_arena.deinit();
+        const msg = try conn.recv(line_arena.allocator());
+        const object = tagObject(msg, "shell_output") orelse tagObject(msg, "shell_snapshot") orelse continue;
+        const is_snapshot = tagObject(msg, "shell_snapshot") != null;
+        const encoded = stringField(object, "data_base64") orelse continue;
+        const bytes = try line_arena.allocator().alloc(u8, try decoder.calcSizeForSlice(encoded));
+        try decoder.decode(bytes, encoded);
+        try io.sleep(.fromMicroseconds(@intCast(consumer_us_per_kib * bytes.len / 1024)), .awake);
+        if (!is_snapshot) try conn.send(.{ .shell_ack = .{ .shell_id = shell_id, .bytes = bytes.len } });
+        if (interrupted_at == null) {
+            // Right after a catch-up snapshot the window refills at once:
+            // Ctrl+C then goes out with the most output possible in flight.
+            if (!is_snapshot) continue;
+            try io.sleep(.fromMilliseconds(100), .awake);
+            interrupted_at = Io.Timestamp.now(io, .awake);
+            try conn.send(.{ .shell_input = .{ .shell_id = shell_id, .data_base64 = encoder.encode(&typed, "\x03") } });
+            try conn.send(.{ .shell_input = .{ .shell_id = shell_id, .data_base64 = encoder.encode(&typed, "echo after-$((6*7))\r") } });
+            continue;
+        }
+        if (is_snapshot) snapshots_after += 1 else live_after += bytes.len;
+        const joined = try std.mem.concat(line_arena.allocator(), u8, &.{ &tail, bytes });
+        if (std.mem.indexOf(u8, joined, "after-42") != null) break;
+        @memcpy(&tail, joined[joined.len - tail.len ..]);
+    }
+    const elapsed_ms = interrupted_at.?.durationTo(Io.Timestamp.now(io, .awake)).toMilliseconds();
+    // What was in flight when Ctrl+C went out: at most the viewer window of
+    // live output, and one snapshot to catch up (4 MiB and several, before).
+    if (live_after > 2 * 256 * 1024 or snapshots_after > 1) {
+        print(io, "\n  ctrl+c answered after {d} ms, behind {d} KiB of output and {d} snapshots\n", .{ elapsed_ms, live_after / 1024, snapshots_after });
+        return error.ShellInterruptBehindBacklog;
     }
 }
 

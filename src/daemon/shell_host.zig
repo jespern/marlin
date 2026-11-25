@@ -15,8 +15,10 @@ const proto = @import("../core/proto.zig");
 const block = @import("../core/block.zig");
 
 /// Output a viewer may have unacknowledged before it stops receiving live
-/// bytes; once it catches up it is resynced with a snapshot.
-pub const viewer_window: usize = 4 * 1024 * 1024;
+/// bytes; once it catches up it is resynced with a snapshot. It bounds what
+/// still scrolls past after Ctrl+C on a client slower than the program, so
+/// it is a few screens (tmux bounds a slow client similarly), not megabytes.
+pub const viewer_window: usize = 256 * 1024;
 /// Scrollback the mirror keeps, and therefore what reattaching restores.
 pub const scrollback_bytes: usize = 16 * 1024 * 1024;
 /// Largest unfinished escape sequence carried across a snapshot.

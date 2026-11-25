@@ -1,0 +1,7 @@
+{
+  "steps": [],
+  "check": {
+    "argv": [],
+    "shell_interrupt_flow": true
+  }
+}
