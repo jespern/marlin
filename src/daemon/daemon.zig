@@ -6575,8 +6575,6 @@ pub const Daemon = struct {
         const target = for (peers) |peer| {
             if (peer.sid == target_sid) break peer;
         } else unreachable;
-        if (target_sid == caller_sid) return .{ .text = "error: that handle is this session", .status = .err };
-
         if (std.mem.eql(u8, name, sessions_tool.read_name)) {
             const args = std.json.parseFromSliceLeaky(sessions_tool.ReadArgs, arena, args_json, .{ .ignore_unknown_fields = true }) catch
                 sessions_tool.ReadArgs{ .handle = handle_query };
@@ -6589,6 +6587,10 @@ pub const Daemon = struct {
                 if (tail.len > 0) tail else "(nothing yet)",
             }) };
         }
+
+        // Reading one's own transcript is fine; messaging or waiting on
+        // oneself would only loop or wait on this very turn.
+        if (target_sid == caller_sid) return .{ .text = "error: that handle is this session", .status = .err };
 
         if (std.mem.eql(u8, name, sessions_tool.message_name)) {
             const args = std.json.parseFromSliceLeaky(sessions_tool.MessageArgs, arena, args_json, .{ .ignore_unknown_fields = true }) catch

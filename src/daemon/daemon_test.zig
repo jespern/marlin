@@ -935,8 +935,16 @@ test "agents reach other sessions: list, read, message (hop and turn limits), wa
     try Call.send(r, 7, 2, "read_session", .{ .handle = handle });
     const read = (try Call.result(r, 2)).?;
     try std.testing.expect(std.mem.indexOf(u8, read.output, "user: hello\n\nagent: hi there") != null);
+    // Its own transcript too; messaging or waiting on itself is refused.
+    try r.daemon.store.appendBlock(.{ .id = 100, .session_id = 7, .turn_id = 1, .seq = 1, .ts = 0, .body = .{ .user_msg = .{ .text = "what did I ask?" } } });
     try Call.send(r, 7, 3, "read_session", .{ .handle = caller_handle });
-    try std.testing.expectEqual(block_mod.ToolStatus.err, (try Call.result(r, 3)).?.status);
+    const own = (try Call.result(r, 3)).?;
+    try std.testing.expectEqual(block_mod.ToolStatus.ok, own.status);
+    try std.testing.expect(std.mem.indexOf(u8, own.output, "user: what did I ask?") != null);
+    try Call.send(r, 7, 30, "message_session", .{ .handle = caller_handle, .text = "hi me" });
+    try std.testing.expectEqual(block_mod.ToolStatus.err, (try Call.result(r, 30)).?.status);
+    try Call.send(r, 7, 31, "wait_for_session", .{ .handle = caller_handle });
+    try std.testing.expectEqual(block_mod.ToolStatus.err, (try Call.result(r, 31)).?.status);
 
     // A message to a busy session waits for its next step, marked as ours.
     other.state = .running;

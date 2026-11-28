@@ -42,7 +42,7 @@ pub const specs = [_]Spec{
     },
     .{
         .name = read_name,
-        .description = "Read the recent transcript of another Marlin session: what its user asked and what its agent answered, with one line per tool call. Use the handle from `sessions`.",
+        .description = "Read the recent transcript of a Marlin session, another or your own: what its user asked and what its agent answered, with one line per tool call. Use the handle from `sessions`.",
         .schema =
         \\{"type":"object","properties":{"handle":{"type":"string","description":"The session's handle (at least 4 characters of it)"},"last":{"type":"integer","minimum":1,"maximum":100,"description":"How many recent transcript entries (default 20)"}},"required":["handle"]}
         ,
